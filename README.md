@@ -324,6 +324,11 @@ ssh root@192.168.1.1 "rm -rf /tmp/luci-indexcache /tmp/luci-modulecache; /etc/in
 ```
 登入 LuCI 後即可在 **「Network」->「MWAN4 Load Balancing」**（中文環境下為 **「網路」->「MWAN4 多路分流」**）查看並管理。
 
+## 致謝
+
+- [DeepSeek](https://www.deepseek.com)：參與架構設計、程式碼實作、跨平台編譯與路由器實機驗證。
+- OpenWrt / LuCI：Netlink、rpcd、LuCI-JS 的既有實作與文件。
+
 ---
 
 ## 授權條款
