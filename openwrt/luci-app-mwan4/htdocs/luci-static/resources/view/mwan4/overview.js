@@ -76,19 +76,30 @@ function pick(root, role) {
 	return root ? root.querySelector('[data-role="' + role + '"]') : null;
 }
 
-/* LuCI's description row is one cell short of the title row (no leading name cell),
-   which shifts every hint one column left. Pad it so the columns line up. */
+/* LuCI's description row is one cell short of the title row (no leading
+   name cell), and some themes (e.g. Argon) inject a leading ghost cell into
+   the title and data rows via ::before but not into the description row,
+   which shifts every hint left by one column. Counting cells cannot cover
+   both cases (1 vs 2 ghost cells), so pad by geometry instead: align the
+   description row's first cell with the title row's second column. */
 function alignDescrRows(root) {
 	var tables = root.querySelectorAll('table.cbi-section-table');
 
 	for (var i = 0; i < tables.length; i++) {
 		var titles = tables[i].querySelector('tr.cbi-section-table-titles:not(.cbi-section-table-filter)');
 		var descr = tables[i].querySelector('tr.cbi-section-table-descr');
-		if (!titles || !descr) continue;
+		if (!titles || !descr || titles.children.length < 2 || descr.children.length === 0) continue;
+		if (descr.hasAttribute('data-aligned')) continue;
 
-		for (var n = titles.children.length - descr.children.length; n > 0; n--) {
+		var target = titles.children[1].getBoundingClientRect();
+		var colWidth = target.width;
+		if (colWidth <= 0) continue;
+
+		var pads = Math.round((target.x - descr.getBoundingClientRect().x) / colWidth);
+		for (var n = 0; n < pads; n++) {
 			descr.insertBefore(E('th', { 'class': 'th cbi-section-table-cell' }), descr.firstChild);
 		}
+		descr.setAttribute('data-aligned', '1');
 	}
 }
 
