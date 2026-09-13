@@ -1,0 +1,18 @@
+{
+	"luci-app-mwan4": {
+		"description": "Grant access to MWAN4 configuration and status",
+		"read": {
+			"uci": [ "mwan4", "network" ],
+			"file": {
+				"/tmp/mwan4_status.json": [ "read" ]
+			},
+			"ubus": {
+				"service": [ "list" ],
+				"file": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "mwan4" ]
+		}
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"admin/network/mwan4": {
+		"title": "MWAN4 Load Balancing",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "mwan4/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwan4" ]
+		}
+	}
+}

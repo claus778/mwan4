@@ -1,0 +1,32 @@
+config global 'global'
+	option enabled '1'
+	option check_interval_ms '500'
+	option probe_timeout_ms '400'
+	option window_size '10'
+	option loss_threshold_down '0.5'
+	option consecutive_fail_down '3'
+	option recovery_success_count '5'
+	option max_rtt_ms '1500'
+	option flush_conntrack '1'
+	# standard: 單一 multipath 路由，切換線路時既有連線可能被重哈希打斷
+	# resilient: 使用內核 resilient nexthop group（需 Linux 5.14+），只重映射故障線路的連線
+	# auto: 優先 resilient，內核不支援時自動退回 standard
+	option ecmp_mode 'standard'
+
+config interface 'wan1'
+	option enabled '1'
+	option name 'wan1'
+	option gateway '192.168.1.1'
+	option metric '10'
+	option weight '1'
+	list probe_targets '1.1.1.1:443'
+	list probe_targets '8.8.8.8:443'
+
+config interface 'wan2'
+	option enabled '1'
+	option name 'wan2'
+	option gateway '192.168.2.1'
+	option metric '10'
+	option weight '1'
+	list probe_targets '1.1.1.1:443'
+	list probe_targets '8.8.8.8:443'

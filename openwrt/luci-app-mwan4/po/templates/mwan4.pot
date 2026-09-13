@@ -1,0 +1,152 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "MWAN4 Load Balancing"
+msgstr ""
+
+msgid "Unknown"
+msgstr ""
+
+msgid "Running"
+msgstr ""
+
+msgid "Stopped"
+msgstr ""
+
+msgid "MWAN4 Multi-WAN Failover & Health Monitor"
+msgstr ""
+
+msgid "Daemon:"
+msgstr ""
+
+msgid "Kernel Default Route:"
+msgstr ""
+
+msgid "No metrics available. Check that the MWAN4 service is running."
+msgstr ""
+
+msgid "Online (UP)"
+msgstr ""
+
+msgid "Offline (DOWN)"
+msgstr ""
+
+msgid "(No IP)"
+msgstr ""
+
+msgid "Realtime RTT"
+msgstr ""
+
+msgid "Jitter"
+msgstr ""
+
+msgid "Gateway"
+msgstr ""
+
+msgid "ECMP Weight"
+msgstr ""
+
+msgid "Sliding Window Packet Loss"
+msgstr ""
+
+msgid "Consecutive Successes: "
+msgstr ""
+
+msgid "Consecutive Timeouts: "
+msgstr ""
+
+msgid "MWAN4 Configuration"
+msgstr ""
+
+msgid "Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon."
+msgstr ""
+
+msgid "Global Settings"
+msgstr ""
+
+msgid "Enable MWAN4 Daemon"
+msgstr ""
+
+msgid "Probe Interval (ms)"
+msgstr ""
+
+msgid "Probe interval per interface (default: 500 ms)"
+msgstr ""
+
+msgid "Probe Timeout (ms)"
+msgstr ""
+
+msgid "Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)"
+msgstr ""
+
+msgid "Sliding Window Size"
+msgstr ""
+
+msgid "Number of probe samples to calculate loss rate and smoothed RTT (default: 10)"
+msgstr ""
+
+msgid "Consecutive Failures for DOWN"
+msgstr ""
+
+msgid "Consecutive probe timeouts before interface is marked DOWN (default: 3)"
+msgstr ""
+
+msgid "Recovery Success Count (Hysteresis)"
+msgstr ""
+
+msgid "Consecutive successful probes with <10% loss required before recovering to UP (default: 5)"
+msgstr ""
+
+msgid "Flush Conntrack on DOWN"
+msgstr ""
+
+msgid "Flush TCP/UDP connections on an interface when it goes down."
+msgstr ""
+
+msgid "WAN Interfaces"
+msgstr ""
+
+msgid "Gateway, ECMP weight and probe targets for each WAN interface."
+msgstr ""
+
+msgid "Enable"
+msgstr ""
+
+msgid "Interface Name"
+msgstr ""
+
+msgid "Gateway IP"
+msgstr ""
+
+msgid "Probe Targets (IP:Port)"
+msgstr ""
+
+msgid "Multi-WAN Routing Mode"
+msgstr ""
+
+msgid "standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+)."
+msgstr ""
+
+msgid "Standard ECMP (multipath route)"
+msgstr ""
+
+msgid "Automatic (resilient when supported)"
+msgstr ""
+
+msgid "Resilient nexthop group (require kernel support)"
+msgstr ""
+
+msgid "MWAN4 configuration saved and applied."
+msgstr ""
+
+msgid "Priority / Weight"
+msgstr ""
+
+msgid "Metric (Priority)"
+msgstr ""
+
+msgid "Lower = higher priority. Same metric = ECMP aggregation, different metrics = primary/backup failover."
+msgstr ""
+
+msgid "ECMP weight for interfaces with the same metric."
+msgstr ""

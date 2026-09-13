@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 品質關卡：格式、靜態檢查、單元測試 ────────────────────────────────
+  quality:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  # ── 交叉編譯：靜態 musl 二進位（x86_64 與 aarch64）───────────────────
+  # 注意：musl target 仍會呼叫一個 `cc` 作為連結驅動（crt/libc 由 Rust 自帶的
+  # self-contained sysroot 提供）。因此
+  #   - x86_64：runner 內建 gcc 即可，無需額外套件；
+  #   - aarch64：必須另外裝 gcc-aarch64-linux-gnu 並指定為 linker，
+  #              否則 x86_64 的 gcc 無法輸出 aarch64 執行檔。
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            packages: ""
+            linker: ""
+          - target: aarch64-unknown-linux-musl
+            packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Point cargo at the cross linker
+        if: matrix.linker != ''
+        run: |
+          printf '[target.%s]\nlinker = "%s"\n' \
+            "${{ matrix.target }}" "${{ matrix.linker }}" >> "$CARGO_HOME/config.toml"
+          tail -n 5 "$CARGO_HOME/config.toml"
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Assert statically linked (no PT_INTERP)
+        run: |
+          BIN="target/${{ matrix.target }}/release/mwan4"
+          file "$BIN"
+          if readelf -lW "$BIN" | grep -q 'INTERP'; then
+            echo "::error file=$BIN::binary is dynamically linked; musl target must be static"
+            exit 1
+          fi
+          echo "OK: $BIN is a static binary"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mwan4-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/mwan4
+          if-no-files-found: error
+
+  # ── MSRV 守門：確保 Cargo.toml 宣告的 rust-version 真的能編過 ─────────
+  # Cargo.toml 使用 edition 2024 並宣告 rust-version = "1.85"。
+  # 此 job 為「預警」性質：若某個依賴悄悄把自身 MSRV 拉高，這裡會變紅提醒，
+  # 但不阻擋主線（continue-on-error），避免第三方套件更新時無故卡住發布。
+  msrv:
+    name: msrv (1.85) [advisory]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: cargo build (MSRV)
+        run: cargo build --locked

@@ -1,0 +1,143 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/mwan4
+CONF_DIR=/var/etc
+CONF_FILE="$CONF_DIR/mwan4.json"
+
+generate_json_config() {
+	mkdir -p "$CONF_DIR"
+
+	local enabled check_interval probe_timeout window_size loss_down fail_down recovery max_rtt flush_ct ecmp_mode
+	config_get_bool enabled global enabled 0
+	[ "$enabled" -eq 1 ] || return 1
+
+	config_get check_interval global check_interval_ms 500
+	# 探測超時必須 <= 探測週期，否則實際週期會被超時拉長
+	config_get probe_timeout global probe_timeout_ms 400
+	config_get window_size global window_size 10
+	config_get loss_down global loss_threshold_down 0.5
+	config_get fail_down global consecutive_fail_down 3
+	config_get recovery global recovery_success_count 5
+	config_get max_rtt global max_rtt_ms 1500
+	config_get_bool flush_ct global flush_conntrack 1
+	# standard / auto / resilient；無效值交給 daemon 的 --check-config 擋下來
+	config_get ecmp_mode global ecmp_mode standard
+
+	local flush_str="false"
+	[ "$flush_ct" -eq 1 ] && flush_str="true"
+
+	cat <<-EOF > "$CONF_FILE"
+	{
+	  "check_interval_ms": $check_interval,
+	  "probe_timeout_ms": $probe_timeout,
+	  "window_size": $window_size,
+	  "loss_threshold_down": $loss_down,
+	  "consecutive_fail_down": $fail_down,
+	  "recovery_success_count": $recovery,
+	  "max_rtt_ms": $max_rtt,
+	  "ecmp_mode": "$ecmp_mode",
+	  "flush_conntrack_on_down": $flush_str,
+	  "interfaces": [
+	EOF
+
+	local first=1
+	handle_interface() {
+		local section="$1"
+		local if_enabled name gateway metric weight
+		config_get_bool if_enabled "$section" enabled 1
+		[ "$if_enabled" -eq 1 ] || return 0
+
+		config_get name "$section" name "$section"
+		config_get gateway "$section" gateway ""
+		config_get metric "$section" metric 10
+		config_get weight "$section" weight 1
+
+		local gw_json="null"
+		[ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ] && gw_json="\"$gateway\""
+
+		local target_json=""
+		add_target() {
+			local target="$1"
+			if [ -n "$target_json" ]; then
+				target_json="$target_json, \"$target\""
+			else
+				target_json="\"$target\""
+			fi
+		}
+		config_list_foreach "$section" probe_targets add_target
+		[ -n "$target_json" ] || target_json='"1.1.1.1:443", "8.8.8.8:443"'
+
+		if [ "$first" -eq 1 ]; then
+			first=0
+		else
+			echo "    ," >> "$CONF_FILE"
+		fi
+
+		cat <<-EOF >> "$CONF_FILE"
+		    {
+		      "name": "$name",
+		      "gateway": $gw_json,
+		      "metric": $metric,
+		      "weight": $weight,
+		      "probe_targets": [ $target_json ]
+		    }
+		EOF
+	}
+
+	config_foreach handle_interface interface
+
+	# 沒有任何 interface 段時不要產生 {"interfaces": []}：
+	# 那會讓 daemon 在 validate() 失敗後退出，被 procd 無限重啟
+	if [ "$first" -eq 1 ]; then
+		rm -f "$CONF_FILE"
+		logger -t mwan4 "No WAN interface defined in /etc/config/mwan4, refusing to start"
+		return 1
+	fi
+
+	cat <<-EOF >> "$CONF_FILE"
+	  ]
+	}
+	EOF
+
+	return 0
+}
+
+start_service() {
+	[ -x "$PROG" ] || {
+		logger -t mwan4 "Binary $PROG not executable or not installed"
+		return 1
+	}
+
+	config_load mwan4
+	generate_json_config || {
+		# 回傳 1 涵蓋「未啟用」與「沒有設定 interface」兩種情況，
+		# 兩者都不應該讓 procd 進入重啟迴圈
+		logger -t mwan4 "mwan4 is disabled or has no WAN interface configured, not starting"
+		return 0
+	}
+
+	# 產生 JSON 後先讓 daemon 自我驗證（--check-config 只驗證、不啟動）。
+	# 設定錯誤時留下明確日誌並拒絕啟動，而不是讓 daemon 起飛即退出、被 procd 無限重啟；
+	# 這裡尚未 procd_open_instance，因此 return 1 不會產生重啟迴圈。
+	if ! "$PROG" --check-config "$CONF_FILE"; then
+		logger -t mwan4 "Generated config $CONF_FILE failed --check-config, aborting start"
+		return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command "$PROG" -c "$CONF_FILE"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/mwan4
+	procd_close_instance
+	logger -t mwan4 "mwan4 service started with $CONF_FILE"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "mwan4"
+}

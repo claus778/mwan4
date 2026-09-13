@@ -1,0 +1,35 @@
+{
+  "check_interval_ms": 500,
+  "probe_timeout_ms": 400,
+  "window_size": 10,
+  "loss_threshold_down": 0.5,
+  "loss_threshold_up": 0.1,
+  "consecutive_fail_down": 3,
+  "recovery_success_count": 5,
+  "max_rtt_ms": 1500.0,
+  "flush_conntrack_on_down": true,
+  "route_priority": 0,
+  "ecmp_mode": "standard",
+  "interfaces": [
+    {
+      "name": "wan1",
+      "gateway": "192.168.1.1",
+      "metric": 1,
+      "weight": 1,
+      "probe_targets": [
+        "1.1.1.1:443",
+        "8.8.8.8:443"
+      ]
+    },
+    {
+      "name": "wan2",
+      "gateway": "192.168.2.1",
+      "metric": 1,
+      "weight": 1,
+      "probe_targets": [
+        "1.1.1.1:443",
+        "8.8.8.8:443"
+      ]
+    }
+  ]
+}
