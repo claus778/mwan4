@@ -323,7 +323,9 @@ fn refresh_affected_interfaces(monitors: &mut [WanMonitor], events: &[netlink::l
         let mut reindex = false;
         for e in events {
             match e {
-                netlink::link::LinkEvent::Link { ifname: Some(name), .. } if name == &monitor.ifname => {
+                netlink::link::LinkEvent::Link {
+                    ifname: Some(name), ..
+                } if name == &monitor.ifname => {
                     touched = true;
                     reindex = true;
                 }

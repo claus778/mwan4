@@ -292,7 +292,10 @@ mod tests {
         attrs.extend_from_slice(&IFLA_IFNAME.to_ne_bytes());
         attrs.extend_from_slice(b"wan1\0");
         attrs.extend_from_slice(&[0, 0, 0]);
-        assert_eq!(LinkWatcher::parse_ifla_ifname(&attrs).as_deref(), Some("wan1"));
+        assert_eq!(
+            LinkWatcher::parse_ifla_ifname(&attrs).as_deref(),
+            Some("wan1")
+        );
 
         // 其他屬性在前，IFLA_IFNAME 在後
         let mut mixed = Vec::new();
@@ -300,7 +303,10 @@ mod tests {
         mixed.extend_from_slice(&1u16.to_ne_bytes());
         mixed.extend_from_slice(&[0, 0, 0, 0]);
         mixed.extend_from_slice(&attrs);
-        assert_eq!(LinkWatcher::parse_ifla_ifname(&mixed).as_deref(), Some("wan1"));
+        assert_eq!(
+            LinkWatcher::parse_ifla_ifname(&mixed).as_deref(),
+            Some("wan1")
+        );
 
         // 沒有 IFNAME 屬性
         assert_eq!(LinkWatcher::parse_ifla_ifname(&[0, 0, 0, 0]), None);

@@ -564,11 +564,8 @@ mod tests {
 
         // 多目標：任一 IP 命中即匹配
         assert!(
-            ConntrackManager::extract_matching_orig_tuple(
-                &attrs,
-                &[Ipv4Addr::new(1, 2, 3, 4), ip]
-            )
-            .is_some()
+            ConntrackManager::extract_matching_orig_tuple(&attrs, &[Ipv4Addr::new(1, 2, 3, 4), ip])
+                .is_some()
         );
 
         // 不相關的 IP 不應匹配
