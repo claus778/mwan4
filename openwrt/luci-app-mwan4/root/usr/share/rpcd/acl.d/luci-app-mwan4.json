@@ -4,7 +4,8 @@
 		"read": {
 			"uci": [ "mwan4", "network" ],
 			"file": {
-				"/tmp/mwan4_status.json": [ "read" ]
+				"/tmp/mwan4_status.json": [ "read" ],
+				"/sys/class/net/*": [ "read", "list" ]
 			},
 			"ubus": {
 				"service": [ "list" ],

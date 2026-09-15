@@ -46,6 +46,20 @@ pub struct InterfaceConfig {
     /// 探測目標地址列表（TCP SYN 探測 IP:Port），如 ["1.1.1.1:443", "8.8.8.8:443"]
     #[serde(default = "default_probe_targets")]
     pub probe_targets: Vec<SocketAddr>,
+    /// 隧道型 WAN 的 underlay 對端位址（選填）。
+    ///
+    /// VXLAN 的 remote、WireGuard 的 endpoint 這類「封裝封包真正要去的地方」，
+    /// 必須經由**其他** WAN（非隧道的那條）抵達。若放任它們走 ECMP 預設路由，
+    /// 就有約 1/N 的機率被塞回這條隧道自己 —— 封裝封包進隧道、隧道再封裝，形成自環。
+    ///
+    /// 實測（VXLAN 當第二條線、與 eth1 組成雙線 ECMP）：設成 resilient 後隧道立刻
+    /// 丟包 60% 並被判 DOWN，`ip route get <對端>` 卻仍顯示正確的那條
+    /// （它只反映固定哈希的單次採樣，會騙人）。
+    ///
+    /// 設了這個欄位後，守護進程會在 main 表為每個位址補一條 /32
+    /// （前綴比預設路由長，必然優先），固定走「非隧道、metric 最小」的那條 WAN。
+    #[serde(default)]
+    pub underlay_targets: Vec<Ipv4Addr>,
 }
 
 fn default_metric() -> u32 {
@@ -111,8 +125,12 @@ pub struct DaemonConfig {
     /// 想要「線路切換時既有連線不被 ECMP 重哈希打斷」請設為 resilient 或 auto。
     #[serde(default)]
     pub ecmp_mode: EcmpMode,
-    /// 優雅退出時是否移除本程式下發的預設路由（預設 true）。
-    /// 若常透過 WAN 端 SSH 重啟服務，可設為 false 保留路由避免斷線。
+    /// 優雅退出時是否移除本程式下發的預設路由（預設 **false**）。
+    ///
+    /// 預設改為 false 的原因：預設路由是本機（含所有 LAN 客戶端）唯一的出口，
+    /// 服務重啟／套件升級／`uci commit` 觸發 reload 時刪掉它，會在「舊實例已退出、
+    /// 新實例還沒下發」的窗口內把整台路由器打成離線；若新實例啟動失敗，更是永久斷網。
+    /// 需要「退出即清乾淨」的部署再明確設為 true。
     #[serde(default = "default_remove_routes_on_exit")]
     pub remove_routes_on_exit: bool,
     /// WAN 接口配置列表
@@ -156,8 +174,10 @@ fn default_flush_conntrack() -> bool {
 fn default_route_priority() -> u32 {
     0
 }
+/// 預設 false：見 `remove_routes_on_exit` 的說明。刪掉唯一一條預設路由
+/// 會在重啟窗口內讓整台路由器失去出口（且新實例失敗時無法自行恢復）。
 fn default_remove_routes_on_exit() -> bool {
-    true
+    false
 }
 
 impl Default for DaemonConfig {
@@ -186,6 +206,7 @@ impl Default for DaemonConfig {
                     metric: 1,
                     weight: 1,
                     probe_targets: default_probe_targets(),
+                    underlay_targets: Vec::new(),
                 },
                 InterfaceConfig {
                     name: "wan2".to_string(),
@@ -194,6 +215,7 @@ impl Default for DaemonConfig {
                     metric: 1,
                     weight: 1,
                     probe_targets: default_probe_targets(),
+                    underlay_targets: Vec::new(),
                 },
             ],
         }
@@ -211,6 +233,14 @@ impl DaemonConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.interfaces.is_empty() {
             return Err("At least one WAN interface must be configured".into());
+        }
+        // 每張 WAN 會佔用一個探針 slot（獨立表＋oif 規則），slot 數有上限
+        if self.interfaces.len() > crate::netlink::route::PROBE_SLOT_MAX as usize {
+            return Err(format!(
+                "too many interfaces: {} (limit is {})",
+                self.interfaces.len(),
+                crate::netlink::route::PROBE_SLOT_MAX
+            ));
         }
         if self.window_size == 0 {
             return Err("window_size must be greater than 0".into());
@@ -373,6 +403,16 @@ mod tests {
     fn test_default_timeout_shorter_than_interval() {
         let cfg = DaemonConfig::default();
         assert!(cfg.probe_timeout_ms <= cfg.check_interval_ms);
+    }
+
+    #[test]
+    fn test_remove_routes_on_exit_defaults_to_false() {
+        // 預設必須是 false：刪掉唯一一條預設路由會在服務重啟窗口內
+        // 讓整台路由器（含所有 LAN 客戶端）失去出口。
+        assert!(!DaemonConfig::default().remove_routes_on_exit);
+        let old: DaemonConfig =
+            serde_json::from_str(r#"{"interfaces":[{"name":"wan1"}]}"#).unwrap();
+        assert!(!old.remove_routes_on_exit);
     }
 
     #[test]

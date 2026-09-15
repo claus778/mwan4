@@ -106,15 +106,44 @@ pub fn if_nametoindex(name: &str) -> io::Result<u32> {
     }
 }
 
+/// 行程級長連 ioctl fd（每次查詢都 socket()+close() 太昂貴）。
+///
+/// 用 `AtomicI32` 而不是 `OnceLock`：`OnceLock` 會把「第一次 socket() 失敗」的
+/// -1 永久快取，之後**所有**介面的 IP 查詢都會失敗（介面全顯示 No IP、
+/// conntrack 清理永久 no-op）。這裡失敗不寫入，下次呼叫會重新嘗試。
+#[cfg(target_os = "linux")]
+static IOCTL_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(target_os = "linux")]
+fn ioctl_fd() -> io::Result<libc::c_int> {
+    use std::sync::atomic::Ordering;
+
+    let cached = IOCTL_FD.load(Ordering::Relaxed);
+    if cached >= 0 {
+        return Ok(cached);
+    }
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // 只有搶到「從 -1 變成 fd」的執行緒保留這個 fd，其他執行緒關掉自己多開的
+    match IOCTL_FD.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed) {
+        Ok(_) => Ok(fd),
+        Err(existing) => {
+            unsafe { libc::close(fd) };
+            Ok(existing)
+        }
+    }
+}
+
 /// 透過 SIOCGIFADDR ioctl 快速取得網卡的 IPv4 地址（用於 Conntrack 精準連線清理）
 pub fn get_interface_ipv4(name: &str) -> io::Result<Ipv4Addr> {
     #[cfg(target_os = "linux")]
     unsafe {
-        // SIOCGIFADDR 對任意 AF_INET/SOCK_DGRAM socket 都有效，
-        // 用行程級長連 fd 避免「每次查詢都 socket()+close()」的系統呼叫開銷
-        static IOCTL_FD: std::sync::OnceLock<libc::c_int> = std::sync::OnceLock::new();
-        let sock = *IOCTL_FD
-            .get_or_init(|| libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0));
+        // SIOCGIFADDR 對任意 AF_INET/SOCK_DGRAM socket 都有效
+        let sock = ioctl_fd()?;
         if sock < 0 {
             return Err(io::Error::last_os_error());
         }

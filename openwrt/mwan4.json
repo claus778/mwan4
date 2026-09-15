@@ -8,7 +8,9 @@
   "recovery_success_count": 5,
   "max_rtt_ms": 1500.0,
   "flush_conntrack_on_down": true,
+  "flush_conntrack_on_switch": true,
   "route_priority": 0,
+  "remove_routes_on_exit": false,
   "ecmp_mode": "standard",
   "interfaces": [
     {

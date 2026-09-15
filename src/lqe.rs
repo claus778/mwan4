@@ -192,11 +192,16 @@ impl LinkQualityEstimator {
                 }
                 LinkState::Down => {
                     // UP 恢復判定條件（Hysteresis 防震盪機制）：
-                    // 1) 連續成功至少 5 次 (recovery_success_count)
-                    // 2) 且滑動窗口丟包率 < loss_threshold_up（預設 10%）
+                    // 1) 連續成功至少 recovery_success_count 次
+                    // 2) 且滑動窗口丟包率「不超過」loss_threshold_up（預設 10%）
                     // 3) 且 RTT 在正常範圍
+                    //
+                    // 注意門檻是 `<=`（舊版是嚴格 `<`）：嚴格小於在
+                    // window_size=10、loss_threshold_up=0.10 時等於「窗口內一次丟包都不准」，
+                    // 會讓 recovery_success_count（預設 5）在預設參數下完全失效、
+                    // 且任何一次抖動都把恢復無限往後推。`<=` 才與「丟包率 10% 以內」一致。
                     let should_up = self.consecutive_successes >= self.recovery_success_count
-                        && loss < self.loss_threshold_up
+                        && loss <= self.loss_threshold_up
                         && rtt_normal;
 
                     if should_up {
@@ -423,6 +428,57 @@ mod tests {
 
         // 若計數器沒有歸零，這裡會是第 2 次超標而翻成 DOWN
         assert_eq!(lqe.state, LinkState::Up);
+    }
+
+    #[test]
+    fn test_recovery_loss_threshold_is_inclusive() {
+        // 門檻是「不超過」（<=）：window=10、loss_threshold_up=0.10 時，
+        // 窗口內殘留 1 次丟包（1/10 = 10%）也應該允許恢復；
+        // 這正是舊版嚴格 `<` 的 bug（等於「一次丟包都不准」，把
+        // recovery_success_count 完全架空）。
+        let cfg = DaemonConfig::default();
+        let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
+
+        lqe.update(&sample(true, 20));
+        lqe.update(&sample(false, 600));
+        lqe.update(&sample(false, 600));
+        lqe.update(&sample(false, 600));
+        assert_eq!(lqe.state, LinkState::Down);
+
+        // 再連續成功 9 次：窗口內只剩那 1 次失敗（loss = 10%）
+        let mut recovered = false;
+        for _ in 0..9 {
+            let (state, changed) = lqe.update(&sample(true, 25));
+            if state == LinkState::Up && changed {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "1 loss in a 10-sample window is exactly 10% and must still allow recovery"
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_two_losses_in_window() {
+        // 對照組：窗口內 2 次丟包 = 20% > 10%，不得恢復
+        let cfg = DaemonConfig::default();
+        let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
+
+        lqe.update(&sample(false, 600));
+        lqe.update(&sample(false, 600));
+        lqe.update(&sample(false, 600));
+        assert_eq!(lqe.state, LinkState::Down);
+
+        for _ in 0..8 {
+            lqe.update(&sample(true, 25));
+        }
+        assert_eq!(
+            lqe.state,
+            LinkState::Down,
+            "20% window loss must keep the link DOWN"
+        );
     }
 
     #[test]

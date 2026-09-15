@@ -11,7 +11,7 @@ CONF_FILE="$CONF_DIR/mwan4.json"
 generate_json_config() {
 	mkdir -p "$CONF_DIR"
 
-	local enabled check_interval probe_timeout window_size loss_down fail_down recovery max_rtt flush_ct ecmp_mode
+	local enabled check_interval probe_timeout window_size loss_down loss_up fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes
 	config_get_bool enabled global enabled 0
 	[ "$enabled" -eq 1 ] || return 1
 
@@ -20,15 +20,43 @@ generate_json_config() {
 	config_get probe_timeout global probe_timeout_ms 400
 	config_get window_size global window_size 10
 	config_get loss_down global loss_threshold_down 0.5
+	# 恢復門檻（「不超過」這個丟包率才允許回 UP）；舊版是嚴格小於，
+	# 在 window=10 時等於「窗口內一次丟包都不准」，把 recovery_success_count 架空
+	config_get loss_up global loss_threshold_up 0.1
 	config_get fail_down global consecutive_fail_down 3
 	config_get recovery global recovery_success_count 5
 	config_get max_rtt global max_rtt_ms 1500
 	config_get_bool flush_ct global flush_conntrack 1
+	# 成員進出時是否清 conntrack（僅 standard ECMP 生效；主備模式下只清新進成員）
+	config_get_bool flush_switch global flush_conntrack_on_switch 1
 	# standard / auto / resilient；無效值交給 daemon 的 --check-config 擋下來
 	config_get ecmp_mode global ecmp_mode standard
+	# 退出時是否刪掉預設路由。預設 0：刪掉唯一一條預設路由會在重啟窗口內
+	# 讓整台路由器失去出口，且新實例啟動失敗時無法自行恢復
+	config_get_bool remove_routes global remove_routes_on_exit 0
 
 	local flush_str="false"
 	[ "$flush_ct" -eq 1 ] && flush_str="true"
+	local flush_switch_str="false"
+	[ "$flush_switch" -eq 1 ] && flush_switch_str="true"
+	# 注意：daemon 的 bool 欄位只吃 true/false，寫 0/1 會讓 --check-config 失敗、
+	# 服務直接起不來（所以一定要轉成 JSON 布林，不能直接塞 shell 的 0/1）
+	local remove_routes_str="false"
+	[ "$remove_routes" -eq 1 ] && remove_routes_str="true"
+
+	# 浮點欄位若被手動填成非數字（例如 "10%"），會產生非法 JSON，讓 daemon 以很難懂的
+	# serde 訊息拒絕啟動。這裡先擋下來，留下明確日誌（回傳 1 → 不啟動、也不會重啟循環）。
+	local pair field value
+	for pair in "loss_threshold_down:$loss_down" "loss_threshold_up:$loss_up" "max_rtt_ms:$max_rtt"; do
+		field="${pair%%:*}"
+		value="${pair#*:}"
+		case "$value" in
+			''|*[!0-9.]*|*.*.*)
+				logger -t mwan4 "Invalid numeric value for $field: '$value' (expected e.g. 0.5)"
+				return 1
+				;;
+		esac
+	done
 
 	cat <<-EOF > "$CONF_FILE"
 	{
@@ -36,11 +64,14 @@ generate_json_config() {
 	  "probe_timeout_ms": $probe_timeout,
 	  "window_size": $window_size,
 	  "loss_threshold_down": $loss_down,
+	  "loss_threshold_up": $loss_up,
 	  "consecutive_fail_down": $fail_down,
 	  "recovery_success_count": $recovery,
 	  "max_rtt_ms": $max_rtt,
 	  "ecmp_mode": "$ecmp_mode",
 	  "flush_conntrack_on_down": $flush_str,
+	  "flush_conntrack_on_switch": $flush_switch_str,
+	  "remove_routes_on_exit": $remove_routes_str,
 	  "interfaces": [
 	EOF
 
@@ -69,7 +100,55 @@ generate_json_config() {
 			fi
 		}
 		config_list_foreach "$section" probe_targets add_target
+
+		# UCI 的 list 與 option 是兩種型別：`uci set mwan4.<sec>.probe_targets='...'`
+		# 建出來的是 option，config_list_foreach 讀不到。若就此帶過，下面那行會「安靜地」
+		# 退回預設值 —— 使用者以為指定生效了，其實這條線在探 1.1.1.1，
+		# 症狀是莫名的丟包與 DOWN（實測：vxlan 線因此被誤判，但設定檔看起來完全正常）。
+		# 這裡兩種型別都接受，並留一條 log 提醒改成 list。
+		if [ -z "$target_json" ]; then
+			local single_targets
+			config_get single_targets "$section" probe_targets ""
+			if [ -n "$single_targets" ]; then
+				logger -t mwan4 "section '$section': probe_targets is a plain option; accepted, but 'list probe_targets' is preferred"
+				for target in $single_targets; do
+					add_target "$target"
+				done
+			fi
+		fi
+
 		[ -n "$target_json" ] || target_json='"1.1.1.1:443", "8.8.8.8:443"'
+
+		# 隧道型 WAN（VXLAN 等）的 underlay 對端：自動探測並寫進設定。
+		#
+		# 為什麼一定要有：隧道的封裝封包目的地就是這個對端位址，而它得靠 main 表的
+		# 預設路由送出。一旦預設路由是「含該隧道的 ECMP」，就會有約 1/N 的機率把
+		# 封裝封包再塞回同一條隧道 —— 自環。實測（VXLAN 做第二條線）切到 resilient 後
+		# 隧道立刻丟包 60% 並被判 DOWN，而 `ip route get <對端>` 還顯示正常的那條。
+		# 守護進程收到這個清單後，會為對端補一條走「非隧道線」的 /32，徹底避開自環。
+		local underlay_json=""
+		add_underlay() {
+			[ -n "$1" ] || return 0
+			if [ -n "$underlay_json" ]; then
+				underlay_json="$underlay_json, \"$1\""
+			else
+				underlay_json="\"$1\""
+			fi
+		}
+		detect_underlay_targets() {
+			local info
+			info="$(ip -d link show "$1" 2>/dev/null)" || return 0
+			case "$info" in
+			*vxlan*)
+				# 形如 "... vxlan id 100 remote 10.128.0.20 dev eth1 ..."
+				echo "$info" | sed -n 's/.*[[:space:]]remote[[:space:]]*\([0-9][0-9.]*\).*/\1/p'
+				;;
+			*) : ;;
+			esac
+		}
+		for ua in $(detect_underlay_targets "$name"); do
+			add_underlay "$ua"
+		done
 
 		if [ "$first" -eq 1 ]; then
 			first=0
@@ -83,7 +162,8 @@ generate_json_config() {
 		      "gateway": $gw_json,
 		      "metric": $metric,
 		      "weight": $weight,
-		      "probe_targets": [ $target_json ]
+		      "probe_targets": [ $target_json ],
+		      "underlay_targets": [ $underlay_json ]
 		    }
 		EOF
 	}

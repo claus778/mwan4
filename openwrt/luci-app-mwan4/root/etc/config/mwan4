@@ -4,10 +4,17 @@ config global 'global'
 	option probe_timeout_ms '400'
 	option window_size '10'
 	option loss_threshold_down '0.5'
+	# 恢復門檻：滑動窗口丟包率「不超過」這個值才允許回 UP（預設 0.1 = 10%）
+	option loss_threshold_up '0.1'
 	option consecutive_fail_down '3'
 	option recovery_success_count '5'
 	option max_rtt_ms '1500'
 	option flush_conntrack '1'
+	# 存活成員進出時是否清 conntrack（僅 standard ECMP 生效，主備模式只清新進成員）
+	option flush_conntrack_on_switch '1'
+	# 退出時是否刪掉 mwan4 下發的預設路由。預設 0（保留），
+	# 否則服務重啟／升級的窗口內整台路由器會沒有預設路由
+	option remove_routes_on_exit '0'
 	# standard: 單一 multipath 路由，切換線路時既有連線可能被重哈希打斷
 	# resilient: 使用內核 resilient nexthop group（需 Linux 5.14+），只重映射故障線路的連線
 	# auto: 優先 resilient，內核不支援時自動退回 standard

@@ -8,7 +8,9 @@
   "recovery_success_count": 5,
   "max_rtt_ms": 1500.0,
   "flush_conntrack_on_down": true,
+  "flush_conntrack_on_switch": true,
   "route_priority": 0,
+  "remove_routes_on_exit": false,
   "ecmp_mode": "standard",
   "interfaces": [
     {
@@ -29,6 +31,19 @@
       "probe_targets": [
         "1.1.1.1:443",
         "8.8.8.8:443"
+      ]
+    },
+    {
+      "_comment": "隧道型 WAN（VXLAN/WireGuard）請填 underlay_targets：封裝封包真正要去的地方。守護進程會為它們補一條走非隧道線的 /32，避免被 ECMP 塞回隧道自己（自環）。OpenWrt 的 init 腳本會自動探測 VXLAN 的 remote 填入，通常不需手寫。",
+      "name": "vxlan0",
+      "gateway": "10.77.0.1",
+      "metric": 10,
+      "weight": 1,
+      "probe_targets": [
+        "223.5.5.5:53"
+      ],
+      "underlay_targets": [
+        "10.128.0.20"
       ]
     }
   ]
