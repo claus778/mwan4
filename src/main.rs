@@ -695,6 +695,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             local_condition_warned: false,
             probe_path_missing: false,
             last_path_check: None,
+            down_since: None,
+            flushed_while_down: false,
             lqe: LinkQualityEstimator::new(iface_cfg.name.clone(), &config),
         });
     }
@@ -882,18 +884,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut flush_pending: Vec<usize> = Vec::new();
 
                 // 餵入樣本更新各鏈路 LQE 狀態機
-                for ((idx, monitor), sample) in
-                    monitors.iter_mut().enumerate().zip(samples.into_iter())
-                {
+                for (monitor, sample) in monitors.iter_mut().zip(samples.into_iter()) {
                     let (new_state, changed) = monitor.lqe.update(&sample);
                     if changed {
                         state_changed = true;
                         // 狀態切換時順勢刷新快取的 IP
                         monitor.cached_ip = crate::netlink::util::get_interface_ipv4(&monitor.ifname).ok();
 
-                        if new_state == LinkState::Down && config.flush_conntrack_on_down {
-                            // 鏈路斷開：稍後精準清理該網卡上的 conntrack 連線快取
-                            flush_pending.push(idx);
+                        // 只記錄「何時進入 DOWN」（以及恢復時重置），
+                        // 真正的 conntrack 清理延後到確認這不是短暫抖動之後，
+                        // 見下方「抖動保護」排程處的說明。
+                        match new_state {
+                            LinkState::Down => monitor.down_since = Some(Instant::now()),
+                            _ => {
+                                monitor.down_since = None;
+                                monitor.flushed_while_down = false;
+                            }
                         }
                     }
 
@@ -1314,6 +1320,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // 路由下發之後才排程 conntrack 清理：多張網卡合併為一條指令、
                 // worker 只掃一次全表。每網卡限流在這裡檢查，入隊成功才更新時間戳。
+                //
+                // 抖動保護（重要）：線路剛被判 DOWN 就清 conntrack，會把該線路上「其實還活著」
+                // 的連線一次全砍掉。實測隧道抖動觸發一次 DOWN 就砍了 495 條，使用者直接看到
+                // 「網站打不開、連線斷掉」，而幾秒後線路自己就恢復了。
+                // 因此這裡改成：DOWN 之後再等 CONNTRACK_FLUSH_DOWN_QUIET，確認它「持續」
+                // 不可用才清；期間若恢復（抖動），連線就保住了，代價只是晚幾秒切換。
+                if config.flush_conntrack_on_down {
+                    let now = Instant::now();
+                    for (idx, monitor) in monitors.iter_mut().enumerate() {
+                        if monitor.flushed_while_down {
+                            continue;
+                        }
+                        if let Some(since) = monitor.down_since {
+                            if now.duration_since(since) >= CONNTRACK_FLUSH_DOWN_QUIET {
+                                monitor.flushed_while_down = true;
+                                flush_pending.push(idx);
+                            }
+                        }
+                    }
+                }
+
                 if !flush_pending.is_empty() {
                     let now = Instant::now();
                     let mut names: Vec<String> = Vec::new();
@@ -1394,6 +1421,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 線路判 DOWN 之後，要「持續」不可用多久才動手清 conntrack。
+///
+/// 為什麼要拖：隧道型線路（VXLAN/WireGuard）常有幾秒到十幾秒的抖動，而清 conntrack
+/// 會把該線路上所有連線一次砍掉（實測一次 495 條），使用者立刻看到「網站打不開」。
+///
+/// 這個值要蓋過「判 DOWN + 抖動本身 + 恢復所需時間」：
+/// 以預設參數為例，連續 3 次失敗 ≈ 2.4s 才判 DOWN，恢復要 5 次連續成功 ≈ 4s
+/// （實測這台設備用了 9 次 ≈ 7s），所以一次 8 秒的抖動實測約 12 秒才能回到 UP。
+/// 10 秒的靜默期剛好被跨過去、仍然誤清；25 秒能穩穩擋住這類抖動。
+///
+/// 代價：真斷線時晚 25 秒清連線。但用戶端 TCP 本來就要自我重傳超時（通常 20s+），
+/// 所以實際感受幾乎沒有差別；而誤清是「立刻全斷」，兩者不對等。
+const CONNTRACK_FLUSH_DOWN_QUIET: Duration = Duration::from_secs(25);
+
 struct WanMonitor {
     ifname: String,
     ifindex: u32,
@@ -1420,6 +1461,11 @@ struct WanMonitor {
     probe_path_missing: bool,
     /// 上次做「路徑是否存在」查詢的時間（限流，避免每 tick 都查）
     last_path_check: Option<Instant>,
+    /// 本輪進入 DOWN 的時刻；恢復 UP 時清空。
+    /// 用來區分「短暫抖動」與「真的掛了」——前者不該清 conntrack。
+    down_since: Option<Instant>,
+    /// 這次 DOWN 期間是否已經清過 conntrack（避免每 tick 重複清）
+    flushed_while_down: bool,
     lqe: LinkQualityEstimator,
 }
 
