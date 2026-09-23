@@ -53,8 +53,8 @@ LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
 # 注意：apk 對「同版本替換（1.0.0-r1 -> 1.0.0-r1）」**不會執行 post-install 鉤子**，
 # 只有真正的版本升級才會跑（實機驗證）。所以只要二進位/腳本有變，就必須遞增 release。
-APK_RELEASE = "r4"
-IPK_RELEASE = "4"
+APK_RELEASE = "r8"
+IPK_RELEASE = "8"
 
 # 新生成金鑰的位元數 / 可接受的最小位元數
 KEY_SIZE = 2048
@@ -100,7 +100,12 @@ class Arch:
         return os.path.join(ROOT_DIR, "target", self.rust_target, "release", PKG_NAME)
 
 
-#: 目前支援的架構。新增架構只需在此加一行（rust target 需先 rustup target add）。
+#: 目前支援的架構。新增架構只需在此加一行。
+#:
+#: ⚠️ 多數 rust target 先 `rustup target add <triple>` 即可；但 **mipsel-unknown-linux-musl
+#: 是 tier-3，rustup 沒有預編譯 std**（會回 "has no prebuilt artifacts available"），
+#: 必須用 `-Z build-std` 從原始碼編 std，並自備 musl sysroot 當連結來源。
+#: 見 README「MIPS (mipsel_24kc)」一節的完整指令。
 ARCH_TABLE: list[Arch] = [
     Arch(
         key="aarch64_cortex-a53",
@@ -121,6 +126,14 @@ ARCH_TABLE: list[Arch] = [
         rust_target="armv7-unknown-linux-musleabihf",
         apk_arch="arm_cortex-a7",
         ipk_arch="arm_cortex-a7",
+        libc_dep="libc",
+    ),
+    Arch(
+        # MIPS 小端 24kc（MediaTek MT7621/MT7620 等 ramips 機型；OpenWrt 的 arch 名）。
+        key="mipsel_24kc",
+        rust_target="mipsel-unknown-linux-musl",
+        apk_arch="mipsel_24kc",
+        ipk_arch="mipsel_24kc",
         libc_dep="libc",
     ),
 ]
@@ -243,7 +256,9 @@ def make_ustar_header(name: str, size: int, mode: int, typeflag: bytes = b"0") -
     h[108:116] = b"0000000\0"
     h[116:124] = b"0000000\0"
     h[124:136] = f"{size:011o}\0".encode("ascii")
-    h[136:148] = f"{int(time.time()):011o}\0".encode("ascii")
+    # SOURCE_DATE_EPOCH 讓同一份來源能產出可重現的 tar（發行版可重現建置慣例）
+    mtime = int(os.environ.get("SOURCE_DATE_EPOCH", time.time()))
+    h[136:148] = f"{mtime:011o}\0".encode("ascii")
     h[148:156] = b"        "
     h[156:157] = typeflag
     h[257:263] = b"ustar\0"
@@ -385,6 +400,7 @@ def create_ipk_package(
     data_entries: list[dict],
     postinst: str | None = None,
     depends: list[str] | None = None,
+    conffiles: list[str] | None = None,
 ) -> None:
     """OpenWrt OPKG IPK 格式"""
     data_tar = bytearray()
@@ -424,6 +440,12 @@ def create_ipk_package(
         pi_bytes = postinst.replace("\r\n", "\n").encode("utf-8")
         control_tar.extend(make_ustar_header("postinst", len(pi_bytes), 0o755, b"0"))
         control_tar.extend(pad512(pi_bytes))
+    if conffiles:
+        # opkg 讀 control.tar.gz 裡的 conffiles 檔（一行一個絕對路徑），
+        # 沒有它會把 /etc 下的設定當普通檔案：升級時用包內容覆蓋、移除時直接刪掉。
+        cf_bytes = ("\n".join(conffiles) + "\n").encode("utf-8")
+        control_tar.extend(make_ustar_header("conffiles", len(cf_bytes), 0o644, b"0"))
+        control_tar.extend(pad512(cf_bytes))
     control_tar.extend(b"\0" * 1024)
     control_gz_bytes = compress_gz(bytes(control_tar))
 
@@ -486,24 +508,87 @@ exit 0
 """
 
 INSTALL_SH = """#!/bin/sh
-# MWAN4 離線安裝腳本（自動尋找 mwan4-*-bundle.tar.gz）
+# MWAN4 離線安裝腳本
+#
+# 安全注意：只接受「腳本所在目錄」或命令列明確指定的 bundle。
+# 舊版會自動從 /tmp 取 mwan4-*-bundle.tar.gz —— /tmp 是 1777，任何本機使用者
+# 都能預置一個含惡意 /usr/bin/mwan4 的 tar，管理員一執行 install.sh 就以 root
+# 解壓並執行，等同本機提權。這裡同時拒絕含絕對路徑或 .. 的 tar 成員。
 set -e
 
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 BUNDLE=""
-for candidate in /tmp/mwan4-*-bundle.tar.gz ./mwan4-*-bundle.tar.gz; do
-    if [ -f "$candidate" ]; then
-        BUNDLE="$candidate"
-        break
-    fi
-done
 
-if [ -z "$BUNDLE" ]; then
-    echo "Error: mwan4-*-bundle.tar.gz not found (looked in /tmp and current dir)" >&2
+if [ -n "$1" ]; then
+    BUNDLE="$1"
+else
+    for candidate in "$SCRIPT_DIR"/mwan4-*-bundle.tar.gz; do
+        [ -f "$candidate" ] || continue
+        if [ -n "$BUNDLE" ]; then
+            echo "Error: multiple bundles found in $SCRIPT_DIR; pass one explicitly" >&2
+            exit 1
+        fi
+        BUNDLE="$candidate"
+    done
+fi
+
+if [ -z "$BUNDLE" ] || [ ! -f "$BUNDLE" ]; then
+    echo "Error: bundle not found." >&2
+    echo "Usage: $0 [path/to/mwan4-<arch>-bundle.tar.gz]" >&2
+    exit 1
+fi
+
+BUNDLE_DIR=$(CDPATH= cd "$(dirname "$BUNDLE")" && pwd)
+BUNDLE_NAME=$(basename "$BUNDLE")
+
+# 完整性檢查：同目錄有 SHA256SUMS 就必須通過（bundle 未簽名，這只防傳輸損壞/誤放）
+if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
+    line=$(grep -F "  $BUNDLE_NAME" "$BUNDLE_DIR/SHA256SUMS" || true)
+    if [ -z "$line" ]; then
+        echo "Error: $BUNDLE_NAME is not listed in $BUNDLE_DIR/SHA256SUMS" >&2
+        exit 1
+    fi
+    want=$(printf '%s\\n' "$line" | cut -d' ' -f1)
+    got=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
+    if [ "$want" != "$got" ]; then
+        echo "Error: checksum verification failed for $BUNDLE_NAME" >&2
+        exit 1
+    fi
+    echo "==> Bundle checksum verified"
+fi
+
+# 解壓前拒絕絕對路徑與 .. 成員
+if tar -tzf "$BUNDLE" | grep -Eq '^/|(^|/)\\.\\.(/|$)'; then
+    echo "Error: $BUNDLE_NAME contains unsafe paths, refusing to extract" >&2
     exit 1
 fi
 
 echo "==> Installing MWAN4 from $BUNDLE ..."
+
+# 先備份既有設定：bundle 內含出廠預設設定，直接解壓會覆蓋使用者調整過的內容
+BACKUP_DIR=/etc/mwan4/preinstall-backup
+saved_uci=0
+saved_json=0
+if [ -f /etc/config/mwan4 ]; then
+    mkdir -p "$BACKUP_DIR"
+    cp -p /etc/config/mwan4 "$BACKUP_DIR/config.mwan4"
+    saved_uci=1
+fi
+if [ -f /etc/mwan4/mwan4.json ]; then
+    mkdir -p "$BACKUP_DIR"
+    cp -p /etc/mwan4/mwan4.json "$BACKUP_DIR/mwan4.json"
+    saved_json=1
+fi
+
 tar -xzf "$BUNDLE" -C /
+
+# 還原使用者設定（存在才還原；全新安裝則採用 bundle 內的預設值）
+if [ "$saved_uci" -eq 1 ]; then
+    cp -p "$BACKUP_DIR/config.mwan4" /etc/config/mwan4
+fi
+if [ "$saved_json" -eq 1 ]; then
+    cp -p "$BACKUP_DIR/mwan4.json" /etc/mwan4/mwan4.json
+fi
 
 chmod +x /usr/bin/mwan4 /etc/init.d/mwan4
 
@@ -597,11 +682,15 @@ def build_luci_data_entries(menu_data: bytes, acl_data: bytes, view_data: bytes,
         {"name": "www/luci-static/resources/view/mwan4/overview.js", "data": view_data, "mode": 0o644},
     ]
     if lmo_data is not None:
+        # 現代 LuCI（21.02+）的簡體中文語言碼是 zh_Hans；舊版是 zh-cn。
+        # lmo_load_catalog() 以語言碼精確匹配檔名，只裝舊名在中文環境下會完全載不到。
+        # 兩個檔名裝同一份內容，新舊版本都能正確顯示中文。
         entries += [
             {"name": "usr/lib", "is_dir": True},
             {"name": "usr/lib/lua", "is_dir": True},
             {"name": "usr/lib/lua/luci", "is_dir": True},
             {"name": "usr/lib/lua/luci/i18n", "is_dir": True},
+            {"name": "usr/lib/lua/luci/i18n/mwan4.zh_Hans.lmo", "data": lmo_data, "mode": 0o644},
             {"name": "usr/lib/lua/luci/i18n/mwan4.zh-cn.lmo", "data": lmo_data, "mode": 0o644},
         ]
     return entries
@@ -689,6 +778,9 @@ def main() -> int:
     private_key, _key_origin = load_or_create_signing_key()
     pub_pem = public_key_pem(private_key)
     pub_key_path = args.key_out or os.path.join(PKG_DIR, PUB_KEY_NAME)
+    key_parent = os.path.dirname(pub_key_path)
+    if key_parent:
+        os.makedirs(key_parent, exist_ok=True)
     with open(pub_key_path, "wb") as f:
         f.write(pub_pem)
     fingerprint = public_key_fingerprint(private_key)
@@ -706,8 +798,11 @@ def main() -> int:
     view_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "htdocs", "luci-static", "resources", "view", "mwan4", "overview.js")
 
     # 翻譯：由 .po 即時編譯（見 build_lmo_bytes 的說明），確保出廠翻譯不落後於來源。
-    lmo_data = build_lmo_bytes(os.path.join(ROOT_DIR, "openwrt", "luci-app-mwan4", "po", "zh-cn", "mwan4.po"))
-    log(f"[+] Compiled translations: mwan4.zh-cn.lmo ({len(lmo_data)} bytes)")
+    # 用 zh_Hans（現代 LuCI 語言碼）當來源，打包時同時裝 zh_Hans 與舊的 zh-cn 檔名。
+    lmo_data = build_lmo_bytes(
+        os.path.join(ROOT_DIR, "openwrt", "luci-app-mwan4", "po", "zh_Hans", "mwan4.po")
+    )
+    log(f"[+] Compiled translations: mwan4.zh_Hans.lmo + mwan4.zh-cn.lmo ({len(lmo_data)} bytes)")
 
     luci_data_entries = build_luci_data_entries(menu_data, acl_data, view_data, lmo_data)
 
@@ -750,6 +845,7 @@ def main() -> int:
             data_entries=data_entries,
             postinst=POST_INSTALL_TEMPLATE,
             depends=["libc"],
+            conffiles=["/etc/config/mwan4", "/etc/mwan4/mwan4.json"],
         )
 
         bundle_path = os.path.join(OUTPUT_DIR, f"mwan4-{arch.key}-bundle.tar.gz")
@@ -769,7 +865,7 @@ def main() -> int:
         data_entries=luci_data_entries,
         private_key=private_key,
         post_install=LUCI_POST_INSTALL,
-        depends=[PKG_NAME],
+        depends=[PKG_NAME, "luci-base"],
     )
 
     create_ipk_package(
@@ -780,7 +876,7 @@ def main() -> int:
         desc="LuCI support for MWAN4 multi-WAN failover & balancing",
         data_entries=luci_data_entries,
         postinst=LUCI_POST_INSTALL,
-        depends=[PKG_NAME],
+        depends=[PKG_NAME, "luci-base"],
     )
 
     # --- 5. 一鍵安裝腳本 ---
@@ -788,6 +884,25 @@ def main() -> int:
     with open(install_sh_path, "wb") as f:
         f.write(INSTALL_SH.replace("\r\n", "\n").encode("utf-8"))
     log(f"[+] Created one-click install script: {install_sh_path}")
+
+    # --- 6. bundle 校驗和（install.sh 解壓前核對；純完整性，不是簽名） ---
+    bundles = sorted(
+        name
+        for name in os.listdir(OUTPUT_DIR)
+        if name.startswith("mwan4-") and name.endswith("-bundle.tar.gz")
+    )
+    if bundles:
+        lines = []
+        for name in bundles:
+            digest = hashlib.sha256()
+            with open(os.path.join(OUTPUT_DIR, name), "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            lines.append(f"{digest.hexdigest()}  {name}")
+        sums_path = os.path.join(OUTPUT_DIR, "SHA256SUMS")
+        with open(sums_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        log(f"[+] Created bundle checksums: {sums_path}")
 
     log("\nBuild complete!")
     return 0

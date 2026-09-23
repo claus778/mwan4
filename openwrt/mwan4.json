@@ -4,6 +4,7 @@
   "window_size": 10,
   "loss_threshold_down": 0.5,
   "loss_threshold_up": 0.1,
+  "degrade_loss_threshold":0.2,"degrade_hysteresis":0.1,"degrade_exit_samples":6,
   "consecutive_fail_down": 3,
   "recovery_success_count": 5,
   "max_rtt_ms": 1500.0,
@@ -12,15 +13,22 @@
   "route_priority": 0,
   "remove_routes_on_exit": false,
   "ecmp_mode": "standard",
+  "_capacity_proportional_comment": "每條 interface 都設定 max_mbps 時，ECMP 基準權重自動 ∝ max_mbps（容量比例分流）",
+  "_load_aware_comment": "true 時在容量比例的基準上，再依實測速率 vs max_mbps/up_mbps 把過載線的權重下修、讓部分 flow 轉到空閒線；啟用時每條 interface 都必須填 max_mbps",
+  "load_aware": false,
+  "load_target_ratio": 0.8,
+  "load_recover_ratio": 0.6,
   "interfaces": [
     {
       "name": "wan1",
       "gateway": "192.168.1.1",
       "metric": 1,
       "weight": 1,
+      "max_mbps": 1000,
+      "up_mbps": 100,
       "probe_targets": [
-        "1.1.1.1:443",
-        "8.8.8.8:443"
+        "223.5.5.5:53",
+        "114.114.114.114:53"
       ]
     },
     {
@@ -28,9 +36,11 @@
       "gateway": "192.168.2.1",
       "metric": 1,
       "weight": 1,
+      "max_mbps": 500,
+      "up_mbps": 50,
       "probe_targets": [
-        "1.1.1.1:443",
-        "8.8.8.8:443"
+        "223.5.5.5:53",
+        "114.114.114.114:53"
       ]
     }
   ]

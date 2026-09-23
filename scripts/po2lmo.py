@@ -80,13 +80,20 @@ def parse_po(filename):
 
     current_msg = {"ctxt": None, "id": None, "str": None}
     state = None
+    # `#, fuzzy` 表示翻譯尚未定稿（msgmerge 後常見）：不要編進 UI，
+    # 否則使用者會看到半成品翻譯，而譯者以為還標著 fuzzy 沒人用。
+    current_fuzzy = False
 
     lines = content.splitlines()
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line:
             continue
-        
+        if line.startswith('#'):
+            if line.startswith('#,') and 'fuzzy' in line:
+                current_fuzzy = True
+            continue
+
         m_ctxt = re.match(r'^msgctxt\s+"(.*)"$', line)
         m_id = re.match(r'^msgid\s+"(.*)"$', line)
         m_str = re.match(r'^msgstr\s+"(.*)"$', line)
@@ -94,14 +101,18 @@ def parse_po(filename):
 
         if m_ctxt:
             if current_msg["id"] is not None and current_msg["str"] is not None:
-                entries.append(current_msg)
+                if not current_fuzzy:
+                    entries.append(current_msg)
                 current_msg = {"ctxt": None, "id": None, "str": None}
+                current_fuzzy = False
             current_msg["ctxt"] = unescape_po(m_ctxt.group(1))
             state = "ctxt"
         elif m_id:
             if current_msg["id"] is not None and current_msg["str"] is not None:
-                entries.append(current_msg)
+                if not current_fuzzy:
+                    entries.append(current_msg)
                 current_msg = {"ctxt": None, "id": None, "str": None}
+                current_fuzzy = False
             current_msg["id"] = unescape_po(m_id.group(1))
             state = "id"
         elif m_str:
@@ -117,7 +128,8 @@ def parse_po(filename):
                 current_msg["str"] += val
 
     if current_msg["id"] is not None and current_msg["str"] is not None:
-        entries.append(current_msg)
+        if not current_fuzzy:
+            entries.append(current_msg)
 
     return entries
 

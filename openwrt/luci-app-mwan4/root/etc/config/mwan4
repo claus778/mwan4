@@ -4,8 +4,18 @@ config global 'global'
 	option probe_timeout_ms '400'
 	option window_size '10'
 	option loss_threshold_down '0.5'
-	# 恢復門檻：滑動窗口丟包率「不超過」這個值才允許回 UP（預設 0.1 = 10%）
+	# 恢復門檻：滑動窗口丟包率「不超過」這個值才允許回 UP。
+	# 目前已不再由 daemon 讀取（恢復只看 recovery_success_count 與 RTT），保留僅為相容舊設定
 	option loss_threshold_up '0.1'
+	# 降級門檻：滑動窗口已填滿且丟包率 >= 這個值時，該線不參與 ECMP（仍繼續探測，
+	# 品質恢復後自動回歸）。必須小於 loss_threshold_down（0.5）。設 0 可關閉此功能
+	option degrade_loss_threshold '0.2'
+	# 降級遲滯：退出降級需要丟包率 <= 降級門檻 - 這個值（預設 0.2 - 0.1 = 0.1）。
+	# 窗口步長是 10%，注入 12%~30% 丟包時丟包率會在 10%/20%/30% 之間擺動，
+	# 沒有遲滯就會每幾秒進出一次降級、反覆重下路由。必須嚴格小於降級門檻
+	option degrade_hysteresis '0.1'
+	# 退出降級所需的「連續」樣本次數（預設 6，約 3 秒）。中間夾一次不達標就重新數
+	option degrade_exit_samples '6'
 	option consecutive_fail_down '3'
 	option recovery_success_count '5'
 	option max_rtt_ms '1500'
@@ -19,6 +29,21 @@ config global 'global'
 	# resilient: 使用內核 resilient nexthop group（需 Linux 5.14+），只重映射故障線路的連線
 	# auto: 優先 resilient，內核不支援時自動退回 standard
 	option ecmp_mode 'standard'
+	# 多路徑哈希策略：空 = 沿用系統預設（多數為 l4）。可選 l3 / l4 / inner
+	option multipath_hash_policy ''
+	# 負載感知分流：啟用後依實測速率 vs 每條 interface 的容量，把過載線的 ECMP
+	# 權重下修、讓部分 flow 轉到空閒線。啟用時每條 interface 都必須填 max_mbps，
+	# 否則 daemon --check-config 會拒絕啟動
+	option load_aware '0'
+	# 過載門檻 / 解除門檻（比例）：利用率 >= 前者開始下修，<= 後者才完全恢復；
+	# 兩者之間是遲滯死區，用來避免權重來回震盪
+	option load_target_ratio '0.80'
+	option load_recover_ratio '0.60'
+	# ECMP 權重模式：static（預設，固定 weight）/ quality（依實測丟包與 RTT 動態調整）
+	option weight_mode 'static'
+	# 動態權重的最小更新間隔（毫秒）與下修下限（比例）
+	option dynamic_weight_interval_ms '10000'
+	option dynamic_weight_min_ratio '0.25'
 
 config interface 'wan1'
 	option enabled '1'
@@ -26,8 +51,12 @@ config interface 'wan1'
 	option gateway '192.168.1.1'
 	option metric '10'
 	option weight '1'
-	list probe_targets '1.1.1.1:443'
-	list probe_targets '8.8.8.8:443'
+	# 這條線的最大頻寬（Mbps）：設定後 ECMP 基準權重自動 ∝ 最大頻寬，
+	# 也作為 LAN 下載方向的容量；up 是 LAN 上傳方向（非對稱線路才需填，未填沿用 max）
+	#option max_mbps '1000'
+	#option up_mbps '50'
+	list probe_targets '223.5.5.5:53'
+	list probe_targets '114.114.114.114:53'
 
 config interface 'wan2'
 	option enabled '1'
@@ -35,5 +64,14 @@ config interface 'wan2'
 	option gateway '192.168.2.1'
 	option metric '10'
 	option weight '1'
-	list probe_targets '1.1.1.1:443'
-	list probe_targets '8.8.8.8:443'
+	list probe_targets '223.5.5.5:53'
+	list probe_targets '114.114.114.114:53'
+
+# 策略分流：匹配來源（可選目的）的流量走指定 WAN，其餘仍走 ECMP。
+# 目標 WAN 被判 DOWN 時規則自動移除，流量回退 ECMP。可有多個 config policy 段。
+#config policy 'guest'
+#	option name 'guest'
+#	list source '192.168.3.0/24'
+#	list destination '10.0.0.0/8'
+#	option interface 'wan2'
+#	option priority '9000'

@@ -10,6 +10,12 @@ msgstr "Content-Type: text/plain; charset=UTF-8\n"
 msgid "MWAN4 Load Balancing"
 msgstr "MWAN4 多路分流"
 
+msgid "Basic"
+msgstr "基础"
+
+msgid "Advanced"
+msgstr "高级"
+
 msgid "Unknown"
 msgstr "未知"
 
@@ -136,8 +142,8 @@ msgstr "优先级 / 权重"
 msgid "Metric (Priority)"
 msgstr "跃点优先级 (Metric)"
 
-msgid "Lower = higher priority. Same metric = ECMP aggregation, different metrics = primary/backup failover."
-msgstr "数值越小优先级越高；metric 相同走 ECMP 聚合，不同则走主备故障转移。"
+msgid "Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover."
+msgstr "数值越小优先级越高；metric 相同走 ECMP 负载均衡（多流分流），不同则走主备故障转移。"
 
 msgid "ECMP weight for interfaces with the same metric."
 msgstr "同一 metric 网卡之间的流量分配权重。"
@@ -157,3 +163,164 @@ msgstr "自动（内核支持时使用弹性模式）"
 msgid "Resilient nexthop group (require kernel support)"
 msgstr "弹性 nexthop 组（需内核支持）"
 
+msgid "Throughput (TX / RX)"
+msgstr "实时吞吐 (发送 / 接收)"
+
+msgid " (inactive)"
+msgstr "（未生效）"
+
+msgid "Policy Routing:"
+msgstr "策略分流："
+
+msgid "Multipath Hash Policy"
+msgstr "多路径哈希策略"
+
+msgid "Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start."
+msgstr "内核 fib_multipath_hash_policy。l4（多数系统默认）同时哈希端口，分流最均匀；l3 只哈希地址；inner 还会使用隧道内层头。启动时写入。"
+
+msgid "L3 (addresses only)"
+msgstr "L3（仅地址）"
+
+msgid "L4 (addresses + ports, recommended)"
+msgstr "L4（地址 + 端口，推荐）"
+
+msgid "L3 + tunnel inner headers"
+msgstr "L3 + 隧道内层头"
+
+msgid "ECMP Weight Mode"
+msgstr "ECMP 权重模式"
+
+msgid "quality adjusts each active WAN weight from measured loss and RTT (rate-limited, may rehash flows); static keeps the configured weights."
+msgstr "quality 依据实测丢包与 RTT 动态调整各线路权重（有限速，可能触发重哈希）；static 使用配置的固定权重。"
+
+msgid "Static (configured weights)"
+msgstr "静态（使用配置权重）"
+
+msgid "Quality-aware (dynamic)"
+msgstr "质量感知（动态）"
+
+msgid "Dynamic Weight Update Interval (ms)"
+msgstr "动态权重更新间隔（毫秒）"
+
+msgid "Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route."
+msgstr "两次动态权重更新之间的最小间隔（默认 10000 毫秒）。每次更新都会重新下发 ECMP 路由。"
+
+msgid "Dynamic Weight Floor (ratio)"
+msgstr "动态权重下限（比例）"
+
+msgid "Lowest fraction of the configured weight a poor-quality or overloaded line can be scaled to (default: 0.25). Lines that are truly unusable are still removed by the degrade/DOWN logic."
+msgstr "质量差或过载的线路最多被下修到配置权重的这个比例（默认 0.25）。真正不可用的线路仍由降级/DOWN 机制移出。"
+
+msgid "Load-aware Traffic Shifting"
+msgstr "负载感知流量转移"
+
+msgid "When a WAN utilisation (measured tx/rx against its max_mbps/up_mbps) exceeds the target ratio, lower its ECMP weight so part of the flows move to the idle WANs. Rate-limited by the update interval above; every interface then needs max_mbps."
+msgstr "当某条 WAN 的利用率（按实测 tx/rx 与该接口的 max_mbps/up_mbps 计算）超过目标比例时，下修其 ECMP 权重，把部分 flow 转移到空闲的 WAN。更新节流沿用上面的间隔；启用后每条 interface 都必须填 max_mbps。"
+
+msgid "Load Offload Threshold (ratio)"
+msgstr "负载转移触发阈值（比例）"
+
+msgid "Utilisation at or above which a WAN starts shedding weight (default: 0.80 = 80%). Must be greater than the recover ratio."
+msgstr "利用率达到或超过该值时，该 WAN 开始下修权重（默认 0.80 = 80%）。必须大于恢复阈值。"
+
+msgid "Load Recover Threshold (ratio)"
+msgstr "负载恢复阈值（比例）"
+
+msgid "Utilisation at or below which a throttled WAN fully regains its configured weight (default: 0.60). The gap to the offload threshold is hysteresis against weight oscillation."
+msgstr "利用率降到该值及以下时，被下修的 WAN 完全恢复配置权重（默认 0.60）。与触发阈值之间的差值是避免权重来回震荡的迟滞。"
+
+msgid "Max Bandwidth (Mbps)"
+msgstr "最大带宽（Mbps）"
+
+msgid "Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled."
+msgstr "线路容量。所有 interface 都填写时，ECMP 权重自动按它成比例（weight × max_mbps）；同时也是负载感知使用的 LAN 下载方向容量。启用负载感知流量转移时每条 interface 必填。"
+
+msgid "Up Capacity (Mbps)"
+msgstr "上行容量（Mbps）"
+
+msgid "Upload (LAN upload) capacity for asymmetric lines. Leave empty to reuse the max bandwidth."
+msgstr "非对称线路的上传（LAN 上传）容量。留空则沿用最大带宽。"
+
+msgid "offloaded"
+msgstr "已转移"
+
+msgid "Policy Routing (Source / Destination)"
+msgstr "策略分流（来源 / 目的）"
+
+msgid "Send traffic matching a source (and optionally destination) prefix through a specific WAN using fib rules. Non-matching traffic keeps using ECMP. Rules are removed automatically while the target WAN is down, so traffic falls back to ECMP."
+msgstr "让匹配来源（可选目的）前缀的流量经 fib 规则走指定 WAN，未匹配流量仍走 ECMP。目标 WAN 下线时规则自动移除，流量回退 ECMP。"
+
+msgid "Rule Name"
+msgstr "规则名称"
+
+msgid "Unique name used in logs and status."
+msgstr "用于日志与状态显示的唯一名称。"
+
+msgid "Source Prefixes (CIDR)"
+msgstr "来源前缀 (CIDR)"
+
+msgid "IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source."
+msgstr "IPv4 来源前缀，例如 192.168.3.0/24。留空 = 匹配任意来源。"
+
+msgid "Destination Prefixes (CIDR)"
+msgstr "目的前缀 (CIDR)"
+
+msgid "Optional IPv4 destination prefixes. Leave empty to match any destination."
+msgstr "可选的 IPv4 目的前缀。留空 = 匹配任意目的。"
+
+msgid "Target WAN"
+msgstr "目标 WAN"
+
+msgid "Traffic matching this rule is routed through this WAN while it is healthy."
+msgstr "匹配此规则的流量在该 WAN 健康时经它转发。"
+
+msgid "Rule Priority"
+msgstr "规则优先级"
+
+msgid "Optional fib-rule priority (9000-9063); lower matches first. Either set it on every rule or on none."
+msgstr "可选的 fib 规则优先级（9000-9063），数值越小越先匹配。要么每条规则都设置，要么都不设置。"
+
+msgid "Degrade Loss Threshold"
+msgstr "降级丢包阈值"
+
+msgid "Flush Conntrack on Active Set Change"
+msgstr "成员变化时清理 conntrack"
+
+msgid "Remove Default Route on Exit"
+msgstr "退出时删除默认路由"
+
+msgid "Last probe error: "
+msgstr "最近探测错误："
+
+msgid "Local problem (packets never left the device): "
+msgstr "本机问题（封包未发出网卡）："
+
+msgid "No status file"
+msgstr "无状态文件"
+
+msgid "No status file yet: the daemon has not written one (or it just started)."
+msgstr "尚无状态文件：守护进程尚未写入（或刚启动）。"
+
+msgid "Not trustworthy (clock skew)"
+msgstr "不可信（时钟偏差）"
+
+msgid "Online (UP, degraded - not carrying traffic)"
+msgstr "在线（UP，已降级——不承载流量）"
+
+msgid "Status File:"
+msgstr "状态文件："
+
+msgid "Status is stale: the daemon may have stopped. This is the last known state."
+msgstr "状态已过期：守护进程可能已停止，这是最后已知状态。"
+
+msgid "Stopped (status is stale)"
+msgstr "已停止（状态过期）"
+
+msgid "ago"
+msgstr "前"
+
+msgid "clock skew"
+msgstr "时钟偏差"
+
+msgid "missing"
+msgstr "缺失"

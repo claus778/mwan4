@@ -1,6 +1,6 @@
 [package]
 name = "mwan4"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 # edition 2024 需要 rustc >= 1.85；明確宣告讓舊工具鏈（例如 OpenWrt SDK 內建的
 # rustc）在建置階段就報錯，而不是吐出難以理解的語法錯誤。

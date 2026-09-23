@@ -31,6 +31,15 @@ function listNetdevs() {
 	});
 }
 
+/* 容忍的時鐘偏差（秒）：瀏覽器時鐘落後路由器時，只有差距超過這個值才說
+   「無法判斷」。實測路由器（NTP 同步）與瀏覽器差十幾秒是常態，
+   原本用 stale_after_secs（10 秒）當門檻會把正常運作誤報成 clock skew。 */
+var CLOCK_SKEW_TOLERANCE_SECS = 300;
+
+/* 上一次看到的 updated_at：用來判斷 daemon 是否還在寫狀態檔。
+   兩邊時鐘差多少不影響這個判斷——只要 updated_at 還在變大，daemon 就是活的。 */
+var lastSeenUpdatedAt = null;
+
 /* 狀態檔新鮮度：卡片與徽章都必須據此判斷，否則 daemon 被殺掉之後
    最後一次快照（可能剛好是兩條 DOWN）會被當成即時狀態一直顯示。
    回傳 'fresh' | 'stale' | 'skew' | 'missing' */
@@ -38,12 +47,19 @@ function freshnessOf(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return 'missing';
 	var staleAfter = statusData.stale_after_secs || 10;
-	var age = Date.now() / 1000 - statusData.updated_at;
+	var updated = statusData.updated_at;
+	var advanced = lastSeenUpdatedAt !== null && updated > lastSeenUpdatedAt;
+	if (lastSeenUpdatedAt === null || updated > lastSeenUpdatedAt)
+		lastSeenUpdatedAt = updated;
+	// daemon 還在推進 updated_at → 確定活著，與兩邊時鐘差多少無關
+	if (advanced)
+		return 'fresh';
+
+	var age = Date.now() / 1000 - updated;
 	if (age > staleAfter)
 		return 'stale';
-	// 路由器時鐘超前瀏覽器太多時無法斷定「還在跑」還是「時鐘不同步」；
-	// 這種情況一律當作「不可信」處理（卡片同樣標成陳舊），不要假裝新鮮
-	if (age < -staleAfter)
+	// 瀏覽器時鐘落後：只有差距大到無法用「時鐘偏差」解釋時才說不可判斷
+	if (age < -CLOCK_SKEW_TOLERANCE_SECS)
 		return 'skew';
 	return 'fresh';
 }
@@ -81,9 +97,15 @@ function runText(fresh) {
 	return _('Not trustworthy (clock skew)');
 }
 
-function stateText(up) { return up ? _('Online (UP)') : _('Offline (DOWN)'); }
+function stateText(iface) {
+	if (iface.state !== 'UP') return _('Offline (DOWN)');
+	// 降級 = 仍 UP、仍探測，但已因實測丟包率超標被移出 ECMP（見 degrade_loss_threshold）
+	return iface.degraded
+		? _('Online (UP, degraded - not carrying traffic)')
+		: _('Online (UP)');
+}
 
-/* 卡片提示：資料不可信 > 本機條件錯誤 > 一般探針錯誤 */
+/* 卡片提示：資料不可信 > 本機條件錯誤 > 一般探針錯誤 > 降級 */
 function cardAlert(iface, fresh) {
 	if (fresh === 'stale')
 		return _('Status is stale: the daemon may have stopped. This is the last known state.');
@@ -96,6 +118,10 @@ function cardAlert(iface, fresh) {
 		return _('Local problem (packets never left the device): ') + iface.last_error;
 	if (iface.last_error)
 		return _('Last probe error: ') + iface.last_error;
+	if (iface.degraded)
+		return _('Degraded: sliding-window packet loss reached the degrade threshold, so this WAN ' +
+			'is excluded from the default route. It is still probed and rejoins automatically ' +
+			'once its loss drops.');
 	return '';
 }
 
@@ -103,9 +129,8 @@ function cardAlert(iface, fresh) {
 function statusAgeText(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return _('missing');
-	var staleAfter = statusData.stale_after_secs || 10;
 	var age = Date.now() / 1000 - statusData.updated_at;
-	if (age < -staleAfter)
+	if (age < -CLOCK_SKEW_TOLERANCE_SECS)
 		return _('clock skew');
 	if (age < 60)
 		return Math.max(0, Math.round(age)) + ' s ' + _('ago');
@@ -131,7 +156,38 @@ function routeInfo(statusData) {
 function rttText(iface) { return iface.state === 'UP' ? iface.rtt_ms.toFixed(1) + ' ms' : '--'; }
 function jitterText(iface) { return iface.state === 'UP' ? iface.jitter_ms.toFixed(1) + ' ms' : '--'; }
 function lossText(iface) { return (iface.loss_rate || 0).toFixed(1) + '%'; }
-function pwText(iface) { return (iface.metric ? ('P:' + iface.metric + ' / ') : '') + 'W:' + iface.weight; }
+function pwText(iface) {
+	var w = 'W:' + iface.weight;
+	// 動態權重啟用且與設定值不同時一併顯示，方便驗證品質感知分流
+	if (iface.effective_weight !== undefined && iface.effective_weight !== iface.weight)
+		w = 'W:' + iface.weight + ' \u2192 ' + iface.effective_weight;
+	return (iface.metric ? ('P:' + iface.metric + ' / ') : '') + w;
+}
+function formatRate(bps) {
+	if (!bps || bps < 1000) return '0 bps';
+	var units = ['Kbps', 'Mbps', 'Gbps'];
+	var v = bps / 1000, i = 0;
+	while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+	return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
+}
+function rateText(iface) {
+	if (iface.state !== 'UP') return '\u2191 --  \u2193 --';
+	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
+	// 負載感知啟用且該線設有容量時，附上利用率與是否正被下修
+	if (iface.load_pct !== undefined && iface.load_pct !== null) {
+		text += '  (' + iface.load_pct.toFixed(0) + '%';
+		if (iface.offloaded) text += ', ' + _('offloaded');
+		text += ')';
+	}
+	return text;
+}
+function policyText(statusData) {
+	var list = (statusData && statusData.policies) ? statusData.policies : [];
+	if (!list.length) return null;
+	return list.map(function(p) {
+		return p.name + '\u2192' + p.interface + (p.active ? '' : _(' (inactive)'));
+	}).join(', ');
+}
 function succText(iface) { return _('Consecutive Successes: ') + iface.consecutive_successes; }
 function toText(iface) { return _('Consecutive Timeouts: ') + iface.consecutive_timeouts; }
 
@@ -218,6 +274,16 @@ return view.extend({
 					E('span', { 'class': 'mwan4-badge' }, [
 						E('span', { 'data-role': 'age-text' }, statusAgeText(statusData))
 					])
+				]),
+				E('span', {
+					'class': 'mwan4-meta-item',
+					'data-role': 'policy-item',
+					'style': policyText(statusData) ? '' : 'display: none'
+				}, [
+					E('span', { 'class': 'mwan4-meta-key' }, _('Policy Routing:')),
+					E('span', { 'class': 'mwan4-badge' }, [
+						E('span', { 'data-role': 'policy-text' }, policyText(statusData) || '')
+					])
 				])
 			])
 		]);
@@ -243,7 +309,7 @@ return view.extend({
 				]),
 				E('span', { 'class': 'mwan4-badge' }, [
 					dot(up ? 'ok' : 'bad', 'state-dot'),
-					E('span', { 'data-role': 'state-text' }, stateText(up))
+					E('span', { 'data-role': 'state-text' }, stateText(iface))
 				])
 			]),
 			E('div', {
@@ -275,6 +341,12 @@ return view.extend({
 					E('span', { 'class': 'mwan4-stat-label' }, _('Priority / Weight')),
 					E('span', { 'class': 'mwan4-stat-val' }, [
 						E('span', { 'data-role': 'pw' }, pwText(iface))
+					])
+				]),
+				E('div', { 'class': 'mwan4-stat-item' }, [
+					E('span', { 'class': 'mwan4-stat-label' }, _('Throughput (TX / RX)')),
+					E('span', { 'class': 'mwan4-stat-val mwan4-mono' }, [
+						E('span', { 'data-role': 'rate' }, rateText(iface))
 					])
 				])
 			]),
@@ -329,7 +401,7 @@ return view.extend({
 		var lLevel = lossLevel(loss);
 		var stale = (fresh === 'stale' || fresh === 'skew');
 
-		setText(pick(card, 'state-text'), stateText(up));
+		setText(pick(card, 'state-text'), stateText(iface));
 		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + (up ? 'ok' : 'bad'));
 
 		// 過期／本機條件錯誤一律標在卡片上：不要讓「最後一次快照」偽裝成即時狀態
@@ -356,6 +428,7 @@ return view.extend({
 
 		setText(pick(card, 'succ'), succText(iface));
 		setText(pick(card, 'to'), toText(iface));
+		setText(pick(card, 'rate'), rateText(iface));
 	},
 
 	applyStatus: function(statusData) {
@@ -368,6 +441,10 @@ return view.extend({
 			setText(pick(header, 'route-text'), ri.text);
 			setCls(pick(header, 'route-dot'), 'mwan4-dot ' + ri.level);
 			setText(pick(header, 'age-text'), statusAgeText(statusData));
+			var pt = policyText(statusData);
+			var policyItem = pick(header, 'policy-item');
+			if (policyItem) policyItem.style.display = pt ? '' : 'none';
+			setText(pick(header, 'policy-text'), pt || '');
 		}
 
 		var container = document.getElementById('mwan4_cards_container');
@@ -815,63 +892,103 @@ return view.extend({
 		// 2 秒一拉的頻率對低配路由器上的 uhttpd/rpcd 是純粹的常駐開銷
 		poll.add(this.pollFn, 5);
 
+
 		// Configuration form
-		m = new form.Map('mwan4', _('MWAN4 Configuration'), _('Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon.'));
+		m = new form.Map('mwan4', _('MWAN4 Configuration'));
 
-		// Global settings
+		// Global settings (tabbed: basic / advanced)
 		s = m.section(form.NamedSection, 'global', 'global', _('Global Settings'));
+		s.tab('basic', _('Basic'));
+		s.tab('advanced', _('Advanced'));
 
-		o = s.option(form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
+		o = s.taboption('basic', form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
 		o.default = o.enabled;
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'check_interval_ms', _('Probe Interval (ms)'), _('Probe interval per interface (default: 500 ms)'));
+		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'));
 		o.datatype = 'uinteger';
 		o.default = '500';
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'), _('Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)'));
+		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'));
 		o.datatype = 'uinteger';
 		o.default = '400';
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'window_size', _('Sliding Window Size'), _('Number of probe samples to calculate loss rate and smoothed RTT (default: 10)'));
+		o = s.taboption('basic', form.Value, 'window_size', _('Sliding Window Size'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'), _('Consecutive probe timeouts before interface is marked DOWN (default: 3)'));
+		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'));
 		o.datatype = 'uinteger';
 		o.default = '3';
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'), _('Consecutive successful probes required before recovering to UP. The sliding-window loss rate must also stay at or below the recovery loss threshold (default 0.10).'));
+		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'));
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'loss_threshold_up', _('Recovery Loss Threshold'), _('Sliding-window loss rate must be AT OR BELOW this value to recover (default 0.10 = 10%). Raise it if a jittery line recovers too slowly.'));
-		o.default = '0.1';
-		o.rmempty = false;
-
-		o = s.option(form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'), _('Flush TCP/UDP connections on an interface when it goes down.'));
-		o.default = o.enabled;
-
-		o = s.option(form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Active Set Change'), _('Standard ECMP only: when the set of active WANs changes, the kernel rehashes multipath and existing flows may move. In primary/backup mode only the newly entered WAN is flushed, so a recovering primary no longer resets healthy backup connections.'));
-		o.default = o.enabled;
-
-		o = s.option(form.Flag, 'remove_routes_on_exit', _('Remove Default Route on Exit'), _('Leave disabled (recommended). Removing the default route on stop/restart leaves the whole router without an exit while the new instance starts, and cannot recover if that instance fails.'));
-		o.default = o.disabled;
-
-		o = s.option(form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'), _('standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+).'));
+		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'));
 		o.value('standard', _('Standard ECMP (multipath route)'));
 		o.value('auto', _('Automatic (resilient when supported)'));
 		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
 		o.default = 'standard';
 		o.rmempty = false;
 
+		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
+		o.default = '0.2';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.ListValue, 'weight_mode', _('ECMP Weight Mode'));
+		o.value('static', _('Static (configured weights)'));
+		o.value('quality', _('Quality-aware (dynamic)'));
+		o.default = 'static';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms', _('Dynamic Weight Update Interval (ms)'));
+		o.datatype = 'uinteger';
+		o.default = '10000';
+		o.depends('weight_mode', 'quality');
+		o.depends('load_aware', '1');
+
+		o = s.taboption('advanced', form.Value, 'dynamic_weight_min_ratio', _('Dynamic Weight Floor (ratio)'));
+		o.datatype = 'ufloat';
+		o.default = '0.25';
+		o.depends('weight_mode', 'quality');
+		o.depends('load_aware', '1');
+
+		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Traffic Shifting'));
+		o.default = o.disabled;
+
+		o = s.taboption('advanced', form.Value, 'load_target_ratio', _('Load Offload Threshold (ratio)'));
+		o.datatype = 'ufloat';
+		o.default = '0.80';
+		o.depends('load_aware', '1');
+
+		o = s.taboption('advanced', form.Value, 'load_recover_ratio', _('Load Recover Threshold (ratio)'));
+		o.datatype = 'ufloat';
+		o.default = '0.60';
+		o.depends('load_aware', '1');
+
+		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'));
+		o.value('l3', _('L3 (addresses only)'));
+		o.value('l4', _('L4 (addresses + ports, recommended)'));
+		o.value('inner', _('L3 + tunnel inner headers'));
+		o.rmempty = true;
+
+		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'));
+		o.default = o.enabled;
+
+		o = s.taboption('advanced', form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Active Set Change'));
+		o.default = o.enabled;
+
+		o = s.taboption('advanced', form.Flag, 'remove_routes_on_exit', _('Remove Default Route on Exit'));
+		o.default = o.disabled;
+
 		// WAN interface list
-		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'), _('Gateway, ECMP weight and probe targets for each WAN interface.'));
+		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'));
 		s.addremove = true;
 		s.anonymous = false;
 
@@ -879,11 +996,9 @@ return view.extend({
 		o.default = o.enabled;
 		o.editable = true;
 
-		o = s.option(form.Value, 'name', _('Interface Name'), _('KERNEL device name (e.g. eth1, vxlan, pppoe-wan), not the UCI network name. The daemon resolves it with if_nametoindex() and binds probes with SO_BINDTODEVICE; a UCI logical name (wan/wanb…) never works and shows up as a permanently offline card.'));
+		o = s.option(form.Value, 'name', _('Interface Name'));
 		o.rmempty = false;
 		o.editable = true;
-		// 候選值優先給「內核設備名」（/sys/class/net）；取不到才退回 UCI 邏輯名，
-		// 但上面的說明已經明確警告兩者不同名
 		if (netdevs.length) {
 			netdevs.forEach(function(dev) {
 				o.value(dev);
@@ -902,19 +1017,56 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 
-		o = s.option(form.Value, 'metric', _('Metric (Priority)'), _('Lower = higher priority. Same metric = ECMP aggregation, different metrics = primary/backup failover.'));
+		o = s.option(form.Value, 'metric', _('Metric (Priority)'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.editable = true;
 
-		o = s.option(form.Value, 'weight', _('ECMP Weight'), _('ECMP weight for interfaces with the same metric.'));
+		o = s.option(form.Value, 'weight', _('ECMP Weight'));
 		o.datatype = 'uinteger';
 		o.default = '1';
 		o.editable = true;
 
+		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'));
+		o.datatype = 'ufloat';
+		o.editable = true;
+
+		o = s.option(form.Value, 'up_mbps', _('Up Capacity (Mbps)'));
+		o.datatype = 'ufloat';
+		o.editable = true;
+
 		o = s.option(form.DynamicList, 'probe_targets', _('Probe Targets (IP:Port)'));
 		o.datatype = 'ipaddrport(1)';
-		o.default = ['1.1.1.1:443', '8.8.8.8:443'];
+		o.default = ['223.5.5.5:53', '114.114.114.114:53'];
+
+		// Policy routing (source / destination)
+		s = m.section(form.GridSection, 'policy', _('Policy Routing (Source / Destination)'));
+		s.addremove = true;
+		s.anonymous = false;
+		s.sortable = true;
+
+		o = s.option(form.Value, 'name', _('Rule Name'));
+		o.rmempty = false;
+		o.editable = true;
+
+		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'));
+		o.datatype = 'cidr4';
+		o.editable = true;
+
+		o = s.option(form.DynamicList, 'destination', _('Destination Prefixes (CIDR)'));
+		o.datatype = 'cidr4';
+		o.editable = true;
+
+		o = s.option(form.ListValue, 'interface', _('Target WAN'));
+		o.rmempty = false;
+		o.editable = true;
+		uci.sections('mwan4', 'interface').forEach(function(sec) {
+			if (sec.name) o.value(sec.name, sec.name);
+		});
+
+		o = s.option(form.Value, 'priority', _('Rule Priority'));
+		o.datatype = 'uinteger';
+		o.editable = true;
 
 		return m.render().then(function(formNode) {
 			viewRoot.appendChild(formNode);

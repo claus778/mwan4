@@ -4,6 +4,12 @@ msgstr "Content-Type: text/plain; charset=UTF-8\n"
 msgid "MWAN4 Load Balancing"
 msgstr ""
 
+msgid "Basic"
+msgstr ""
+
+msgid "Advanced"
+msgstr ""
+
 msgid "Unknown"
 msgstr ""
 
@@ -145,8 +151,170 @@ msgstr ""
 msgid "Metric (Priority)"
 msgstr ""
 
-msgid "Lower = higher priority. Same metric = ECMP aggregation, different metrics = primary/backup failover."
+msgid "Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover."
 msgstr ""
 
 msgid "ECMP weight for interfaces with the same metric."
+msgstr ""
+
+msgid "Throughput (TX / RX)"
+msgstr ""
+
+msgid " (inactive)"
+msgstr ""
+
+msgid "Policy Routing:"
+msgstr ""
+
+msgid "Multipath Hash Policy"
+msgstr ""
+
+msgid "Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start."
+msgstr ""
+
+msgid "L3 (addresses only)"
+msgstr ""
+
+msgid "L4 (addresses + ports, recommended)"
+msgstr ""
+
+msgid "L3 + tunnel inner headers"
+msgstr ""
+
+msgid "ECMP Weight Mode"
+msgstr ""
+
+msgid "quality adjusts each active WAN weight from measured loss and RTT (rate-limited, may rehash flows); static keeps the configured weights."
+msgstr ""
+
+msgid "Static (configured weights)"
+msgstr ""
+
+msgid "Quality-aware (dynamic)"
+msgstr ""
+
+msgid "Dynamic Weight Update Interval (ms)"
+msgstr ""
+
+msgid "Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route."
+msgstr ""
+
+msgid "Dynamic Weight Floor (ratio)"
+msgstr ""
+
+msgid "Lowest fraction of the configured weight a poor-quality or overloaded line can be scaled to (default: 0.25). Lines that are truly unusable are still removed by the degrade/DOWN logic."
+msgstr ""
+
+msgid "Load-aware Traffic Shifting"
+msgstr ""
+
+msgid "When a WAN utilisation (measured tx/rx against its max_mbps/up_mbps) exceeds the target ratio, lower its ECMP weight so part of the flows move to the idle WANs. Rate-limited by the update interval above; every interface then needs max_mbps."
+msgstr ""
+
+msgid "Load Offload Threshold (ratio)"
+msgstr ""
+
+msgid "Utilisation at or above which a WAN starts shedding weight (default: 0.80 = 80%). Must be greater than the recover ratio."
+msgstr ""
+
+msgid "Load Recover Threshold (ratio)"
+msgstr ""
+
+msgid "Utilisation at or below which a throttled WAN fully regains its configured weight (default: 0.60). The gap to the offload threshold is hysteresis against weight oscillation."
+msgstr ""
+
+msgid "Max Bandwidth (Mbps)"
+msgstr ""
+
+msgid "Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled."
+msgstr ""
+
+msgid "Up Capacity (Mbps)"
+msgstr ""
+
+msgid "Upload (LAN upload) capacity for asymmetric lines. Leave empty to reuse the max bandwidth."
+msgstr ""
+
+msgid "offloaded"
+msgstr ""
+
+msgid "Policy Routing (Source / Destination)"
+msgstr ""
+
+msgid "Send traffic matching a source (and optionally destination) prefix through a specific WAN using fib rules. Non-matching traffic keeps using ECMP. Rules are removed automatically while the target WAN is down, so traffic falls back to ECMP."
+msgstr ""
+
+msgid "Rule Name"
+msgstr ""
+
+msgid "Unique name used in logs and status."
+msgstr ""
+
+msgid "Source Prefixes (CIDR)"
+msgstr ""
+
+msgid "IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source."
+msgstr ""
+
+msgid "Destination Prefixes (CIDR)"
+msgstr ""
+
+msgid "Optional IPv4 destination prefixes. Leave empty to match any destination."
+msgstr ""
+
+msgid "Target WAN"
+msgstr ""
+
+msgid "Traffic matching this rule is routed through this WAN while it is healthy."
+msgstr ""
+
+msgid "Rule Priority"
+msgstr ""
+
+msgid "Optional fib-rule priority (9000-9063); lower matches first. Either set it on every rule or on none."
+msgstr ""
+
+msgid "Degrade Loss Threshold"
+msgstr ""
+
+msgid "Flush Conntrack on Active Set Change"
+msgstr ""
+
+msgid "Remove Default Route on Exit"
+msgstr ""
+
+msgid "Last probe error: "
+msgstr ""
+
+msgid "Local problem (packets never left the device): "
+msgstr ""
+
+msgid "No status file"
+msgstr ""
+
+msgid "No status file yet: the daemon has not written one (or it just started)."
+msgstr ""
+
+msgid "Not trustworthy (clock skew)"
+msgstr ""
+
+msgid "Online (UP, degraded - not carrying traffic)"
+msgstr ""
+
+msgid "Status File:"
+msgstr ""
+
+msgid "Status is stale: the daemon may have stopped. This is the last known state."
+msgstr ""
+
+msgid "Stopped (status is stale)"
+msgstr ""
+
+msgid "ago"
+msgstr ""
+
+msgid "clock skew"
+msgstr ""
+
+msgid "missing"
 msgstr ""

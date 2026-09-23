@@ -4,6 +4,7 @@
   "window_size": 10,
   "loss_threshold_down": 0.5,
   "loss_threshold_up": 0.1,
+  "degrade_loss_threshold":0.2,"degrade_hysteresis":0.1,"degrade_exit_samples":6,
   "consecutive_fail_down": 3,
   "recovery_success_count": 5,
   "max_rtt_ms": 1500.0,
@@ -12,15 +13,42 @@
   "route_priority": 0,
   "remove_routes_on_exit": false,
   "ecmp_mode": "standard",
+  "_ecmp_mode_comment": "standard / auto / resilient；想避免切換時既有連線被重哈希打斷請用 resilient 或 auto",
+  "_multipath_hash_policy_comment": "選填 l3 / l4 / inner：啟動時寫入 net.ipv{4,6}.fib_multipath_hash_policy；留 null 沿用系統預設（多數為 l4）",
+  "multipath_hash_policy": null,
+  "_weight_mode_comment": "static（固定 weight）/ quality（依實測丟包與 RTT 動態調整 ECMP 權重，有限速）",
+  "weight_mode": "static",
+  "dynamic_weight_interval_ms": 10000,
+  "dynamic_weight_min_ratio": 0.25,
+  "_capacity_proportional_comment": "只要每條 interface 都設定 max_mbps，ECMP 基準權重就自動 ∝ max_mbps（例：wan1 1000、wan2 500 → 權重 2:1），不需要手動換算 weight",
+  "_load_aware_comment": "true 時在上述基準上，再依實測速率（tx/rx 的 EWMA）vs max_mbps/up_mbps，把利用率超過 load_target_ratio 的線之權重進一步下修，讓部分 flow 轉到空閒線；啟用時每條 interface 都必須填 max_mbps。與 weight_mode 可疊加",
+  "load_aware": false,
+  "_load_target_comment": "過載門檻：利用率 >= 0.80 開始下修",
+  "load_target_ratio": 0.80,
+  "_load_recover_comment": "解除門檻：利用率 <= 0.60 才完全恢復（與門檻之間是遲滯死區，避免權重來回震盪）",
+  "load_recover_ratio": 0.60,
+  "_policies_comment": "策略分流：匹配 source（可選 destination）的轉發流量走指定 WAN，其餘仍走 ECMP；目標 WAN DOWN 時規則自動移除。範例：",
+  "policies": [],
+  "_policies_example": [
+    {
+      "name": "guest-to-wan2",
+      "source": ["192.168.3.0/24"],
+      "destination": [],
+      "interface": "wan2"
+    }
+  ],
   "interfaces": [
     {
       "name": "wan1",
       "gateway": "192.168.1.1",
       "metric": 1,
       "weight": 1,
+      "_capacity_comment": "這條線的最大頻寬（Mbps）：容量比例分流以此為比，也是 LAN 下載方向容量；up = LAN 上傳方向（非對稱線路才需要填，未填時沿用 max_mbps）",
+      "max_mbps": 1000,
+      "up_mbps": 100,
       "probe_targets": [
-        "1.1.1.1:443",
-        "8.8.8.8:443"
+        "223.5.5.5:53",
+        "114.114.114.114:53"
       ]
     },
     {
@@ -28,9 +56,11 @@
       "gateway": "192.168.2.1",
       "metric": 1,
       "weight": 1,
+      "max_mbps": 500,
+      "up_mbps": 50,
       "probe_targets": [
-        "1.1.1.1:443",
-        "8.8.8.8:443"
+        "223.5.5.5:53",
+        "114.114.114.114:53"
       ]
     },
     {
@@ -39,6 +69,8 @@
       "gateway": "10.77.0.1",
       "metric": 10,
       "weight": 1,
+      "max_mbps": 100,
+      "up_mbps": 100,
       "probe_targets": [
         "223.5.5.5:53"
       ],

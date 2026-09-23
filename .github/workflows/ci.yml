@@ -60,6 +60,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             packages: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
+          - target: armv7-unknown-linux-musleabihf
+            packages: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
     steps:
       - uses: actions/checkout@v4
 
@@ -105,6 +108,77 @@ jobs:
           name: mwan4-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/mwan4
           if-no-files-found: error
+
+  # ── 打包鏈路：Python 語法、翻譯編譯、用假二進位做 APK/IPK/bundle 冒煙測試 ─
+  # 這些腳本改壞時不會影響 Rust 編譯，但會直接毀掉發布產物，所以獨立把關。
+  packaging:
+    name: packaging scripts
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging dependency
+        run: pip install cryptography
+
+      - name: Python syntax check
+        run: python -m py_compile scripts/build_packages.py scripts/po2lmo.py
+
+      - name: Compile zh_Hans translation
+        run: |
+          python scripts/po2lmo.py \
+            openwrt/luci-app-mwan4/po/zh_Hans/mwan4.po /tmp/mwan4.zh_Hans.lmo
+          test -s /tmp/mwan4.zh_Hans.lmo
+
+      - name: Packaging smoke test (dummy binary)
+        run: |
+          mkdir -p target/x86_64-unknown-linux-musl/release
+          cp /bin/true target/x86_64-unknown-linux-musl/release/mwan4
+          python scripts/build_packages.py --arch x86_64
+          test -f dist/SHA256SUMS
+          test -f dist/mwan4-x86_64-bundle.tar.gz
+          ls -l dist/packages dist/SHA256SUMS
+      - name: IPK control still validates (python)
+        run: |
+          python - <<'PY'
+          import glob, io, tarfile
+          ipk = sorted(glob.glob("dist/packages/mwan4_*_x86_64.ipk"))[-1]
+          with tarfile.open(ipk, "r:gz") as t:
+              name = [n for n in t.getnames() if n.startswith("control.tar")][0]
+              ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile(name).read()), mode="r:gz")
+              assert "conffiles" in ctrl.getnames(), "IPK must declare conffiles"
+          print("OK", ipk)
+          PY
+
+  # ── 真實核心 netns 整合測試（advisory）────────────────────────────────
+  # GitHub runner 對 unprivileged userns 有 AppArmor 限制時會直接跑不起來，
+  # 因此不阻擋主線；本機能跑時才是有效的路由編碼驗證。
+  netns:
+    name: netns integration [advisory]
+    runs-on: ubuntu-latest
+    needs: quality
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: netns
+
+      - name: Build tests
+        run: cargo test --locked --no-run
+
+      - name: Run netns route lifecycle tests
+        run: |
+          unshare -Urn sh -c             'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
 
   # ── MSRV 守門：確保 Cargo.toml 宣告的 rust-version 真的能編過 ─────────
   # Cargo.toml 使用 edition 2024 並宣告 rust-version = "1.85"。

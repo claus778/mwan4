@@ -26,11 +26,27 @@ pub const NLM_F_EXCL: u16 = 0x200;
 pub const NLM_F_REPLACE: u16 = 0x100;
 /// NLM_F_ROOT | NLM_F_MATCH：請求內核把整張表 dump 出來
 pub const NLM_F_DUMP: u16 = 0x300;
+/// dump 進行中路由表被改動時，內核會把這個旗標標在 `NLMSG_DONE` 上（資料不完整）
+pub const NLM_F_DUMP_INTR: u16 = 0x10;
 
 pub const RT_TABLE_MAIN: u8 = 254;
 pub const RTPROT_STATIC: u8 = 4;
+/// 刪除時代表「不比較 protocol」（通配符）；只用於啟動清掃的舊版本殘留。
+pub const RTPROT_UNSPEC: u8 = 0;
+/// 本程式下發路由的專屬 protocol 標記（與探針規則的 FRA_PROTOCOL 同值）。
+///
+/// 為什麼不用 RTPROT_STATIC：內核在 `RTM_DELROUTE` 時會比對 protocol，而
+/// `RTA_PRIORITY = 0` 又是「不比較 metric」的通配符。若刪除訊息帶 RTPROT_UNSPEC，
+/// 當我們那條 metric 0 的路由已被外部移除、而 netifd 剛好有一條同 metric 的預設
+/// 路由時，就會把**別人的路由刪掉**。帶專屬 protocol 後，刪除只會命中自己下發的。
+pub const RTPROT_MWAN4: u8 = 0x4D;
 pub const RT_SCOPE_UNIVERSE: u8 = 0;
 pub const RT_SCOPE_LINK: u8 = 253;
+/// 刪除路由時使用：內核 `fib_table_delete()` 會比對路由既有的 scope，
+/// 除非請求的 `fc_scope == RT_SCOPE_NOWHERE`（iproute2 刪除時正是填這個值）。
+/// 若刪除時沿用建立時的 scope（UNIVERSE / LINK），無網關路由（scope=LINK）
+/// 會因不匹配回 ESRCH 而被誤當成「本來就不存在」，殘留永遠清不掉。
+pub const RT_SCOPE_NOWHERE: u8 = 255;
 pub const RTN_UNICAST: u8 = 1;
 
 pub const AF_UNSPEC: u8 = 0;
@@ -88,14 +104,15 @@ pub const NEXTHOP_GRP_TYPE_RES: u16 = 1;
 pub const NH_GROUP_ID_V4: u32 = 0xFFFF_FF00;
 pub const NH_GROUP_ID_V6: u32 = 0xFFFF_FF01;
 
-/// resilient group 的 bucket 數：必須是 2 的冪，且不小於成員數。
-/// 上限用來界定單一 netlink 訊息大小與核心記憶體用量；
-/// 成員數超過上限時不支援 resilient（由呼叫端退回標準 ECMP）。
-const RES_BUCKETS_MIN: usize = 8;
+/// resilient group 的 bucket 數上限：必須是 2 的冪、涵蓋所有允許的成員數，
+/// 且第一次建立後**不得再變**（核心不允許 REPLACE 時改變 bucket 數）。
+/// 上限同時界定單一 netlink 訊息大小與核心記憶體用量；成員數超過上限時
+/// 不支援 resilient（由呼叫端退回標準 ECMP）。
 const RES_BUCKETS_MAX: usize = 256;
 
-/// rtnexthop 的 weight 欄位（rtnh_hops）是 u8，核心語意為 weight - 1
-pub const MAX_NEXTHOP_WEIGHT: u32 = 256;
+/// rtnexthop 的 weight 欄位（rtnh_hops）是 u8，核心語意為 weight - 1；
+/// 上限與 `config::MAX_WEIGHT` 一致（resilient group 在舊核心只到 255）。
+pub const MAX_NEXTHOP_WEIGHT: u32 = 255;
 
 // ---------------------------------------------------------------------------
 // 探針專用路由表 / 規則（RTM_NEWRULE）
@@ -142,6 +159,25 @@ pub const PROBE_RULE_PRIORITY_BASE: u32 = 10_000;
 /// 啟動時會清掃整個保留區段，避免上一次執行留下的規則指向舊閘道。
 /// 刻意壓在 64：真實路由器不會有這麼多 WAN，而每次啟動的清掃往返次數正比於它。
 pub const PROBE_SLOT_MAX: u32 = 64;
+
+// ---------------------------------------------------------------------------
+// 策略分流規則（fib rule 的 from/to + 目標 WAN 的獨立表）
+//
+// 為什麼不用 fwmark/nftables（mwan3 的做法）：`ip rule` 的 `from`/`to` 本身就
+// 支援來源/目的前綴匹配，轉發封包在路由查找時就會命中，完全不需要在封包上打標。
+// 這與本專案「轉發面零封包標記、不破壞 Flow Offload」的架構一致。
+//
+// 規則優先序獨立於探針規則（9000 起算，仍在 main 表 32766 之前）；
+// 目標 WAN 的下一跳沿用該 WAN 的探針獨立表（default via gw dev wan）。
+// ---------------------------------------------------------------------------
+
+/// 策略規則的優先序起點（第 i 條用 POLICY_RULE_PRIORITY_BASE + i）
+pub const POLICY_RULE_PRIORITY_BASE: u32 = 9_000;
+/// 策略規則數量上限（含來源/目的展開後的總條數）
+pub const POLICY_SLOT_MAX: u32 = 64;
+/// enum fib_rule_attr：來源/目的前綴
+pub const FRA_DST: u16 = 1;
+pub const FRA_SRC: u16 = 2;
 /// 探針目標在主表的 /32 路由使用的 metric。
 /// 與預設路由的 priority（通常 0）分開，便於辨識與精準刪除。
 pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
@@ -152,12 +188,35 @@ pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 /// 真正讓它優先於預設路由的是「前綴更長」，metric 只作為辨識標記。
 pub const UNDERLAY_ROUTE_METRIC: u32 = 42_761;
 
+/// **啟動前**那次清掃要掃掉的 metric（探針 + 隧道 underlay）。
+///
+/// 開機時連 underlay 一起清的理由：上次執行留下的 underlay /32 出口（ifindex / gateway）
+/// 可能已經換了（隧道重建、物理線改 metric），逐條猜測不如一次清乾淨，
+/// 之後由 `sync_underlay_routes` 按當前期望重新補回。
+const STARTUP_SWEEP_METRICS: [(u32, &str); 2] = [
+    (PROBE_MAIN_ROUTE_METRIC, "probe"),
+    (UNDERLAY_ROUTE_METRIC, "underlay"),
+];
+
+/// **執行期**（`SetProbePaths(clean = true)`）那次清掃只掃探針 /32。
+///
+/// 為什麼絕對不能連 underlay 一起清：worker 處理同一批指令時是 `Apply` 先、`SetProbePaths`
+/// 後（`apply_default_routes` → `sync_underlay_routes` 才剛把 underlay /32 裝好、
+/// 並記進記憶體快取），清掃若順手刪掉它，`sync_underlay_routes` 只信快取
+/// （「出口沒變 → 不必重下」）就再也不會補——實測啟動後 40 秒（含 30 秒心跳）
+/// underlay /32 一直是 0 條，隧道的封裝封包只能走 ECMP 預設路由，約 1/2 機率被塞回
+/// 隧道自己（自環丟包），雙線才丟包的元凶。
+const RUNTIME_SWEEP_METRICS: [(u32, &str); 1] = [(PROBE_MAIN_ROUTE_METRIC, "probe")];
+
 // 這些不變式是「規則一定會在 main 表之前被求值」與「/32 一定贏過預設路由」的前提，
 // 直接在編譯期釘死；改壞了會無法編譯而不是上機才發現。
 const _: () = {
     assert!(PROBE_TABLE_BASE > 255);
     assert!(PROBE_RULE_PRIORITY_BASE > 0);
     assert!(PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX < 32_766);
+    // 策略規則的保留區段必須完整落在探針規則之前，兩者不會互相覆蓋
+    assert!(POLICY_RULE_PRIORITY_BASE > 0);
+    assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
     assert!(PROBE_MAIN_ROUTE_METRIC != 0);
     // 探針 /32 的 metric 不能落在表號／規則優先序的保留區段裡，否則清掃會誤刪
     assert!(PROBE_MAIN_ROUTE_METRIC > PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX);
@@ -166,6 +225,12 @@ const _: () = {
     assert!(UNDERLAY_ROUTE_METRIC != PROBE_MAIN_ROUTE_METRIC);
     assert!(UNDERLAY_ROUTE_METRIC > PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX);
     assert!(UNDERLAY_ROUTE_METRIC < 0xFFFF_FF00);
+    // 執行期清掃只能掃探針 /32：誤刪 underlay 會讓隧道封裝封包走 ECMP 自環
+    assert!(RUNTIME_SWEEP_METRICS.len() == 1);
+    assert!(RUNTIME_SWEEP_METRICS[0].0 == PROBE_MAIN_ROUTE_METRIC);
+    assert!(RUNTIME_SWEEP_METRICS[0].0 != UNDERLAY_ROUTE_METRIC);
+    // 啟動清掃兩者都要掃（殘留的 underlay /32 出口可能已經失效）
+    assert!(STARTUP_SWEEP_METRICS.len() == 2);
 };
 
 /// 等待核心 ACK 的最大輪詢次數（配合 socket 上的 SO_RCVTIMEO 使用）
@@ -180,11 +245,6 @@ const ESRCH: i32 = 3;
 const ENOENT: i32 = libc::ENOENT;
 #[cfg(not(target_os = "linux"))]
 const ENOENT: i32 = 2;
-
-#[cfg(target_os = "linux")]
-const EINVAL: i32 = libc::EINVAL;
-#[cfg(not(target_os = "linux"))]
-const EINVAL: i32 = 22;
 
 #[cfg(target_os = "linux")]
 const EEXIST: i32 = libc::EEXIST;
@@ -399,6 +459,26 @@ pub struct ProbePath {
     pub main_route_targets: Vec<Ipv4Addr>,
 }
 
+/// 一條策略分流規則（已展開）：`from`/`to` 為 None 代表不限制。
+///
+/// 主迴圈負責把 `config.policies`（可含多個來源/目的）展開成這個形式，
+/// 並在目標 WAN DOWN 時把它從期望集合移除（流量回退 ECMP）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRule {
+    /// 規則名稱（顯示與日誌用）
+    pub name: String,
+    /// 目標 WAN 的 ifindex（僅供日誌；實際下一跳由 `table` 決定）
+    pub ifindex: u32,
+    /// 目標 WAN 的獨立路由表（沿用探針表 PROBE_TABLE_BASE + slot）
+    pub table: u32,
+    /// fib rule 優先序
+    pub priority: u32,
+    /// 來源前綴（None = 不限制）
+    pub source: Option<(Ipv4Addr, u8)>,
+    /// 目的前綴（None = 不限制）
+    pub destination: Option<(Ipv4Addr, u8)>,
+}
+
 /// 一條 fib_rule 的描述（出向用 oif、入向用 iif）
 #[derive(Debug, Clone, Copy)]
 struct RuleSpec<'a> {
@@ -433,7 +513,7 @@ struct RouteNexthop {
 /// 兩種路由的 netlink key 不同（有無 RTA_NH_ID），必要時得把另一種先刪掉，
 /// 否則同一條 default route 會殘留兩份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstalledVariant {
+pub enum InstalledVariant {
     None,
     /// RTA_OIF / RTA_GATEWAY / RTA_MULTIPATH
     Standard,
@@ -471,6 +551,8 @@ pub struct RouteManager {
     /// 已下發的隧道 underlay /32 路由：對端位址 -> (ifindex, gateway bytes)。
     /// 用來差異比對，避免每輪重下（見 `sync_underlay_routes`）。
     underlay_routes: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
+    /// 已下發的策略分流規則（差異比對與清理用）
+    policy_rules: Vec<PolicyRule>,
 }
 
 impl RouteManager {
@@ -548,6 +630,7 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
+                policy_rules: Vec::new(),
             })
         }
 
@@ -564,7 +647,26 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
+                policy_rules: Vec::new(),
             })
+        }
+    }
+
+    /// 調整 netlink socket 的收發逾時（非 Linux 為 no-op）。
+    ///
+    /// 事件迴圈上的「查詢用」manager 要用短逾時：內核一時不回應時，查詢是同步阻塞
+    /// caller 的，2 秒 × N 張網卡會把 current_thread runtime 整段凍住（訊號、探針、
+    /// link 事件全部延後）。正常 netlink 往返是微秒級，縮到數百毫秒不影響成功率，
+    /// 逾時則由呼叫端用保守值（當成「沒有路」）繼續。
+    pub fn set_netlink_timeout(&self, timeout: std::time::Duration) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            set_socket_timeouts(self.sock_fd, Some(timeout), Some(timeout))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = timeout;
+            Ok(())
         }
     }
 
@@ -715,27 +817,58 @@ impl RouteManager {
         flags: u16,
         seq: u32,
     ) -> Vec<u8> {
+        Self::build_route_msg_ex_proto(
+            priority,
+            family,
+            target,
+            hops,
+            msg_type,
+            flags,
+            seq,
+            RTPROT_MWAN4,
+        )
+    }
+
+    /// 同 `build_route_msg_ex`，但可指定**刪除**訊息使用的 protocol。
+    ///
+    /// 一般刪除用 `RTPROT_MWAN4`（只刪自己的路由）；啟動清掃需要用
+    /// `RTPROT_UNSPEC`（0 = 通配符），否則清不掉舊版本以 RTPROT_STATIC 留下的殘留。
+    #[allow(clippy::too_many_arguments)]
+    fn build_route_msg_ex_proto(
+        priority: u32,
+        family: u8,
+        target: RouteTarget<'_>,
+        hops: &[RouteNexthop],
+        msg_type: u16,
+        flags: u16,
+        seq: u32,
+        delete_protocol: u8,
+    ) -> Vec<u8> {
         let RouteTarget { table, dst } = target;
         let mut buffer: Vec<u8> = Vec::with_capacity(512);
         // 預留 nlmsghdr 空間
         buffer.extend_from_slice(&[0u8; NlMsgHdr::LEN]);
 
-        // 若唯一存活路由沒有網關（點對點 / PPPoE），其 scope 應為 RT_SCOPE_LINK
-        let rtm_scope = if hops.len() == 1 && hops[0].gateway.is_none() {
+        // 刪除時 scope 一律填 RT_SCOPE_NOWHERE（與 iproute2 相同），
+        // 否則內核會拿它與路由既有的 scope 比對，無網關路由（RT_SCOPE_LINK）
+        // 會刪不掉。建立時：若唯一存活路由沒有網關（點對點 / PPPoE），
+        // 其 scope 應為 RT_SCOPE_LINK。
+        let rtm_scope = if msg_type == RTM_DELROUTE {
+            RT_SCOPE_NOWHERE
+        } else if hops.len() == 1 && hops[0].gateway.is_none() {
             RT_SCOPE_LINK
         } else {
             RT_SCOPE_UNIVERSE
         };
 
         let dst_len = dst.map_or(0, |(_, len)| len);
-        // 刪除訊息一律不指定 protocol（RTPROT_UNSPEC）：內核在 RTM_DELROUTE 時**會比對
-        // protocol**。若我們送 RTPROT_STATIC 而該路由其實來自別的來源（iproute2 的預設是
-        // `proto boot`），就會回 ESRCH 而路由仍在——殘留永遠清不掉（實測）。
-        // 不指定時，key 只由 (表, 目的前綴, metric, type, tos) 決定。
+        // 下發時一率帶專屬 protocol；刪除時用呼叫端指定的值（一般為 RTPROT_MWAN4，
+        // 啟動清掃為 RTPROT_UNSPEC）。內核 `fib_table_delete()` 在 `fc_protocol != 0`
+        // 時會比對 protocol，因此帶 0x4D 的刪除只會命中我們自己下發的路由。
         let rtm_protocol = if msg_type == RTM_DELROUTE {
-            0
+            delete_protocol
         } else {
-            RTPROT_STATIC
+            RTPROT_MWAN4
         };
         let rtmsg = RtMsg {
             rtm_family: family,
@@ -774,7 +907,7 @@ impl RouteManager {
             let mut mp_buffer: Vec<u8> = Vec::with_capacity(256);
             for hop in hops {
                 let hop_start = mp_buffer.len();
-                // weight 必須落在 1..=256，否則 rtnh_hops 會靜默截斷
+                // weight 必須落在 1..=255，否則 rtnh_hops 會靜默截斷
                 let weight = hop.weight.clamp(1, MAX_NEXTHOP_WEIGHT);
                 let rtnh = RtNextHop {
                     rtnh_len: 0, // 待計算
@@ -901,10 +1034,26 @@ impl RouteManager {
     /// group 才是 `AF_UNSPEC`。內核查找待刪物件時會比對 family，
     /// 寫死 `AF_UNSPEC` 會讓成員永遠刪不掉（回 `EINVAL`），
     /// 於是每輪重試都留下一個孤兒 nexthop object —— 實測堆到 69 個。
+    /// 組出刪除 nexthop object 的訊息。
+    ///
+    /// ⚠️ 內核 `nh_valid_get_del_req()` 要求 DELNEXTHOP 的 `nhmsg` 除了 family 以外
+    /// **全部為零**（`nh_protocol || nh_resvd || nh_scope || nh_flags` 任一非零就回
+    /// EINVAL "Invalid values in header"）。因此這裡不能沿用 `nhmsg_bytes()`（它帶
+    /// RTPROT_STATIC）。舊版就是這樣：刪除請求被內核拒絕，而 `is_absent_object` 又把
+    /// EINVAL 當成「本來就不存在」，於是 group/成員永遠刪不掉（netns 實測發現）。
     fn build_nexthop_del_msg(seq: u32, family: u8, id: u32) -> Vec<u8> {
         let mut buffer: Vec<u8> = Vec::with_capacity(64);
         buffer.extend_from_slice(&[0u8; NlMsgHdr::LEN]);
-        buffer.extend_from_slice(&Self::nhmsg_bytes(family).to_bytes());
+        buffer.extend_from_slice(
+            &NhMsg {
+                nh_family: family,
+                nh_scope: 0,
+                nh_protocol: 0,
+                nh_resvd: 0,
+                nh_flags: 0,
+            }
+            .to_bytes(),
+        );
         Self::append_attr(&mut buffer, NHA_ID, &id.to_ne_bytes());
         Self::finish_msg(&mut buffer, RTM_DELNEXTHOP, NLM_F_REQUEST | NLM_F_ACK, seq);
         buffer
@@ -928,13 +1077,14 @@ impl RouteManager {
             rtm_src_len: 0,
             rtm_tos: 0,
             rtm_table: RT_TABLE_MAIN,
-            // 刪除時不指定 protocol，理由同 build_route_msg_ex
-            rtm_protocol: if msg_type == RTM_DELROUTE {
-                0
+            // 建立/刪除都用專屬 protocol：刪除只命中自己的路由（見 RTPROT_MWAN4）
+            rtm_protocol: RTPROT_MWAN4,
+            // 刪除時 scope 必須是 NOWHERE（理由同 build_route_msg_ex）
+            rtm_scope: if msg_type == RTM_DELROUTE {
+                RT_SCOPE_NOWHERE
             } else {
-                RTPROT_STATIC
+                RT_SCOPE_UNIVERSE
             },
-            rtm_scope: RT_SCOPE_UNIVERSE,
             rtm_type: RTN_UNICAST,
             rtm_flags: 0,
         };
@@ -994,6 +1144,150 @@ impl RouteManager {
 
         Self::finish_msg(&mut buffer, msg_type, flags, seq);
         buffer
+    }
+
+    /// 組出策略分流規則（fib rule 的 `from`/`to` + 目標表；不含 oif）。
+    fn build_policy_rule_msg(seq: u32, rule: &PolicyRule, msg_type: u16, flags: u16) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(128);
+        buffer.extend_from_slice(&[0u8; NlMsgHdr::LEN]);
+
+        let hdr = FibRuleHdr {
+            family: AF_INET,
+            dst_len: rule.destination.map_or(0, |(_, len)| len),
+            src_len: rule.source.map_or(0, |(_, len)| len),
+            tos: 0,
+            // 表號一律用 FRA_TABLE 表達
+            table: 0,
+            action: FR_ACT_TO_TBL,
+            flags: 0,
+        };
+        buffer.extend_from_slice(&hdr.to_bytes());
+
+        Self::append_attr(&mut buffer, FRA_TABLE, &rule.table.to_ne_bytes());
+        Self::append_attr(&mut buffer, FRA_PRIORITY, &rule.priority.to_ne_bytes());
+        if let Some((addr, _)) = rule.source {
+            Self::append_attr(&mut buffer, FRA_SRC, &addr.octets());
+        }
+        if let Some((addr, _)) = rule.destination {
+            Self::append_attr(&mut buffer, FRA_DST, &addr.octets());
+        }
+        // 與探針規則共用來源標記：清掃時只刪本程式下發的規則
+        Self::append_attr(&mut buffer, FRA_PROTOCOL, &[PROBE_RULE_PROTOCOL]);
+
+        Self::finish_msg(&mut buffer, msg_type, flags, seq);
+        buffer
+    }
+
+    /// 同步策略分流規則：刪掉不再需要的，安裝/更新期望的。
+    ///
+    /// 與探針路徑不同，這裡做**差異比對**而不是每次全量重下：策略規則的優先序
+    /// 與內容在執行期很少變動（只有目標 WAN 上下線會觸發），全量重下只會製造
+    /// 無謂的 netlink 往返與規則閃斷。
+    pub fn set_policy_rules(&mut self, wanted: &[PolicyRule]) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+
+        // 1) 刪除不再需要的（wanted 以集合語意比對：內容改動＝舊的刪、新的裝）
+        let stale: Vec<PolicyRule> = self
+            .policy_rules
+            .iter()
+            .filter(|old| !wanted.contains(old))
+            .cloned()
+            .collect();
+        for rule in stale {
+            if let Err(e) = self.delete_policy_rule(&rule) {
+                warn!(
+                    "[RouteManager] Failed to remove policy rule '{}' (priority {}): {e}",
+                    rule.name, rule.priority
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            self.policy_rules.retain(|r| r != &rule);
+        }
+
+        // 2) 安裝缺的
+        for rule in wanted {
+            if self.policy_rules.contains(rule) {
+                continue;
+            }
+            match self.install_policy_rule(rule) {
+                Ok(()) => self.policy_rules.push(rule.clone()),
+                Err(e) => {
+                    warn!(
+                        "[RouteManager] Failed to install policy rule '{}' (priority {}): {e}",
+                        rule.name, rule.priority
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn install_policy_rule(&mut self, rule: &PolicyRule) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let msg = Self::build_policy_rule_msg(
+            seq,
+            rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        );
+        self.commit_rule_msg(
+            &msg,
+            &format!(
+                "policy rule '{}' (from {:?} to {:?} lookup {})",
+                rule.name, rule.source, rule.destination, rule.table
+            ),
+        )
+    }
+
+    fn delete_policy_rule(&mut self, rule: &PolicyRule) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let msg = Self::build_policy_rule_msg(seq, rule, RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK);
+        self.commit_rule_msg(
+            &msg,
+            &format!(
+                "policy rule removal '{}' (priority {})",
+                rule.name, rule.priority
+            ),
+        )
+    }
+
+    /// 清掃策略規則保留區段內本程式留下的所有規則（啟動與退出共用）。
+    pub fn sweep_policy_rules(&mut self) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+        let mut removed = 0usize;
+        for slot in 0..POLICY_SLOT_MAX {
+            match self.delete_own_rule_by_priority(POLICY_RULE_PRIORITY_BASE + slot) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            info!(
+                "[RouteManager] Removed {removed} leftover policy rule(s) from the reserved band"
+            );
+        }
+        self.policy_rules.clear();
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 把「期望的探針路徑集合」與目前已下發的做差異比對：刪掉多的，並**重下所有期望的**。
@@ -1119,6 +1413,15 @@ impl RouteManager {
         buffer
     }
 
+    /// 內核在「查不到路由」時回的 errno（是查詢結果，不是失敗）
+    #[cfg(target_os = "linux")]
+    fn is_no_route_errno(errno: i32) -> bool {
+        matches!(
+            errno,
+            libc::ENETUNREACH | libc::ENETDOWN | libc::EHOSTUNREACH
+        )
+    }
+
     /// 解析一則 RTM_NEWROUTE 訊息 → RouteLookup
     fn parse_route_reply(buf: &[u8], len: usize) -> Option<RouteLookup> {
         if len < NlMsgHdr::LEN + RtMsg::LEN {
@@ -1211,8 +1514,22 @@ impl RouteManager {
                 continue;
             }
             if hdr.nlmsg_type == libc::NLMSG_ERROR as u16 {
-                // 沒有可用的路（ENETUNREACH / ENETDOWN…）→ 不是錯誤，是「沒有路由」
-                return Ok(None);
+                match read_i32(&buf[..len], NlMsgHdr::LEN) {
+                    // 「沒有路」是查詢的正常結果，不是錯誤
+                    Some(code) if code < 0 && Self::is_no_route_errno(code.saturating_neg()) => {
+                        return Ok(None);
+                    }
+                    // 其它 errno（EINVAL/EPERM…）是真錯誤：不能當成「沒有路由」，
+                    // 否則呼叫端會把 query 失敗誤判成路徑缺失而亂補 /32
+                    Some(code) if code < 0 => {
+                        return Err(io::Error::from_raw_os_error(code.saturating_neg()));
+                    }
+                    _ => {
+                        return Err(io::Error::other(
+                            "route lookup rejected by the kernel without an errno",
+                        ));
+                    }
+                }
             }
             if hdr.nlmsg_type == RTM_NEWROUTE {
                 return Ok(Self::parse_route_reply(&buf[..len], len));
@@ -1225,6 +1542,95 @@ impl RouteManager {
         ))
     }
 
+    /// 發送 route dump 並收集所有 `RTM_NEWROUTE` 的原始訊息。
+    ///
+    /// 比逐字重寫兩個 dump 迴圈多做了兩件事：
+    /// - **只認 seq 相符的 `NLMSG_DONE`**：上一次逾時中斷的 dump 會在接收佇列留下
+    ///   一則舊 `NLMSG_DONE`，下一次 dump 讀到它就會提早結束（假陰性）。
+    /// - **`NLM_F_DUMP_INTR` 自動重試一次**：dump 期間路由表變動時內核會把資料
+    ///   標成不完整；重試一次通常能拿到一致快照。
+    #[cfg(target_os = "linux")]
+    fn dump_route_messages(&mut self, family: u8) -> io::Result<Vec<Vec<u8>>> {
+        let mut result: Vec<Vec<u8>> = Vec::new();
+        for attempt in 0..2 {
+            self.seq += 1;
+            let seq = self.seq;
+            let msg = Self::build_getroute_msg(family, seq, None, None, true);
+            let sent = unsafe {
+                libc::send(
+                    self.sock_fd,
+                    msg.as_ptr() as *const libc::c_void,
+                    msg.len(),
+                    0,
+                )
+            };
+            if sent < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if sent as usize != msg.len() {
+                return Err(io::Error::other("short netlink send for route dump"));
+            }
+
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut buf = [0u8; 8192];
+            // 迴圈的唯一出口是讀到本次 seq 的 NLMSG_DONE；中斷旗標由內核標在 DONE 上
+            let interrupted = 'outer: loop {
+                let n = unsafe {
+                    libc::recv(
+                        self.sock_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                let len = n as usize;
+                let mut offset = 0usize;
+                while offset + NlMsgHdr::LEN <= len {
+                    let hdr = match NlMsgHdr::from_bytes(&buf[offset..len]) {
+                        Some(h) => h,
+                        None => break,
+                    };
+                    let msg_len = hdr.nlmsg_len as usize;
+                    if msg_len < NlMsgHdr::LEN || offset + msg_len > len {
+                        break;
+                    }
+                    if hdr.nlmsg_type == libc::NLMSG_DONE as u16 {
+                        if hdr.nlmsg_seq == seq {
+                            break 'outer (hdr.nlmsg_flags & NLM_F_DUMP_INTR) != 0;
+                        }
+                        // 舊 dump 殘留的 DONE（seq 不符）：跳過，繼續等本次的
+                    } else if hdr.nlmsg_type == libc::NLMSG_ERROR as u16 && hdr.nlmsg_seq == seq {
+                        let code = read_i32(&buf[offset..offset + msg_len], NlMsgHdr::LEN);
+                        return Err(match code {
+                            Some(c) if c < 0 => io::Error::from_raw_os_error(c.saturating_neg()),
+                            _ => io::Error::other("route dump rejected by the kernel"),
+                        });
+                    } else if hdr.nlmsg_type == RTM_NEWROUTE && hdr.nlmsg_seq == seq {
+                        out.push(buf[offset..offset + msg_len].to_vec());
+                    }
+                    offset += crate::netlink::util::nlmsg_align(msg_len);
+                }
+            };
+            result = out;
+            if !interrupted {
+                return Ok(result);
+            }
+            if attempt == 0 {
+                debug!(
+                    "[RouteManager] route dump was interrupted (NLM_F_DUMP_INTR); retrying once"
+                );
+            }
+        }
+        Ok(result)
+    }
+
     /// 轉儲主表中 metric == `metric` 的所有路由（用於清掃自己留下的探針 /32）。
     ///
     /// 回傳 `(表號, 目的位址, 前綴長度)`；只認 32 位元前綴（我們只下發 /32）。
@@ -1233,84 +1639,40 @@ impl RouteManager {
         &mut self,
         metric: u32,
     ) -> io::Result<Vec<(u32, Ipv4Addr, u8)>> {
-        self.seq += 1;
-        let seq = self.seq;
-        let msg = Self::build_getroute_msg(AF_INET, seq, None, None, true);
-        let sent = unsafe {
-            libc::send(
-                self.sock_fd,
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
         let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        'outer: loop {
-            let n = unsafe {
-                libc::recv(
-                    self.sock_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
+        for body in self.dump_route_messages(AF_INET)? {
+            // 內核正常不會送出短於 rtmsg 的訊息，但這是「靠內核保證」的不變量：
+            // 少一個位元組就會 panic（release 下 panic=abort，整個 daemon 直接死）。
+            if body.len() < NlMsgHdr::LEN + RtMsg::LEN {
+                continue;
             }
-            let len = n as usize;
-            let mut offset = 0usize;
-            while offset + NlMsgHdr::LEN <= len {
-                let hdr = match NlMsgHdr::from_bytes(&buf[offset..len]) {
-                    Some(h) => h,
-                    None => break,
-                };
-                let msg_len = hdr.nlmsg_len as usize;
-                if msg_len < NlMsgHdr::LEN || offset + msg_len > len {
+            let msg_len = body.len();
+            let dst_len = body[NlMsgHdr::LEN + 1];
+            let mut priority = None;
+            let mut dst = None;
+            let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
+            let mut off = NlMsgHdr::LEN + RtMsg::LEN;
+            while off + RtAttr::LEN <= msg_len {
+                let rta_len = read_u16(&body, off).unwrap_or(0) as usize;
+                let rta_type = read_u16(&body, off + 2).unwrap_or(0);
+                if rta_len < RtAttr::LEN || off + rta_len > msg_len {
                     break;
                 }
-                if hdr.nlmsg_type == libc::NLMSG_DONE as u16 {
-                    break 'outer;
-                }
-                if hdr.nlmsg_type == RTM_NEWROUTE && hdr.nlmsg_seq == seq {
-                    let body = &buf[offset..offset + msg_len];
-                    let dst_len = body[NlMsgHdr::LEN + 1];
-                    let mut priority = None;
-                    let mut dst = None;
-                    let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
-                    let mut off = NlMsgHdr::LEN + RtMsg::LEN;
-                    while off + RtAttr::LEN <= msg_len {
-                        let rta_len = read_u16(body, off).unwrap_or(0) as usize;
-                        let rta_type = read_u16(body, off + 2).unwrap_or(0);
-                        if rta_len < RtAttr::LEN || off + rta_len > msg_len {
-                            break;
-                        }
-                        let data = &body[off + RtAttr::LEN..off + rta_len];
-                        match rta_type {
-                            RTA_PRIORITY => priority = read_u32(data, 0),
-                            RTA_DST if data.len() == 4 => {
-                                dst = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]))
-                            }
-                            RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
-                            _ => {}
-                        }
-                        off += rta_align(rta_len);
+                let data = &body[off + RtAttr::LEN..off + rta_len];
+                match rta_type {
+                    RTA_PRIORITY => priority = read_u32(data, 0),
+                    RTA_DST if data.len() == 4 => {
+                        dst = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]))
                     }
-                    if priority == Some(metric) && dst_len == 32 {
-                        if let Some(addr) = dst {
-                            out.push((table, addr, dst_len));
-                        }
-                    }
+                    RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
+                    _ => {}
                 }
-                offset += crate::netlink::util::nlmsg_align(msg_len);
+                off += rta_align(rta_len);
+            }
+            if priority == Some(metric) && dst_len == 32 {
+                if let Some(addr) = dst {
+                    out.push((table, addr, dst_len));
+                }
             }
         }
         Ok(out)
@@ -1363,81 +1725,35 @@ impl RouteManager {
     /// 轉儲主表裡的所有預設路由 → `(表號, metric)`
     #[cfg(target_os = "linux")]
     fn dump_default_routes(&mut self, family: u8) -> io::Result<Vec<(u32, u32)>> {
-        self.seq += 1;
-        let seq = self.seq;
-        let msg = Self::build_getroute_msg(family, seq, None, None, true);
-        let sent = unsafe {
-            libc::send(
-                self.sock_fd,
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
         let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        'outer: loop {
-            let n = unsafe {
-                libc::recv(
-                    self.sock_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
+        for body in self.dump_route_messages(family)? {
+            if body.len() < NlMsgHdr::LEN + RtMsg::LEN {
+                continue;
             }
-            let len = n as usize;
-            let mut offset = 0usize;
-            while offset + NlMsgHdr::LEN <= len {
-                let hdr = match NlMsgHdr::from_bytes(&buf[offset..len]) {
-                    Some(h) => h,
-                    None => break,
-                };
-                let msg_len = hdr.nlmsg_len as usize;
-                if msg_len < NlMsgHdr::LEN || offset + msg_len > len {
+            let msg_len = body.len();
+            let dst_len = body[NlMsgHdr::LEN + 1];
+            let mut priority = None;
+            let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
+            let mut off = NlMsgHdr::LEN + RtMsg::LEN;
+            while off + RtAttr::LEN <= msg_len {
+                let rta_len = read_u16(&body, off).unwrap_or(0) as usize;
+                let rta_type = read_u16(&body, off + 2).unwrap_or(0);
+                if rta_len < RtAttr::LEN || off + rta_len > msg_len {
                     break;
                 }
-                if hdr.nlmsg_type == libc::NLMSG_DONE as u16 {
-                    break 'outer;
+                let data = &body[off + RtAttr::LEN..off + rta_len];
+                match rta_type {
+                    RTA_PRIORITY => priority = read_u32(data, 0),
+                    RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
+                    _ => {}
                 }
-                if hdr.nlmsg_type == RTM_NEWROUTE && hdr.nlmsg_seq == seq {
-                    let body = &buf[offset..offset + msg_len];
-                    let dst_len = body[NlMsgHdr::LEN + 1];
-                    let mut priority = None;
-                    let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
-                    let mut off = NlMsgHdr::LEN + RtMsg::LEN;
-                    while off + RtAttr::LEN <= msg_len {
-                        let rta_len = read_u16(body, off).unwrap_or(0) as usize;
-                        let rta_type = read_u16(body, off + 2).unwrap_or(0);
-                        if rta_len < RtAttr::LEN || off + rta_len > msg_len {
-                            break;
-                        }
-                        let data = &body[off + RtAttr::LEN..off + rta_len];
-                        match rta_type {
-                            RTA_PRIORITY => priority = read_u32(data, 0),
-                            RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
-                            _ => {}
-                        }
-                        off += rta_align(rta_len);
-                    }
-                    let prio = priority.unwrap_or(0);
-                    // 只認主表：(1) 我們的探針表裡也有 default，若不按表號過濾會被誤判成
-                    // 「主表有預設路由」（實測踩過），(2) F13 的兜底判斷也靠這個。
-                    if dst_len == 0 && table == u32::from(RT_TABLE_MAIN) {
-                        out.push((table, prio));
-                    }
-                }
-                offset += crate::netlink::util::nlmsg_align(msg_len);
+                off += rta_align(rta_len);
+            }
+            let prio = priority.unwrap_or(0);
+            // 只認主表：(1) 我們的探針表裡也有 default，若不按表號過濾會被誤判成
+            // 「主表有預設路由」（實測踩過），(2) 全斷時的兜底判斷也靠這個。
+            if dst_len == 0 && table == u32::from(RT_TABLE_MAIN) {
+                out.push((table, prio));
             }
         }
         debug!("[RouteManager] main-table default routes: {out:?}");
@@ -1462,17 +1778,31 @@ impl RouteManager {
         Ok(Vec::new())
     }
 
-    /// 清掉主表裡所有屬於本程式的 /32（metric 為 `PROBE_MAIN_ROUTE_METRIC` 或
-    /// `UNDERLAY_ROUTE_METRIC`），不論目標是否還在設定裡。
+    /// 清掉主表裡**探針**的 /32（metric `PROBE_MAIN_ROUTE_METRIC`），不論目標是否還在
+    /// 設定裡。
     ///
-    /// 這是啟動時的正確做法：只依「metric 是我們專用的」來判斷歸屬，因此上一次執行
-    /// 留下的、已從設定移除的目標，或當時設備還不存在的目標，都能一併清乾淨。
-    /// 刪除訊息**不帶 nexthop**（只按 table + dst + metric 命中）——帶了 OIF/GATEWAY
-    /// 時，若那條路由的閘道或 ifindex 後來變過，內核會回 ESRCH 而實際上沒刪掉。
+    /// 這是執行期（`SetProbePaths(clean = true)`）該用的入口：**不含 underlay /32**，
+    /// 因為 underlay 是執行期資產，同一批指令裡才剛由 `Apply` 裝好（見
+    /// `RUNTIME_SWEEP_METRICS` 的說明）。啟動時要清乾淨請用 `sweep_all_own_host_routes`。
     pub fn sweep_own_probe_host_routes(&mut self) -> io::Result<usize> {
-        let probe = self.sweep_host_routes_with_metric(PROBE_MAIN_ROUTE_METRIC, "probe")?;
-        let underlay = self.sweep_host_routes_with_metric(UNDERLAY_ROUTE_METRIC, "underlay")?;
-        Ok(probe + underlay)
+        self.sweep_host_routes_for(&RUNTIME_SWEEP_METRICS)
+    }
+
+    /// 清掉主表裡所有屬於本程式的 /32（探針 + 隧道 underlay），不論目標是否還在設定裡。
+    ///
+    /// **只供啟動前使用**：上次執行留下的 underlay /32 出口可能已經失效，而
+    /// `sync_underlay_routes` 的快取是空的（重啟後），不清就會留下指向舊網關的 /32。
+    pub fn sweep_all_own_host_routes(&mut self) -> io::Result<usize> {
+        self.sweep_host_routes_for(&STARTUP_SWEEP_METRICS)
+    }
+
+    /// 依給定的 metric 清單清掃主表 /32（探針與 underlay 共用這段邏輯）
+    fn sweep_host_routes_for(&mut self, metrics: &[(u32, &str)]) -> io::Result<usize> {
+        let mut removed = 0;
+        for (metric, kind) in metrics {
+            removed += self.sweep_host_routes_with_metric(*metric, kind)?;
+        }
+        Ok(removed)
     }
 
     /// 依 metric 把主表裡屬於我們的 /32 清乾淨（探針與 underlay 共用這段邏輯）
@@ -1480,30 +1810,36 @@ impl RouteManager {
         let victims = self.dump_host_routes_with_metric(metric)?;
         let mut removed = 0;
         for (table, dst, dst_len) in victims {
+            // 只清主表：我們所有探針 /32 與 underlay /32 都下發在主表；其它表裡
+            // 剛好同 metric 的 /32 是第三方的，不該碰（dump 不過濾表號）。
+            if table != u32::from(RT_TABLE_MAIN) {
+                debug!(
+                    "[RouteManager] Ignoring non-main-table {kind} host route {dst}/{dst_len} in table {table}"
+                );
+                continue;
+            }
             // 主表用 rtm_table（254）表達、不帶 RTA_TABLE——與我們下發時的形式一致。
             // 實測：對主表的路由帶 RTA_TABLE 去刪，內核會回 ESRCH 而路由仍在。
-            let target_table = if table == u32::from(RT_TABLE_MAIN) {
-                None
-            } else {
-                Some(table)
-            };
             debug!(
                 "[RouteManager] Removing stale {kind} host route {dst}/{dst_len} in table {table} (metric {metric})"
             );
             self.seq += 1;
             let seq = self.seq;
             let octets = dst.octets();
-            let msg = Self::build_route_msg_ex(
+            // 清掃專用：刪除帶 RTPROT_UNSPEC（通配符），才清得掉舊版本以
+            // RTPROT_STATIC 留下的 /32；一般刪除仍用專屬 protocol（見 RTPROT_MWAN4）。
+            let msg = Self::build_route_msg_ex_proto(
                 metric,
                 AF_INET,
                 RouteTarget {
-                    table: target_table,
+                    table: None,
                     dst: Some((&octets, dst_len)),
                 },
                 &[],
                 RTM_DELROUTE,
                 NLM_F_REQUEST | NLM_F_ACK,
                 seq,
+                RTPROT_UNSPEC,
             );
             match self.commit_probe_route(&msg, &format!("stale {kind} host route {dst}/{dst_len}"))
             {
@@ -1826,16 +2162,6 @@ impl RouteManager {
         buffer[0..NlMsgHdr::LEN].copy_from_slice(&nlhdr.to_bytes());
     }
 
-    /// resilient group 的 bucket 數：2 的冪、不小於成員數（核心要求 u16）
-    fn res_bucket_count(members: usize) -> u16 {
-        let mut b = RES_BUCKETS_MIN;
-        while b < members.max(1) && b < RES_BUCKETS_MAX {
-            b *= 2;
-        }
-        // RES_BUCKETS_MAX 遠小於 u16::MAX，這裡不可能截斷
-        b as u16
-    }
-
     /// 從 NLMSG_ERROR 回應裡取出內核的 extack 說明字串（NLMSGERR_ATTR_MSG = 1）。
     ///
     /// 格式：`nlmsghdr` + `i32 error` + 原始請求的 `nlmsghdr` + 屬性串流。
@@ -1872,15 +2198,12 @@ impl RouteManager {
         )
     }
 
-    /// 內核在刪除一個「本來就不存在」的物件時，不同物件回不同 errno：
-    /// 路由 → ESRCH、規則 → **ENOENT**、整張表不存在 → ENOENT/EINVAL（實測）。
-    /// 全部當成「沒有東西可刪」，否則每次啟動都會出現假警告，
-    /// 而且 `set_probe_paths` 會把「規則已不存在」誤判成失敗而跳過重裝。
+    /// 內核在刪除一個「本來就不存在」的物件時回：路由 → ESRCH、規則 → ENOENT。
+    /// 只容忍這兩種，**不再把 EINVAL 當成 absent**：EINVAL 代表請求本身有問題
+    /// （例如 DELNEXTHOP 的 header 帶了非零的 protocol），吞掉它會讓刪除永遠
+    /// 失敗卻毫無告警（netns 實測踩到：nexthop group/成員默默殘留）。
     fn is_absent_object(err: &io::Error) -> bool {
-        matches!(
-            err.raw_os_error(),
-            Some(ESRCH) | Some(ENOENT) | Some(EINVAL)
-        )
+        matches!(err.raw_os_error(), Some(ESRCH) | Some(ENOENT))
     }
 
     /// 送出 netlink 訊息並等待 ACK；「本來就不存在」（刪除時）與「已經存在」
@@ -1908,48 +2231,41 @@ impl RouteManager {
         }
     }
 
-    /// 刪除核心 FIB 中的 IPv4 預設路由。
+    /// 刪除「本程式目前安裝的」預設路由（IPv4 / IPv6 共用）。
     /// 用於「全部 WAN 斷線」與「守護進程優雅退出」兩種情境，
     /// 避免殘留指向已失效鏈路的預設路由。
-    pub fn delete_default_route(&mut self) -> io::Result<()> {
-        self.seq += 1;
-        let seq = self.seq;
-        let buffer = Self::build_route_msg(
-            self.priority,
-            AF_INET,
-            &[],
-            RTM_DELROUTE,
-            NLM_F_REQUEST | NLM_F_ACK,
-            seq,
-        );
-        info!(
-            "[RouteManager] Removing IPv4 default route from FIB (metric {})",
-            self.priority
-        );
-        let res = self.commit_msg(&buffer, "IPv4 default route removal");
-        self.installed_v4 = InstalledVariant::None;
-        res
-    }
-
-    /// 刪除核心 FIB 中的 IPv6 預設路由（::/0）
-    pub fn delete_ipv6_default_route(&mut self) -> io::Result<()> {
-        self.seq += 1;
-        let seq = self.seq;
-        let buffer = Self::build_route_msg(
-            self.priority,
-            AF_INET6,
-            &[],
-            RTM_DELROUTE,
-            NLM_F_REQUEST | NLM_F_ACK,
-            seq,
-        );
-        info!(
-            "[RouteManager] Removing IPv6 default route from FIB (metric {})",
-            self.priority
-        );
-        let res = self.commit_msg(&buffer, "IPv6 default route removal");
-        self.installed_v6 = InstalledVariant::None;
-        res
+    ///
+    /// 為什麼要分派 variant：標準路由與 nh-id 路由是**不同的路由 key**，
+    /// 用錯刪除報文內核只會回 ESRCH（然後被當成「本來就不存在」），
+    /// 路由就永遠留在核心裡。只有刪除成功（含本來就不存在）才清 bookkeeping，
+    /// 失敗時保留狀態讓後續心跳／清理能重試。
+    fn remove_installed_default_route(&mut self, family: u8) -> io::Result<()> {
+        match self.installed_variant(family) {
+            InstalledVariant::None => {
+                debug!(
+                    "[RouteManager] {} default route was never installed by mwan4; leaving it alone",
+                    Self::family_name(family)
+                );
+                Ok(())
+            }
+            InstalledVariant::Standard => {
+                let res = self.delete_standard_route(family);
+                if res.is_ok() {
+                    self.set_installed_variant(family, InstalledVariant::None);
+                }
+                res
+            }
+            InstalledVariant::Resilient => {
+                let group_id = Self::group_id_for(family);
+                let res = self.delete_nh_route(family, group_id);
+                if res.is_ok() {
+                    self.set_installed_variant(family, InstalledVariant::None);
+                    // 路由已不再引用 group，順手把 group 與成員一起拆乾淨
+                    self.teardown_resilient(family, group_id);
+                }
+                res
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1983,6 +2299,34 @@ impl RouteManager {
         out
     }
 
+    /// 決定 `wanted` 裡哪些 underlay /32 需要（重新）下發。
+    ///
+    /// `installed` 是本行程的記憶體快取，`kernel_present` 是剛從核心轉儲出來的實際集合。
+    /// **不能只信快取**：啟動清掃、外部 `ip route del`、別的行程覆蓋都可能讓核心裡的 /32
+    /// 消失，而快取仍記著「出口沒變 → 已裝好」→ 就再也不會補（實測：被清掃誤刪後
+    /// 40 秒（含 30 秒心跳）一直是 0 條）。核心顯示缺失時一律重下，`NLM_F_REPLACE`
+    /// 本身冪等，重下的代價只有一個 netlink 往返。
+    ///
+    /// `kernel_present == None` 代表轉儲失敗（查不到），此時退回快取判斷：寧可這一輪
+    /// 少下一次，也不要在每個心跳無條件重下全部（轉儲失敗的告警已經另發）。
+    fn plan_underlay_repairs(
+        wanted: &[(Ipv4Addr, u32, Option<Vec<u8>>)],
+        installed: &std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
+        kernel_present: Option<&std::collections::HashSet<Ipv4Addr>>,
+    ) -> Vec<(Ipv4Addr, u32, Option<Vec<u8>>)> {
+        wanted
+            .iter()
+            .filter(|(addr, ifindex, gateway)| {
+                let cached_ok = installed
+                    .get(addr)
+                    .is_some_and(|(i, g)| i == ifindex && g == gateway);
+                let in_kernel = kernel_present.is_none_or(|present| present.contains(addr));
+                !(cached_ok && in_kernel)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// 同步「隧道 underlay 對端」的 /32 路由（見 `UNDERLAY_ROUTE_METRIC`）。
     ///
     /// 為什麼需要：隧道（VXLAN/WireGuard）的封裝封包目的地是 underlay 對端，
@@ -1996,6 +2340,26 @@ impl RouteManager {
     fn sync_underlay_routes(&mut self, active_wans: &[ActiveWanRoute]) -> io::Result<()> {
         let wanted = Self::plan_underlay_routes(active_wans);
 
+        // 0) 問核心「這些 /32 現在到底在不在」。記憶體快取只是快取：
+        //    啟動清掃、外部刪除、或別的行程覆蓋都會讓它與現實脫節，
+        //    只信快取就會卡在「自以為裝好、其實一條都沒有」的死狀態。
+        let kernel_present: Option<std::collections::HashSet<Ipv4Addr>> =
+            match self.dump_host_routes_with_metric(UNDERLAY_ROUTE_METRIC) {
+                Ok(rows) => Some(
+                    rows.into_iter()
+                        .filter(|(table, _, _)| *table == u32::from(RT_TABLE_MAIN))
+                        .map(|(_, addr, _)| addr)
+                        .collect(),
+                ),
+                Err(e) => {
+                    warn!(
+                        "[RouteManager] Could not dump underlay host routes ({e}); \
+                         falling back to the in-memory cache for this round"
+                    );
+                    None
+                }
+            };
+
         // 1) 先刪掉不再需要的（隧道下線、或出口換了）
         let stale: Vec<Ipv4Addr> = self
             .underlay_routes
@@ -2004,6 +2368,15 @@ impl RouteManager {
             .cloned()
             .collect();
         for addr in stale {
+            if kernel_present
+                .as_ref()
+                .is_some_and(|present| !present.contains(&addr))
+            {
+                // 核心裡已經沒有這條：清掉快取即可，不必發一條注定 ESRCH 的刪除
+                debug!("[RouteManager] Underlay route {addr}/32 already gone from the kernel");
+                self.underlay_routes.remove(&addr);
+                continue;
+            }
             if let Err(e) = self.delete_underlay_route(addr) {
                 warn!("[RouteManager] Failed to remove underlay route {addr}/32: {e}");
                 continue;
@@ -2011,15 +2384,10 @@ impl RouteManager {
             self.underlay_routes.remove(&addr);
         }
 
-        // 2) 再補上缺的、或出口變了的
-        for (addr, ifindex, gateway) in wanted {
-            let unchanged = self
-                .underlay_routes
-                .get(&addr)
-                .is_some_and(|(i, g)| *i == ifindex && *g == gateway);
-            if unchanged {
-                continue;
-            }
+        // 2) 再補上缺的、出口變了的、以及核心其實沒有的（自愈）
+        for (addr, ifindex, gateway) in
+            Self::plan_underlay_repairs(&wanted, &self.underlay_routes, kernel_present.as_ref())
+        {
             self.install_underlay_route(addr, ifindex, gateway.clone())?;
             self.underlay_routes.insert(addr, (ifindex, gateway));
         }
@@ -2076,6 +2444,7 @@ impl RouteManager {
         self.commit_msg(&msg, &format!("underlay route {target}/32 removal"))
     }
 
+    // -----------------------------------------------------------------------
     /// 更新 IPv4 預設路由。實際下發方式由 `ecmp_mode` 決定。
     ///
     /// 傳入空陣列代表「所有 WAN 皆斷線」，此時會主動刪除預設路由，
@@ -2218,8 +2587,16 @@ impl RouteManager {
              carrier-loss links, which the kernel does not remove by itself)",
             Self::family_name(family)
         );
-        self.delete_standard_route(family)?;
-        self.set_installed_variant(family, InstalledVariant::None);
+        // 依實際安裝的變體刪除：resilient 是 nh-id 路由，標準刪除報文的 key 對不上，
+        // 會回 ESRCH 被當成「本來就不存在」，結果死鏈路的預設路由留在核心繼續黑洞。
+        // variant == None 時仍走標準刪除：那可能是上一個進程留下的殘留路由。
+        match self.installed_variant(family) {
+            InstalledVariant::Resilient => self.remove_installed_default_route(family)?,
+            _ => {
+                self.delete_standard_route(family)?;
+                self.set_installed_variant(family, InstalledVariant::None);
+            }
+        }
         Ok(())
     }
 
@@ -2304,20 +2681,17 @@ impl RouteManager {
         self.apply_standard(family, hops)
     }
 
-    /// 核心是否「根本不支援」nexthop object / resilient group，
-    /// 或這個設定我們無法用 resilient 表達（成員數超過 bucket 上限）。
-    /// 兩種情況都應該永久退回標準 ECMP，而不是每一輪都重試一次。
+    /// 核心是否「根本不支援」nexthop object / resilient group。
+    ///
+    /// 只有真正的「不支援」才永久退回標準 ECMP。刻意**不把 EINVAL 算進來**：
+    /// EINVAL 也涵蓋「既有 group 的 bucket 數不同」「成員參數被拒」這類可用
+    /// 拆除重建恢復的暫時性錯誤；把它當永久不支援會讓 auto 模式一次失敗就
+    /// 再也不試 resilient（黏滯效果無聲消失）。
     #[cfg(target_os = "linux")]
     fn should_give_up_on_resilient(e: &io::Error) -> bool {
-        if e.kind() == io::ErrorKind::InvalidInput {
-            return true;
-        }
         matches!(
             e.raw_os_error(),
-            Some(libc::EINVAL)
-                | Some(libc::EOPNOTSUPP)
-                | Some(libc::ENOSYS)
-                | Some(libc::EAFNOSUPPORT)
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EAFNOSUPPORT)
         )
     }
 
@@ -2332,6 +2706,15 @@ impl RouteManager {
         } else {
             self.installed_v4
         }
+    }
+
+    /// 實際安裝到核心的 IPv4 預設路由變體。
+    ///
+    /// 給主迴圈判斷 `flush_conntrack_on_switch` 是否該生效：`ecmp_mode=auto` 在
+    /// 內核不支援 resilient 時會退回 standard，此時仍必須在切換瞬間清 conntrack
+    /// （用設定值判斷會誤判成 resilient 而把清理關掉，見 FIX-8）。
+    pub fn installed_ipv4_variant(&self) -> InstalledVariant {
+        self.installed_v4
     }
 
     fn set_installed_variant(&mut self, family: u8, v: InstalledVariant) {
@@ -2358,9 +2741,22 @@ impl RouteManager {
 
     /// 拆除 resilient 預設路由：先刪路由（否則 group 仍被引用刪不掉），
     /// 再刪 group，最後才刪成員。全程容忍「本來就不存在」。
+    ///
+    /// 只有原本真的是 Resilient 且**成功刪除路由**時才會把 variant 清為 None；
+    /// 原本是 Standard / None 時 variant 保持不變，否則標準路由的 bookkeeping
+    /// 會被誤清（`cleanup_routes` 就再也不會刪它）。路由刪除失敗時直接返回，
+    /// 此時刪 group/成員只會拿到 EBUSY，且狀態保留才能重試。
     fn teardown_resilient(&mut self, family: u8, group_id: u32) {
         if self.installed_variant(family) == InstalledVariant::Resilient {
-            let _ = self.delete_nh_route(family, group_id);
+            if let Err(e) = self.delete_nh_route(family, group_id) {
+                warn!(
+                    "[RouteManager] Failed to remove {} nexthop-group route ({e}); \
+                     keeping the group for a later retry",
+                    Self::family_name(family)
+                );
+                return;
+            }
+            self.set_installed_variant(family, InstalledVariant::None);
         }
         // group 本身是用 AF_UNSPEC 建的，刪除時也要用 AF_UNSPEC
         let _ = self.delete_nexthop(AF_UNSPEC, group_id);
@@ -2372,7 +2768,6 @@ impl RouteManager {
                 }
             }
         }
-        self.set_installed_variant(family, InstalledVariant::None);
     }
 
     /// 用 resilient nexthop group 下發預設路由
@@ -2388,14 +2783,8 @@ impl RouteManager {
             return self.handle_all_links_down(family);
         }
 
-        // 標準路由與 nh_id 路由的 key 不同，切換時必須先把舊的刪掉，
-        // 否則核心會保留兩條 default route。
-        if self.installed_variant(family) == InstalledVariant::Standard {
-            self.delete_standard_route(family)?;
-            self.set_installed_variant(family, InstalledVariant::None);
-        }
-
-        // bucket 必須同時是 2 的冪且涵蓋所有成員；超過上限就無法用 resilient 表達
+        // bucket 上限檢查必須在「刪標準路由」之前：先刪再發現無法用 resilient
+        // 表達，會留下「沒有預設路由」的空窗。
         if hops.len() > RES_BUCKETS_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2404,6 +2793,13 @@ impl RouteManager {
                     hops.len()
                 ),
             ));
+        }
+
+        // 標準路由與 nh_id 路由的 key 不同，切換時必須先把舊的刪掉，
+        // 否則核心會保留兩條 default route。
+        if self.installed_variant(family) == InstalledVariant::Standard {
+            self.delete_standard_route(family)?;
+            self.set_installed_variant(family, InstalledVariant::None);
         }
 
         // 1) 確保成員 nexthop object 存在。ID 沿用既有配置，
@@ -2415,8 +2811,13 @@ impl RouteManager {
             members.push((id, hop.weight));
         }
 
-        // 2) 建立 / 更新 resilient group
-        let buckets = Self::res_bucket_count(members.len());
+        // bucket 數固定用上限（2 的冪、涵蓋任何合法成員數）。
+        // 為什麼不按成員數取「最小的 2 的冪」：核心在 REPLACE 既有 group 時**不允許改變
+        // bucket 數**（回 EINVAL "Can not change number of buckets"），而成員數跨越
+        // 8→9 這類 2 的冪邊界時 bucket 數會變動 → 當輪 resilient 失效；auto 模式若把
+        // 這個 EINVAL 當成「核心不支援」還會永久退回 standard。固定上限同時讓
+        // bucket→成員的分配粒度更平滑（每個成員分到的桶更多）。
+        let buckets = RES_BUCKETS_MAX as u16;
         self.ensure_nexthop_group(group_id, &members, buckets)?;
 
         // 3) 下發引用該 group 的預設路由
@@ -2562,26 +2963,32 @@ impl RouteManager {
     /// 從未接管的部署）那條 metric 0 的預設路由其實是 netifd 的，刪掉就等於把
     /// 整台路由器的出口刪了。
     pub fn cleanup_routes(&mut self) -> io::Result<()> {
+        // 策略規則先拆：它們指向各 WAN 的探針表，必須在表被清空/拆除前移除
+        if let Err(e) = self.sweep_policy_rules() {
+            warn!("[RouteManager] Failed to remove policy rules on shutdown: {e}");
+        }
+
         // 探針路徑（規則 + 獨立表內的路由）先拆，避免規則指向已空的表
         let _ = self.set_probe_paths(&[]);
+
+        // 先按實際安裝的變體刪預設路由；這裡不能先 teardown_resilient，
+        // 否則 Standard 的 variant 會被清成 None，後面的 if 就永遠不成立。
+        let mut result = self.remove_installed_default_route(AF_INET);
+        result = result.and(self.remove_installed_default_route(AF_INET6));
+
+        // 隧道 underlay /32 也必須拆掉：它們指向的閘道可能已經失效，
+        // 留著會讓封裝封包被黑洞到舊出口（優先於預設路由）。
+        if let Err(e) = self.sync_underlay_routes(&[]) {
+            warn!("[RouteManager] Failed to remove underlay routes on shutdown: {e}");
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+
+        // 無論預設路由刪除成功與否，都再嘗試拆掉殘留的 resilient group / 成員。
+        // 若上面刪除失敗，variant 仍是 Resilient，teardown 會先重試刪路由。
         self.teardown_resilient(AF_INET, NH_GROUP_ID_V4);
         self.teardown_resilient(AF_INET6, NH_GROUP_ID_V6);
-
-        let mut result = Ok(());
-        if self.installed_v4 != InstalledVariant::None {
-            result = self.delete_default_route();
-        } else {
-            debug!(
-                "[RouteManager] IPv4 default route was never installed by mwan4; leaving it alone"
-            );
-        }
-        if self.installed_v6 != InstalledVariant::None {
-            result = result.and(self.delete_ipv6_default_route());
-        } else {
-            debug!(
-                "[RouteManager] IPv6 default route was never installed by mwan4; leaving it alone"
-            );
-        }
         result
     }
 
@@ -2652,6 +3059,10 @@ impl Drop for RouteManager {
     }
 }
 
+/// 真實核心的 netns 整合測試（預設 ignore；見模組開頭的執行方式）
+#[cfg(all(test, target_os = "linux"))]
+mod netns_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2678,11 +3089,14 @@ mod tests {
 
     #[test]
     fn test_nexthop_weight_clamped() {
-        // weight > 256 會被夾住，避免 `as u8` 靜默截斷
-        assert_eq!(300u32.clamp(1, MAX_NEXTHOP_WEIGHT), 256);
+        // 超過上限（255）一律夾住，避免 `as u8` 靜默截斷。
+        // 上限 255 而非 256：resilient group 的 nexthop_grp.weight 在 Linux < 6.9
+        // 只到 254（weight-1），設 256 會讓 RTM_NEWNEXTHOP 回 EINVAL。
+        assert_eq!(300u32.clamp(1, MAX_NEXTHOP_WEIGHT), 255);
         assert_eq!(0u32.clamp(1, MAX_NEXTHOP_WEIGHT), 1);
-        // 257 在舊程式碼裡會變成 0，等價於 weight=1，屬於靜默錯誤
-        assert_eq!((257u32.clamp(1, MAX_NEXTHOP_WEIGHT) - 1) as u8, 255);
+        // 256 在舊程式碼裡會編成 255（合法），現在一律夾成 255
+        assert_eq!((256u32.clamp(1, MAX_NEXTHOP_WEIGHT) - 1) as u8, 254);
+        assert_eq!((255u32.clamp(1, MAX_NEXTHOP_WEIGHT) - 1) as u8, 254);
     }
 
     #[test]
@@ -2852,6 +3266,26 @@ mod tests {
         let attrs = parse_attrs(&msg);
         let types: Vec<u16> = attrs.iter().map(|(t, _)| *t).collect();
         assert_eq!(types, vec![RTA_PRIORITY]);
+        // scope 必須是 NOWHERE，否則無網關路由（scope=LINK）會因不匹配而刪不掉
+        assert_eq!(msg[NlMsgHdr::LEN + 6], RT_SCOPE_NOWHERE);
+    }
+
+    #[test]
+    fn test_delete_via_nh_message_uses_scope_nowhere() {
+        let msg = RouteManager::build_route_msg_via_nh(
+            0,
+            AF_INET,
+            42,
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            10,
+        );
+        let hdr = NlMsgHdr::from_bytes(&msg).unwrap();
+        assert_eq!(hdr.nlmsg_type, RTM_DELROUTE);
+        assert_eq!(msg[NlMsgHdr::LEN + 6], RT_SCOPE_NOWHERE);
+        let attrs = parse_attrs(&msg);
+        let types: Vec<u16> = attrs.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types, vec![RTA_PRIORITY, RTA_NH_ID]);
     }
 
     #[test]
@@ -2995,6 +3429,15 @@ mod tests {
         assert_eq!(hdr.nlmsg_type, RTM_DELNEXTHOP);
         assert_eq!(msg[NlMsgHdr::LEN], AF_UNSPEC);
 
+        // 除了 nh_family，nhmsg 其餘欄位必須全零：內核 nh_valid_get_del_req()
+        // 對 nh_protocol / nh_scope / nh_flags 任一非零都回 EINVAL
+        // "Invalid values in header"，刪除會靜默失敗（netns 實測抓到過）。
+        assert_eq!(
+            &msg[NlMsgHdr::LEN + 1..NlMsgHdr::LEN + NhMsg::LEN],
+            &[0u8; NhMsg::LEN - 1],
+            "DELNEXTHOP 的 nhmsg 除了 family 必須全零"
+        );
+
         let attrs = nh_attrs(&msg);
         // 刪除時多帶 NHA_OIF 會被核心視為無效；只允許 NHA_ID
         assert_eq!(attr_types(&attrs), vec![NHA_ID]);
@@ -3004,8 +3447,9 @@ mod tests {
     #[test]
     fn test_nexthop_del_msg_uses_the_same_family_as_creation() {
         // 成員是以 AF_INET 建立的，刪除時也必須帶 AF_INET。
-        // 早期版本寫死 AF_UNSPEC，內核比對 family 失敗回 EINVAL，
-        // 成員因此永遠刪不掉，每輪重試都留下一個孤兒 nexthop object。
+        // 成員是以 AF_INET 建立、group 是以 AF_UNSPEC 建立，刪除時帶上對應 family。
+        // （內核 6.12 的 DELNEXTHOP 只驗 header 其餘欄位為零，不驗 family；這裡
+        //   保留對稱寫法以防舊核心比對，且 deleted family 不影響正確性。）
         let msg = RouteManager::build_nexthop_del_msg(7, AF_INET, 42);
         assert_eq!(msg[NlMsgHdr::LEN], AF_INET);
         assert_eq!(read_u32(&nh_attrs(&msg)[0].1, 0), Some(42));
@@ -3111,38 +3555,25 @@ mod tests {
     }
 
     #[test]
-    fn test_res_bucket_count_is_power_of_two_and_covers_members() {
-        for members in [0usize, 1, 2, 3, 8, 9, 16, 17, 64, 100, 256] {
-            let b = RouteManager::res_bucket_count(members) as usize;
-            assert!(b.is_power_of_two(), "buckets {b} must be a power of two");
-            assert!(
-                b >= members.max(1),
-                "buckets {b} must cover {members} members"
-            );
-            assert!((RES_BUCKETS_MIN..=RES_BUCKETS_MAX).contains(&b));
-        }
-
-        // 超過上限時退回上限值；呼叫端（apply_resilient）會把這種設定判為不支援
-        assert_eq!(
-            RouteManager::res_bucket_count(10_000),
-            RES_BUCKETS_MAX as u16
-        );
-        assert_eq!(
-            RouteManager::res_bucket_count(RES_BUCKETS_MAX + 1),
-            RES_BUCKETS_MAX as u16
-        );
-
-        assert_eq!(RouteManager::res_bucket_count(0), RES_BUCKETS_MIN as u16);
-        assert_eq!(RouteManager::res_bucket_count(2), RES_BUCKETS_MIN as u16);
-        assert_eq!(RouteManager::res_bucket_count(9), 16);
+    fn test_resilient_buckets_are_fixed_power_of_two() {
+        // bucket 數固定用 RES_BUCKETS_MAX：核心在 REPLACE 既有 group 時不允許改變
+        // bucket 數，因此不能按成員數動態調整。必須是 2 的冪、涵蓋 config 允許的
+        // 最大網卡數（64），且能放進 u16。
+        const { assert!(RES_BUCKETS_MAX.is_power_of_two()) };
+        const { assert!(RES_BUCKETS_MAX >= 64, "必須涵蓋 config 的網卡數上限") };
+        const { assert!(RES_BUCKETS_MAX < u16::MAX as usize) };
     }
 
     #[test]
-    fn test_too_many_members_is_treated_as_unsupported() {
-        // 成員數超過 bucket 上限時 apply_resilient 會回 InvalidInput；
-        // auto 模式必須據此永久退回，否則每一輪都要重試一次失敗的 netlink 呼叫
-        let e = io::Error::new(io::ErrorKind::InvalidInput, "too many nexthops");
-        assert!(RouteManager::should_give_up_on_resilient(&e));
+    fn test_resilient_give_up_only_for_real_unsupported_errors() {
+        // 真正的「核心不支援」→ 永久退回標準 ECMP
+        let unsupported = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert!(RouteManager::should_give_up_on_resilient(&unsupported));
+
+        // EINVAL（例如既有 group 的 bucket 數不同）可以靠拆除重建恢復，
+        // 不能當成永久不支援，否則 auto 一次失敗就再也不試 resilient
+        let transient = io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!RouteManager::should_give_up_on_resilient(&transient));
     }
 
     #[test]
@@ -3361,6 +3792,97 @@ mod tests {
         assert!(RouteManager::plan_underlay_routes(&[]).is_empty());
     }
 
+    /// FIX-1 回歸釘：**執行期**那次清掃只能掃探針 /32。
+    ///
+    /// 修復前的 bug：worker 處理同一批指令時 `Apply` 先執行（剛把 underlay /32 裝好）、
+    /// `SetProbePaths(clean = true)` 後執行，而當時的清掃同時掃 42760 與 42761 →
+    /// 把剛裝好的 underlay /32 刪掉，且記憶體快取還記著「已裝」→ 永不重裝。
+    #[test]
+    fn test_runtime_sweep_never_touches_underlay() {
+        let runtime: Vec<u32> = RUNTIME_SWEEP_METRICS.iter().map(|(m, _)| *m).collect();
+        assert_eq!(runtime, vec![PROBE_MAIN_ROUTE_METRIC]);
+        assert!(
+            !runtime.contains(&UNDERLAY_ROUTE_METRIC),
+            "執行期清掃若掃到 underlay /32，就會把同一批 Apply 剛裝好的路由刪掉"
+        );
+
+        let startup: Vec<u32> = STARTUP_SWEEP_METRICS.iter().map(|(m, _)| *m).collect();
+        assert!(startup.contains(&PROBE_MAIN_ROUTE_METRIC));
+        assert!(
+            startup.contains(&UNDERLAY_ROUTE_METRIC),
+            "啟動前必須連殘留的 underlay /32 一起清（出口可能已經失效）"
+        );
+    }
+
+    /// FIX-1 回歸釘：核心說「這條 /32 不在」時，即使記憶體快取記著「已裝、出口沒變」，
+    /// 也必須重下（自愈）。反例就是修復前的 `unchanged -> continue`。
+    #[test]
+    fn test_underlay_repair_reinstalls_when_kernel_lost_the_route() {
+        let addr = Ipv4Addr::new(10, 128, 0, 20);
+        let exit_gw = Some(vec![10u8, 176, 255, 254]);
+        let wan = |ifname: &str,
+                   ifindex: u32,
+                   metric: u32,
+                   gateway: Option<Ipv4Addr>,
+                   underlay: Vec<Ipv4Addr>| ActiveWanRoute {
+            ifname: ifname.to_string(),
+            ifindex,
+            gateway,
+            weight: 1,
+            metric,
+            underlay_targets: underlay,
+        };
+        let wans = vec![
+            wan(
+                "eth1",
+                3,
+                10,
+                Some(Ipv4Addr::new(10, 176, 255, 254)),
+                Vec::new(),
+            ),
+            wan(
+                "vxlan0",
+                45,
+                10,
+                Some(Ipv4Addr::new(10, 77, 0, 1)),
+                vec![addr],
+            ),
+        ];
+        let wanted = RouteManager::plan_underlay_routes(&wans);
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(wanted[0].1, 3);
+
+        // 快取說「已裝、出口 = eth1」
+        let installed: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)> =
+            [(addr, (3u32, exit_gw.clone()))].into_iter().collect();
+
+        // 核心也還有一條 → 不必重下
+        let present: std::collections::HashSet<Ipv4Addr> = [addr].into_iter().collect();
+        assert!(
+            RouteManager::plan_underlay_repairs(&wanted, &installed, Some(&present)).is_empty()
+        );
+
+        // 核心裡沒有了（被清掃／外部刪除）→ 必須重裝
+        let absent: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
+        let repairs = RouteManager::plan_underlay_repairs(&wanted, &installed, Some(&absent));
+        assert_eq!(repairs.len(), 1, "核心缺失時必須重下");
+        assert_eq!(repairs[0].0, addr);
+        assert_eq!(repairs[0].1, 3);
+        assert_eq!(repairs[0].2, exit_gw);
+
+        // 轉儲失敗（None）→ 這一輪退回快取判斷，不無條件重下
+        assert!(RouteManager::plan_underlay_repairs(&wanted, &installed, None).is_empty());
+
+        // 快取記的出口與期望不符（隧道換了 underlay 出口）→ 即使核心有也要重下
+        let moved: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)> =
+            [(addr, (45u32, Some(vec![10, 77, 0, 1])))]
+                .into_iter()
+                .collect();
+        let repairs = RouteManager::plan_underlay_repairs(&wanted, &moved, Some(&present));
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].1, 3, "期望的出口是物理線 eth1");
+    }
+
     #[test]
     fn test_probe_main_route_metric_is_distinct() {
         // 探針 /32 的 metric 必須與預設路由的 priority 不同，否則會互相蓋掉；
@@ -3429,6 +3951,74 @@ mod tests {
             RouteManager::build_rule_msg(9, spec(true), RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK);
         assert_eq!(NlMsgHdr::from_bytes(&del).unwrap().nlmsg_type, RTM_DELRULE);
         assert_eq!(parse_rule(&del).1, attrs);
+    }
+
+    #[test]
+    fn test_policy_rule_msg_layout() {
+        let rule = PolicyRule {
+            name: "guest".to_string(),
+            ifindex: 5,
+            table: PROBE_TABLE_BASE + 1,
+            priority: POLICY_RULE_PRIORITY_BASE + 2,
+            source: Some(("192.168.3.0".parse().unwrap(), 24)),
+            destination: Some(("10.0.0.0".parse().unwrap(), 8)),
+        };
+        let msg = RouteManager::build_policy_rule_msg(
+            11,
+            &rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        );
+
+        let (hdr, attrs) = parse_rule(&msg);
+        assert_eq!(hdr.family, AF_INET);
+        assert_eq!(hdr.action, FR_ACT_TO_TBL);
+        assert_eq!(hdr.src_len, 24, "from 前綴長度必須進 fib_rule_hdr");
+        assert_eq!(hdr.dst_len, 8, "to 前綴長度必須進 fib_rule_hdr");
+        assert_eq!(
+            attr_types(&attrs),
+            vec![FRA_TABLE, FRA_PRIORITY, FRA_SRC, FRA_DST, FRA_PROTOCOL]
+        );
+        assert_eq!(read_u32(&attrs[0].1, 0), Some(PROBE_TABLE_BASE + 1));
+        assert_eq!(
+            read_u32(&attrs[1].1, 0),
+            Some(POLICY_RULE_PRIORITY_BASE + 2)
+        );
+        assert_eq!(attrs[2].1, vec![192, 168, 3, 0]);
+        assert_eq!(attrs[3].1, vec![10, 0, 0, 0]);
+        assert_eq!(attrs[4].1, vec![PROBE_RULE_PROTOCOL]);
+
+        // 不限制來源/目的時：長度 0、不帶 FRA_SRC/FRA_DST（等同 match-all）
+        let any = PolicyRule {
+            name: "all".to_string(),
+            ifindex: 5,
+            table: PROBE_TABLE_BASE,
+            priority: POLICY_RULE_PRIORITY_BASE,
+            source: None,
+            destination: None,
+        };
+        let msg = RouteManager::build_policy_rule_msg(
+            12,
+            &any,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        );
+        let (hdr, attrs) = parse_rule(&msg);
+        assert_eq!((hdr.src_len, hdr.dst_len), (0, 0));
+        assert_eq!(
+            attr_types(&attrs),
+            vec![FRA_TABLE, FRA_PRIORITY, FRA_PROTOCOL]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_policy_rule_constants_do_not_collide() {
+        // 策略規則的優先序區段必須完全在探針規則之前，且都在 main 表之前
+        assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
+        assert!(POLICY_RULE_PRIORITY_BASE > 0);
+        // 兩者不能與探針的 metric 區段混淆
+        assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX < PROBE_MAIN_ROUTE_METRIC);
     }
 
     #[test]
