@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""MWAN4 打包腳本（APK + IPK + 離線 bundle）。
+"""MWAN4 打包脚本（APK + IPK + 离线 bundle）。
 
-設計要點
+设计要点
 --------
-1. 簽名金鑰只生成一次並持久化（預設 0600），不再每次打包換一把。
-   已裝機的 mwan4.rsa.pub 才能持續驗證後續版本，歷史簽名也可復現。
-   - MWAN4_SIGNING_KEY=<path>     指定/生成金鑰檔的位置
-   - MWAN4_SIGNING_KEY_PEM=<pem>  直接內嵌 PEM（CI / 密鑰管理用，完全不落盤）
-2. 按架構出包：不再產出「標 arch = all、內容卻是 aarch64 二進位」的假通用包。
-   只對「確實存在已編譯二進位」的 target 出包，檔名 / .PKGINFO / control
-   全部帶上真實架構。跨架構安裝會直接被 apk / opkg 拒絕，而不是裝完才 SIGSEGV。
-3. 依賴聲明（原本完全缺失）：
+1. 签名金钥只生成一次并持久化（预设 0600），不再每次打包换一把。
+   已装机的 mwan4.rsa.pub 才能持续验证后续版本，历史签名也可复现。
+   - MWAN4_SIGNING_KEY=<path>     指定/生成金钥档的位置
+   - MWAN4_SIGNING_KEY_PEM=<pem>  直接内嵌 PEM（CI / 密钥管理用，完全不落盘）
+2. 按架构出包：不再产出「标 arch = all、内容却是 aarch64 二进位」的假通用包。
+   只对「确实存在已编译二进位」的 target 出包，档名 / .PKGINFO / control
+   全部带上真实架构。跨架构安装会直接被 apk / opkg 拒绝，而不是装完才 SIGSEGV。
+3. 依赖声明（原本完全缺失）：
    - APK  : depend = libc
    - IPK  : Depends: libc
    OpenWrt/ImmortalWrt 的 libc 包名就是 `libc`（provides `libc-any`）。
-   注意：**不要**照 Alpine 寫成 `so:libc.musl-<arch>.so.1` —— OpenWrt 沒有這種
-   provider，依賴會無法解析、安裝直接失敗（實機踩過）。錯架構的攔阻由
-   .PKGINFO 的 `arch` 欄位負責。
-4. 翻譯：LuCI 的 .lmo 一律在打包時由 .po 重新編譯，不再依賴入庫的 .lmo。
-   舊的 .lmo 會在 .po 變更後悄悄過期，UI 默默退回英文；改成建置時編譯後，
-   出廠的翻譯必定與原始 .po 一致，並安裝到 /usr/lib/lua/luci/i18n/。
+   注意：**不要**照 Alpine 写成 `so:libc.musl-<arch>.so.1` —— OpenWrt 没有这种
+   provider，依赖会无法解析、安装直接失败（实机踩过）。错架构的拦阻由
+   .PKGINFO 的 `arch` 栏位负责。
+4. 翻译：LuCI 的 .lmo 一律在打包时由 .po 重新编译，不再依赖入库的 .lmo。
+   旧的 .lmo 会在 .po 变更后悄悄过期，UI 默默退回英文；改成建置时编译后，
+   出厂的翻译必定与原始 .po 一致，并安装到 /usr/lib/lua/luci/i18n/。
 """
 
 from __future__ import annotations
@@ -51,12 +51,12 @@ PUB_KEY_NAME = "mwan4.rsa.pub"
 PKG_NAME = "mwan4"
 LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
-# 注意：apk 對「同版本替換（1.0.0-r1 -> 1.0.0-r1）」**不會執行 post-install 鉤子**，
-# 只有真正的版本升級才會跑（實機驗證）。所以只要二進位/腳本有變，就必須遞增 release。
-APK_RELEASE = "r8"
-IPK_RELEASE = "8"
+# 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
+# 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
+APK_RELEASE = "r10"
+IPK_RELEASE = "10"
 
-# 新生成金鑰的位元數 / 可接受的最小位元數
+# 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
 MIN_KEY_SIZE = 2048
 
@@ -75,37 +75,37 @@ def fatal(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# 架構表
+# 架构表
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Arch:
-    """一個可出包的目標架構。"""
+    """一个可出包的目标架构。"""
 
-    #: 供 --arch 使用的短名，同時作為二進位檔名後綴
+    #: 供 --arch 使用的短名，同时作为二进位档名后缀
     key: str
-    #: Rust target triple（用於 target/<triple>/release/mwan4）
+    #: Rust target triple（用于 target/<triple>/release/mwan4）
     rust_target: str
-    #: apk 的 arch 欄位（OpenWrt 風格）
+    #: apk 的 arch 栏位（OpenWrt 风格）
     apk_arch: str
-    #: ipk 的 Architecture 欄位
+    #: ipk 的 Architecture 栏位
     ipk_arch: str
-    #: apk 的 libc 依賴。OpenWrt/ImmortalWrt 的 libc 包就叫 `libc`（provides `libc-any`），
-    #: 並沒有 Alpine 那種 `so:libc.musl-<arch>.so.1` provider，因此這裡用裸包名。
-    #: 錯架構的攔阻靠 .PKGINFO 的 `arch` 欄位，而不是這個依賴。
+    #: apk 的 libc 依赖。OpenWrt/ImmortalWrt 的 libc 包就叫 `libc`（provides `libc-any`），
+    #: 并没有 Alpine 那种 `so:libc.musl-<arch>.so.1` provider，因此这里用裸包名。
+    #: 错架构的拦阻靠 .PKGINFO 的 `arch` 栏位，而不是这个依赖。
     libc_dep: str
 
     def binary_path(self) -> str:
         return os.path.join(ROOT_DIR, "target", self.rust_target, "release", PKG_NAME)
 
 
-#: 目前支援的架構。新增架構只需在此加一行。
+#: 目前支援的架构。新增架构只需在此加一行。
 #:
-#: ⚠️ 多數 rust target 先 `rustup target add <triple>` 即可；但 **mipsel-unknown-linux-musl
-#: 是 tier-3，rustup 沒有預編譯 std**（會回 "has no prebuilt artifacts available"），
-#: 必須用 `-Z build-std` 從原始碼編 std，並自備 musl sysroot 當連結來源。
-#: 見 README「MIPS (mipsel_24kc)」一節的完整指令。
+#: ⚠️ 多数 rust target 先 `rustup target add <triple>` 即可；但 **mipsel-unknown-linux-musl
+#: 是 tier-3，rustup 没有预编译 std**（会回 "has no prebuilt artifacts available"），
+#: 必须用 `-Z build-std` 从原始码编 std，并自备 musl sysroot 当连结来源。
+#: 见 README「MIPS (mipsel_24kc)」一节的完整指令。
 ARCH_TABLE: list[Arch] = [
     Arch(
         key="aarch64_cortex-a53",
@@ -129,7 +129,7 @@ ARCH_TABLE: list[Arch] = [
         libc_dep="libc",
     ),
     Arch(
-        # MIPS 小端 24kc（MediaTek MT7621/MT7620 等 ramips 機型；OpenWrt 的 arch 名）。
+        # MIPS 小端 24kc（MediaTek MT7621/MT7620 等 ramips 机型；OpenWrt 的 arch 名）。
         key="mipsel_24kc",
         rust_target="mipsel-unknown-linux-musl",
         apk_arch="mipsel_24kc",
@@ -141,14 +141,14 @@ ARCH_BY_KEY = {a.key: a for a in ARCH_TABLE}
 
 
 # ---------------------------------------------------------------------------
-# 簽名金鑰：只生成一次、持久化、可從環境變數傳入
+# 签名金钥：只生成一次、持久化、可从环境变数传入
 # ---------------------------------------------------------------------------
 
 
 def _decode_private_key(pem: bytes, origin: str) -> rsa.RSAPrivateKey:
     try:
         key = serialization.load_pem_private_key(pem, password=None)
-    except Exception as e:  # noqa: BLE001 - 需要把底層錯誤原樣呈現給使用者
+    except Exception as e:  # noqa: BLE001 - 需要把底层错误原样呈现给使用者
         fatal(f"failed to load signing key from {origin}: {e}")
 
     if not isinstance(key, rsa.RSAPrivateKey):
@@ -161,7 +161,7 @@ def _decode_private_key(pem: bytes, origin: str) -> rsa.RSAPrivateKey:
 
 
 def _enforce_private_key_permissions(path: str) -> None:
-    """私鑰必須是 0600；若權限過寬則就地收緊，避免簽名金鑰被其他行程讀走。"""
+    """私钥必须是 0600；若权限过宽则就地收紧，避免签名金钥被其他行程读走。"""
     if os.name != "posix":
         return
     try:
@@ -177,10 +177,10 @@ def _enforce_private_key_permissions(path: str) -> None:
 
 
 def load_or_create_signing_key() -> tuple[rsa.RSAPrivateKey, str]:
-    """取得簽名私鑰。
+    """取得签名私钥。
 
-    優先序：MWAN4_SIGNING_KEY_PEM（記憶體） > MWAN4_SIGNING_KEY（路徑） >
-    預設路徑（存在則沿用，不存在則生成）。
+    优先序：MWAN4_SIGNING_KEY_PEM（记忆体） > MWAN4_SIGNING_KEY（路径） >
+    预设路径（存在则沿用，不存在则生成）。
     """
     inline = os.environ.get("MWAN4_SIGNING_KEY_PEM")
     if inline:
@@ -208,7 +208,7 @@ def load_or_create_signing_key() -> tuple[rsa.RSAPrivateKey, str]:
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    # O_EXCL：若同時有兩個打包行程在跑，後到的那個會直接失敗而不是默默覆蓋金鑰
+    # O_EXCL：若同时有两个打包行程在跑，后到的那个会直接失败而不是默默覆盖金钥
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -243,12 +243,12 @@ def public_key_fingerprint(key: rsa.RSAPrivateKey) -> str:
 
 
 # ---------------------------------------------------------------------------
-# tar / gzip 低階工具
+# tar / gzip 低阶工具
 # ---------------------------------------------------------------------------
 
 
 def make_ustar_header(name: str, size: int, mode: int, typeflag: bytes = b"0") -> bytes:
-    """生成標準 POSIX ustar 512 位元組頭部"""
+    """生成标准 POSIX ustar 512 位元组头部"""
     h = bytearray(512)
     nb = name.encode("utf-8")
     h[0:len(nb)] = nb
@@ -256,7 +256,7 @@ def make_ustar_header(name: str, size: int, mode: int, typeflag: bytes = b"0") -
     h[108:116] = b"0000000\0"
     h[116:124] = b"0000000\0"
     h[124:136] = f"{size:011o}\0".encode("ascii")
-    # SOURCE_DATE_EPOCH 讓同一份來源能產出可重現的 tar（發行版可重現建置慣例）
+    # SOURCE_DATE_EPOCH 让同一份来源能产出可重现的 tar（发行版可重现建置惯例）
     mtime = int(os.environ.get("SOURCE_DATE_EPOCH", time.time()))
     h[136:148] = f"{mtime:011o}\0".encode("ascii")
     h[148:156] = b"        "
@@ -285,7 +285,7 @@ def compress_gz(data: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 套件產生
+# 套件产生
 # ---------------------------------------------------------------------------
 
 
@@ -302,11 +302,11 @@ def create_exact_apk_package(
     depends: list[str] | None = None,
     provides: list[str] | None = None,
 ) -> None:
-    """生成嚴格符合 apk-tools v2/v3 解析標準的 3-stream APK 封裝。
+    """生成严格符合 apk-tools v2/v3 解析标准的 3-stream APK 封装。
 
-    Stream 1: signature tar.gz（無結尾補零塊）
-    Stream 2: control tar.gz（無結尾補零塊，保證 Unix LF 換行）
-    Stream 3: data tar.gz（標準 tar 格式，含 1024 位元組 EOF 塊）
+    Stream 1: signature tar.gz（无结尾补零块）
+    Stream 2: control tar.gz（无结尾补零块，保证 Unix LF 换行）
+    Stream 3: data tar.gz（标准 tar 格式，含 1024 位元组 EOF 块）
     """
     # --- Stream 3 (Data) ---
     data_tar = bytearray()
@@ -321,7 +321,7 @@ def create_exact_apk_package(
             data_tar.extend(make_ustar_header(name.rstrip("/") + "/", 0, 0o755, b"5"))
         else:
             installed_size += len(data)
-            # apk-tools 3.x 要求每個檔案前必須有 PAX extended header 記錄 SHA1 校驗和
+            # apk-tools 3.x 要求每个档案前必须有 PAX extended header 记录 SHA1 校验和
             sha1_hex = hashlib.sha1(data).hexdigest()
             pax_rec = f"68 APK-TOOLS.checksum.SHA1={sha1_hex}\n".encode("ascii")
             data_tar.extend(make_ustar_header("././@PaxHeader", len(pax_rec), 0o644, b"x"))
@@ -364,10 +364,10 @@ def create_exact_apk_package(
         control_tar.extend(make_ustar_header(".post-install", len(pi_bytes), 0o755, b"0"))
         control_tar.extend(pad512(pi_bytes))
 
-        # apk 在「升級」情境只會找 .post-upgrade；若不存在，它不會退回跑 .post-install，
-        # 而是整個跳過（實機用 apk-tools 3.0.5 驗證過）。只發 .post-install 的結果就是：
-        # 升級後二進位換了、但服務沒被重啟，仍跑著舊的 in-process 映像。
-        # 因此這裡同時發出 .post-upgrade（預設與 post_install 同內容），升級與安裝都能生效。
+        # apk 在「升级」情境只会找 .post-upgrade；若不存在，它不会退回跑 .post-install，
+        # 而是整个跳过（实机用 apk-tools 3.0.5 验证过）。只发 .post-install 的结果就是：
+        # 升级后二进位换了、但服务没被重启，仍跑著旧的 in-process 映像。
+        # 因此这里同时发出 .post-upgrade（预设与 post_install 同内容），升级与安装都能生效。
         pu_src = post_install if post_upgrade is None else post_upgrade
         pu_bytes = pu_src.replace("\r\n", "\n").encode("utf-8")
         control_tar.extend(make_ustar_header(".post-upgrade", len(pu_bytes), 0o755, b"0"))
@@ -417,7 +417,7 @@ def create_ipk_package(
     data_tar.extend(b"\0" * 1024)
     data_gz_bytes = compress_gz(bytes(data_tar))
 
-    # control 的欄位順序有講究：Depends 必須排在 Description 之前
+    # control 的栏位顺序有讲究：Depends 必须排在 Description 之前
     control_lines = [
         f"Package: {pkgname}",
         f"Version: {pkgver}",
@@ -441,8 +441,8 @@ def create_ipk_package(
         control_tar.extend(make_ustar_header("postinst", len(pi_bytes), 0o755, b"0"))
         control_tar.extend(pad512(pi_bytes))
     if conffiles:
-        # opkg 讀 control.tar.gz 裡的 conffiles 檔（一行一個絕對路徑），
-        # 沒有它會把 /etc 下的設定當普通檔案：升級時用包內容覆蓋、移除時直接刪掉。
+        # opkg 读 control.tar.gz 里的 conffiles 档（一行一个绝对路径），
+        # 没有它会把 /etc 下的设定当普通档案：升级时用包内容覆盖、移除时直接删掉。
         cf_bytes = ("\n".join(conffiles) + "\n").encode("utf-8")
         control_tar.extend(make_ustar_header("conffiles", len(cf_bytes), 0o644, b"0"))
         control_tar.extend(pad512(cf_bytes))
@@ -485,12 +485,12 @@ def make_tar(entries: list[dict]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 靜態資源
+# 静态资源
 # ---------------------------------------------------------------------------
 
 POST_INSTALL_TEMPLATE = """#!/bin/sh
 [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
-# 先驗證設定檔，設定錯誤時留下明確日誌，而不是等 daemon 退出觸發 procd 重啟迴圈
+# 先验证设定档，设定错误时留下明确日志，而不是等 daemon 退出触发 procd 重启回圈
 if [ -x /usr/bin/mwan4 ] && [ -f /etc/mwan4/mwan4.json ]; then
     /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \\
         logger -t mwan4 "warning: /etc/mwan4/mwan4.json failed --check-config"
@@ -508,12 +508,12 @@ exit 0
 """
 
 INSTALL_SH = """#!/bin/sh
-# MWAN4 離線安裝腳本
+# MWAN4 离线安装脚本
 #
-# 安全注意：只接受「腳本所在目錄」或命令列明確指定的 bundle。
-# 舊版會自動從 /tmp 取 mwan4-*-bundle.tar.gz —— /tmp 是 1777，任何本機使用者
-# 都能預置一個含惡意 /usr/bin/mwan4 的 tar，管理員一執行 install.sh 就以 root
-# 解壓並執行，等同本機提權。這裡同時拒絕含絕對路徑或 .. 的 tar 成員。
+# 安全注意：只接受「脚本所在目录」或命令列明确指定的 bundle。
+# 旧版会自动从 /tmp 取 mwan4-*-bundle.tar.gz —— /tmp 是 1777，任何本机使用者
+# 都能预置一个含恶意 /usr/bin/mwan4 的 tar，管理员一执行 install.sh 就以 root
+# 解压并执行，等同本机提权。这里同时拒绝含绝对路径或 .. 的 tar 成员。
 set -e
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
@@ -541,7 +541,7 @@ fi
 BUNDLE_DIR=$(CDPATH= cd "$(dirname "$BUNDLE")" && pwd)
 BUNDLE_NAME=$(basename "$BUNDLE")
 
-# 完整性檢查：同目錄有 SHA256SUMS 就必須通過（bundle 未簽名，這只防傳輸損壞/誤放）
+# 完整性检查：同目录有 SHA256SUMS 就必须通过（bundle 未签名，这只防传输损坏/误放）
 if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
     line=$(grep -F "  $BUNDLE_NAME" "$BUNDLE_DIR/SHA256SUMS" || true)
     if [ -z "$line" ]; then
@@ -557,7 +557,7 @@ if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
     echo "==> Bundle checksum verified"
 fi
 
-# 解壓前拒絕絕對路徑與 .. 成員
+# 解压前拒绝绝对路径与 .. 成员
 if tar -tzf "$BUNDLE" | grep -Eq '^/|(^|/)\\.\\.(/|$)'; then
     echo "Error: $BUNDLE_NAME contains unsafe paths, refusing to extract" >&2
     exit 1
@@ -565,7 +565,7 @@ fi
 
 echo "==> Installing MWAN4 from $BUNDLE ..."
 
-# 先備份既有設定：bundle 內含出廠預設設定，直接解壓會覆蓋使用者調整過的內容
+# 先备份既有设定：bundle 内含出厂预设设定，直接解压会覆盖使用者调整过的内容
 BACKUP_DIR=/etc/mwan4/preinstall-backup
 saved_uci=0
 saved_json=0
@@ -582,7 +582,7 @@ fi
 
 tar -xzf "$BUNDLE" -C /
 
-# 還原使用者設定（存在才還原；全新安裝則採用 bundle 內的預設值）
+# 还原使用者设定（存在才还原；全新安装则采用 bundle 内的预设值）
 if [ "$saved_uci" -eq 1 ]; then
     cp -p "$BACKUP_DIR/config.mwan4" /etc/config/mwan4
 fi
@@ -634,7 +634,7 @@ def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data:
 
 
 def _load_po2lmo():
-    """載入同目錄的 po2lmo.py（不論本腳本如何被啟動，都不能依賴 sys.path[0]）。"""
+    """载入同目录的 po2lmo.py（不论本脚本如何被启动，都不能依赖 sys.path[0]）。"""
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, "po2lmo.py")
     if not os.path.exists(path):
@@ -648,10 +648,10 @@ def _load_po2lmo():
 
 
 def build_lmo_bytes(po_path: str) -> bytes:
-    """把 .po 編譯成 LuCI 的 .lmo，於打包時即時產生。
+    """把 .po 编译成 LuCI 的 .lmo，于打包时即时产生。
 
-    刻意不讀入庫的 .lmo：那份二進位會在 .po 變更後過期，而過期不會有任何
-    錯誤，UI 只是默默顯示英文。改為每次由 .po 重編，翻譯永遠與來源同步。
+    刻意不读入库的 .lmo：那份二进位会在 .po 变更后过期，而过期不会有任何
+    错误，UI 只是默默显示英文。改为每次由 .po 重编，翻译永远与来源同步。
     """
     if not os.path.exists(po_path):
         fatal(f"translation catalog missing: {po_path}")
@@ -682,9 +682,9 @@ def build_luci_data_entries(menu_data: bytes, acl_data: bytes, view_data: bytes,
         {"name": "www/luci-static/resources/view/mwan4/overview.js", "data": view_data, "mode": 0o644},
     ]
     if lmo_data is not None:
-        # 現代 LuCI（21.02+）的簡體中文語言碼是 zh_Hans；舊版是 zh-cn。
-        # lmo_load_catalog() 以語言碼精確匹配檔名，只裝舊名在中文環境下會完全載不到。
-        # 兩個檔名裝同一份內容，新舊版本都能正確顯示中文。
+        # 现代 LuCI（21.02+）的简体中文语言码是 zh_Hans；旧版是 zh-cn。
+        # lmo_load_catalog() 以语言码精确匹配档名，只装旧名在中文环境下会完全载不到。
+        # 两个档名装同一份内容，新旧版本都能正确显示中文。
         entries += [
             {"name": "usr/lib", "is_dir": True},
             {"name": "usr/lib/lua", "is_dir": True},
@@ -702,10 +702,10 @@ def build_luci_data_entries(menu_data: bytes, acl_data: bytes, view_data: bytes,
 
 
 def resolve_archs(requested: list[str] | None) -> list[Arch]:
-    """決定要為哪些架構出包。
+    """决定要为哪些架构出包。
 
-    - 明確指定 --arch：逐一檢查二進位是否存在，缺了就報錯（不靜默跳過）。
-    - 未指定：自動採用「已編譯好二進位」的架構；一個都沒有則報錯。
+    - 明确指定 --arch：逐一检查二进位是否存在，缺了就报错（不静默跳过）。
+    - 未指定：自动采用「已编译好二进位」的架构；一个都没有则报错。
     """
     if requested:
         archs = []
@@ -774,7 +774,7 @@ def main() -> int:
     os.makedirs(PKG_DIR, exist_ok=True)
     os.makedirs(BIN_OUT_DIR, exist_ok=True)
 
-    # --- 1. 簽名金鑰（持久化，不再每次換） ---
+    # --- 1. 签名金钥（持久化，不再每次换） ---
     private_key, _key_origin = load_or_create_signing_key()
     pub_pem = public_key_pem(private_key)
     pub_key_path = args.key_out or os.path.join(PKG_DIR, PUB_KEY_NAME)
@@ -789,7 +789,7 @@ def main() -> int:
     log("    (installed devices verify packages against this key, so it must stay stable;")
     log(f"     ship {PUB_KEY_NAME} to devices and never regenerate it without a migration plan)")
 
-    # --- 2. 來源檔案 ---
+    # --- 2. 来源档案 ---
     init_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "init.d", "mwan4")
     uci_config_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "config", "mwan4")
     json_config_data = read_file(ROOT_DIR, "openwrt", "mwan4.json")
@@ -797,8 +797,8 @@ def main() -> int:
     acl_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "usr", "share", "rpcd", "acl.d", "luci-app-mwan4.json")
     view_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "htdocs", "luci-static", "resources", "view", "mwan4", "overview.js")
 
-    # 翻譯：由 .po 即時編譯（見 build_lmo_bytes 的說明），確保出廠翻譯不落後於來源。
-    # 用 zh_Hans（現代 LuCI 語言碼）當來源，打包時同時裝 zh_Hans 與舊的 zh-cn 檔名。
+    # 翻译：由 .po 即时编译（见 build_lmo_bytes 的说明），确保出厂翻译不落后于来源。
+    # 用 zh_Hans（现代 LuCI 语言码）当来源，打包时同时装 zh_Hans 与旧的 zh-cn 档名。
     lmo_data = build_lmo_bytes(
         os.path.join(ROOT_DIR, "openwrt", "luci-app-mwan4", "po", "zh_Hans", "mwan4.po")
     )
@@ -806,7 +806,7 @@ def main() -> int:
 
     luci_data_entries = build_luci_data_entries(menu_data, acl_data, view_data, lmo_data)
 
-    # --- 3. 逐架構出包（每個架構各自帶正確的 arch 與依賴） ---
+    # --- 3. 逐架构出包（每个架构各自带正确的 arch 与依赖） ---
     archs = resolve_archs(args.arch)
     log(f"[*] Building packages for: {', '.join(a.key for a in archs)}")
 
@@ -853,7 +853,7 @@ def main() -> int:
             f.write(compress_gz(make_tar(data_entries + luci_data_entries)))
         log(f"[+] Created offline bundle: {bundle_path} ({os.path.getsize(bundle_path)} bytes)")
 
-    # --- 4. luci-app-mwan4（真正的架構無關包，apk 用 noarch / ipk 用 all） ---
+    # --- 4. luci-app-mwan4（真正的架构无关包，apk 用 noarch / ipk 用 all） ---
     luci_apk_ver = f"{PKG_VERSION}-{APK_RELEASE}"
     luci_ipk_ver = f"{PKG_VERSION}-{IPK_RELEASE}"
     create_exact_apk_package(
@@ -879,13 +879,13 @@ def main() -> int:
         depends=[PKG_NAME, "luci-base"],
     )
 
-    # --- 5. 一鍵安裝腳本 ---
+    # --- 5. 一键安装脚本 ---
     install_sh_path = os.path.join(OUTPUT_DIR, "install.sh")
     with open(install_sh_path, "wb") as f:
         f.write(INSTALL_SH.replace("\r\n", "\n").encode("utf-8"))
     log(f"[+] Created one-click install script: {install_sh_path}")
 
-    # --- 6. bundle 校驗和（install.sh 解壓前核對；純完整性，不是簽名） ---
+    # --- 6. bundle 校验和（install.sh 解压前核对；纯完整性，不是签名） ---
     bundles = sorted(
         name
         for name in os.listdir(OUTPUT_DIR)

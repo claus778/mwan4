@@ -8,14 +8,14 @@ PROG=/usr/bin/mwan4
 CONF_DIR=/var/etc
 CONF_FILE="$CONF_DIR/mwan4.json"
 
-# UCI 的值會直接拼進 JSON。任何能寫 mwan4 設定的使用者（rpcd ACL 就開放寫入）
-# 都能用 `"`、`\` 或換行在 JSON 裡注入額外欄位（例如偷塞 underlay_targets），
-# 因此字串值一律先轉義、數字值一律先驗證再進模板。
+# UCI 的值会直接拼进 JSON。任何能写 mwan4 设定的使用者（rpcd ACL 就开放写入）
+# 都能用 `"`、`\` 或换行在 JSON 里注入额外栏位（例如偷塞 underlay_targets），
+# 因此字串值一律先转义、数字值一律先验证再进模板。
 json_escape() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'
 }
 
-# 只接受 0 或正整數（JSON 數字；拒絕前導零，JSON 不允許 007 這種寫法）
+# 只接受 0 或正整数（JSON 数字；拒绝前导零，JSON 不允许 007 这种写法）
 is_uint() {
 	case "$1" in
 		''|*[!0-9]*) return 1 ;;
@@ -25,7 +25,7 @@ is_uint() {
 	return 0
 }
 
-# 只接受 JSON 合法的十進位小數：0、0.5、1.25；拒絕 .5 / 1. / 1.2.3 / 007 / 10%
+# 只接受 JSON 合法的十进位小数：0、0.5、1.25；拒绝 .5 / 1. / 1.2.3 / 007 / 10%
 is_decimal() {
 	case "$1" in
 		''|*[!0-9.]*) return 1 ;;
@@ -41,49 +41,57 @@ is_decimal() {
 generate_json_config() {
 	mkdir -p "$CONF_DIR"
 
-	local enabled check_interval probe_timeout window_size loss_down loss_up degrade_loss degrade_hysteresis degrade_exit fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes
+	local enabled check_interval probe_timeout window_size loss_down loss_up degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok
 	config_get_bool enabled global enabled 0
 	[ "$enabled" -eq 1 ] || return 1
 
 	config_get check_interval global check_interval_ms 500
-	# 探測超時必須 <= 探測週期，否則實際週期會被超時拉長
+	# 探测超时必须 <= 探测周期，否则实际周期会被超时拉长
 	config_get probe_timeout global probe_timeout_ms 400
 	config_get window_size global window_size 10
 	config_get loss_down global loss_threshold_down 0.5
-	# 舊版恢復門檻。daemon 目前已不讀取（恢復只看 recovery_success_count 與 RTT），
-	# 保留只是為了相容既有 /etc/config/mwan4 與舊的說明文字
+	# 旧版恢复门槛。daemon 目前已不读取（恢复只看 recovery_success_count 与 RTT），
+	# 保留只是为了相容既有 /etc/config/mwan4 与旧的说明文字
 	config_get loss_up global loss_threshold_up 0.1
-	# 降級門檻：窗口已填滿且丟包率 >= 此值時該線不參與 ECMP（仍繼續探測）。
-	# 必須小於 loss_threshold_down，否則 daemon 的 --check-config 會拒絕啟動
+	# 降级门槛：窗口已填满且丢包率 >= 此值时该线不参与 ECMP（仍继续探测）。
+	# 必须小于 loss_threshold_down，否则 daemon 的 --check-config 会拒绝启动
 	config_get degrade_loss global degrade_loss_threshold 0.2
-	# 降級遲滯：退出門檻 = 降級門檻 - 這個值（預設 0.2 - 0.1 = 0.1）。
-	# 必須嚴格小於降級門檻，否則 daemon 的 --check-config 會拒絕啟動
+	# 降级迟滞：退出门槛 = 降级门槛 - 这个值（预设 0.2 - 0.1 = 0.1）。
+	# 必须严格小于降级门槛，否则 daemon 的 --check-config 会拒绝启动
 	config_get degrade_hysteresis global degrade_hysteresis 0.1
-	# 退出降級所需的連續樣本次數（預設 6，約 3 秒）
+	# 退出降级所需的连续样本次数（预设 6，约 3 秒）
 	config_get degrade_exit global degrade_exit_samples 6
+	# 进入降级所需的连续样本数（预设 20，约 2 个窗口）。设 1 = 旧行为（单一窗口达标即降级）。
+	# 为什么要持续才降级：隧道型 WAN 满载时 SYN 探针偶尔超时，单一窗口达标就把它移出
+	# ECMP 会让全部流量瞬时压到另一条线（使用者看到「一条线突然很卡」），几秒后又加回来。
+	config_get degrade_enter global degrade_enter_samples 20
+	# 降级后至少离开 ECMP 几个样本才准回来（预设 20；0 = 不限制）。
+	# 避免「移出→几秒后回来→又被打满→又移出」的数秒级路由循环（每次都要重映射既有 flow）
+	config_get degrade_min_out global degrade_min_out_samples 20
 	config_get fail_down global consecutive_fail_down 3
 	config_get recovery global recovery_success_count 5
 	config_get max_rtt global max_rtt_ms 1500
 	config_get_bool flush_ct global flush_conntrack 1
-	# 成員進出時是否清 conntrack（僅 standard ECMP 生效；主備模式下只清新進成員）
+	# 成员进出时是否清 conntrack（仅 standard ECMP 生效；主备模式下只清新进成员）
 	config_get_bool flush_switch global flush_conntrack_on_switch 1
-	# standard / auto / resilient；無效值交給 daemon 的 --check-config 擋下來
-	config_get ecmp_mode global ecmp_mode standard
-	# 退出時是否刪掉預設路由。預設 0：刪掉唯一一條預設路由會在重啟窗口內
-	# 讓整台路由器失去出口，且新實例啟動失敗時無法自行恢復
+	# standard / auto / resilient；预设 auto（核心支援 nexthop object 就用 resilient，
+	# 否则退回 standard）。无效值交给 daemon 的 --check-config 挡下来
+	config_get ecmp_mode global ecmp_mode auto
+	# 退出时是否删掉预设路由。预设 0：删掉唯一一条预设路由会在重启窗口内
+	# 让整台路由器失去出口，且新实例启动失败时无法自行恢复
 	config_get_bool remove_routes global remove_routes_on_exit 0
 
 	local flush_str="false"
 	[ "$flush_ct" -eq 1 ] && flush_str="true"
 	local flush_switch_str="false"
 	[ "$flush_switch" -eq 1 ] && flush_switch_str="true"
-	# 注意：daemon 的 bool 欄位只吃 true/false，寫 0/1 會讓 --check-config 失敗、
-	# 服務直接起不來（所以一定要轉成 JSON 布林，不能直接塞 shell 的 0/1）
+	# 注意：daemon 的 bool 栏位只吃 true/false，写 0/1 会让 --check-config 失败、
+	# 服务直接起不来（所以一定要转成 JSON 布林，不能直接塞 shell 的 0/1）
 	local remove_routes_str="false"
 	[ "$remove_routes" -eq 1 ] && remove_routes_str="true"
 
-	# 浮點欄位若被手動填成非數字（例如 "10%"），會產生非法 JSON，讓 daemon 以很難懂的
-	# serde 訊息拒絕啟動。這裡先擋下來，留下明確日誌（回傳 1 → 不啟動、也不會重啟循環）。
+	# 浮点栏位若被手动填成非数字（例如 "10%"），会产生非法 JSON，让 daemon 以很难懂的
+	# serde 讯息拒绝启动。这里先挡下来，留下明确日志（回传 1 → 不启动、也不会重启循环）。
 	local pair field value
 	for pair in "loss_threshold_down:$loss_down" "loss_threshold_up:$loss_up" "degrade_loss_threshold:$degrade_loss" "degrade_hysteresis:$degrade_hysteresis" "max_rtt_ms:$max_rtt"; do
 		field="${pair%%:*}"
@@ -94,7 +102,7 @@ generate_json_config() {
 		fi
 	done
 
-	# 整數欄位同樣要驗：直接塞進 JSON 的數字位置，字串注入會直接產生非法 JSON
+	# 整数栏位同样要验：直接塞进 JSON 的数字位置，字串注入会直接产生非法 JSON
 	for pair in "check_interval_ms:$check_interval" "probe_timeout_ms:$probe_timeout" "window_size:$window_size" "degrade_exit_samples:$degrade_exit" "consecutive_fail_down:$fail_down" "recovery_success_count:$recovery"; do
 		field="${pair%%:*}"
 		value="${pair#*:}"
@@ -104,7 +112,7 @@ generate_json_config() {
 		fi
 	done
 
-	# 字串欄位先轉義；ecmp_mode 另外限定三種合法值，避免 daemon 因拼字錯誤拒絕啟動
+	# 字串栏位先转义；ecmp_mode 另外限定三种合法值，避免 daemon 因拼字错误拒绝启动
 	local ecmp_mode_json
 	case "$ecmp_mode" in
 		standard|auto|resilient) ecmp_mode_json="$ecmp_mode" ;;
@@ -115,7 +123,7 @@ generate_json_config() {
 	esac
 	ecmp_mode_json="$(json_escape "$ecmp_mode_json")"
 
-	# 多路徑哈希策略（選填；空 = 沿用系統預設）
+	# 多路径哈希策略（预设 l4；空 = 不写入、沿用系统预设 = 只有 L3 粒度）
 	local hash_policy hash_policy_json="null"
 	config_get hash_policy global multipath_hash_policy ""
 	case "$hash_policy" in
@@ -127,7 +135,7 @@ generate_json_config() {
 			;;
 	esac
 
-	# ECMP 權重模式（static / quality）
+	# ECMP 权重模式（static / quality）
 	local weight_mode weight_mode_json
 	config_get weight_mode global weight_mode static
 	case "$weight_mode" in
@@ -150,9 +158,16 @@ generate_json_config() {
 		return 1
 	fi
 
-	# 負載感知分流：依實測速率與每條線的容量，把過載線的 ECMP 權重下修、
-	# 讓部分 flow 轉到空閒線。啟用時每條 interface 都必須填 max_mbps，
-	# 否則 daemon 的 --check-config 會拒絕啟動（見 config.rs validate）。
+	# 负载感知分流：依实测速率与每条线的容量，把过载线的 ECMP 权重下修、
+	# 让部分 flow 转到空闲线。启用时每条 interface 都必须填 max_mbps，
+	# 否则 daemon 的 --check-config 会拒绝启动（见 config.rs validate）。
+	# standard ECMP 下是否仍套用 quality / load_aware 动态因子（预设 0 = 忽略）。
+	# standard 的每次权重变更都会重算整张 multipath hash、搬走 24%~39% 的既有连线，
+	# 却搬不动真正造成偏载的大流量；要用动态权重请改用 ecmp_mode resilient/auto。
+	local dyn_standard_ok dyn_standard_str
+	config_get_bool dyn_standard_ok global allow_dynamic_weights_on_standard 0
+	if [ "$dyn_standard_ok" -eq 1 ]; then dyn_standard_str="true"; else dyn_standard_str="false"; fi
+
 	local load_aware load_aware_str
 	config_get_bool load_aware global load_aware 0
 	if [ "$load_aware" -eq 1 ]; then load_aware_str="true"; else load_aware_str="false"; fi
@@ -168,8 +183,8 @@ generate_json_config() {
 		return 1
 	fi
 
-	# 策略分流規則（可有多個 config policy 段）。與介面欄位同一套防注入規則：
-	# 字串先轉義、priority 先驗證，更細的格式（CIDR）交給 daemon --check-config。
+	# 策略分流规则（可有多个 config policy 段）。与介面栏位同一套防注入规则：
+	# 字串先转义、priority 先验证，更细的格式（CIDR）交给 daemon --check-config。
 	local policies_json="" policy_invalid=0
 	handle_policy() {
 		local section="$1"
@@ -211,7 +226,7 @@ generate_json_config() {
 		}
 		config_list_foreach "$section" source add_policy_source
 		config_list_foreach "$section" destination add_policy_destination
-		# UCI 的 list 與 option 是兩種型別；option（空白分隔）也接受，與介面段一致
+		# UCI 的 list 与 option 是两种型别；option（空白分隔）也接受，与介面段一致
 		if [ -z "$p_sources" ]; then
 			local single_sources x
 			config_get single_sources "$section" source ""
@@ -250,6 +265,8 @@ generate_json_config() {
 	  "degrade_loss_threshold": $degrade_loss,
 	  "degrade_hysteresis": $degrade_hysteresis,
 	  "degrade_exit_samples": $degrade_exit,
+	  "degrade_enter_samples": $degrade_enter,
+	  "degrade_min_out_samples": $degrade_min_out,
 	  "consecutive_fail_down": $fail_down,
 	  "recovery_success_count": $recovery,
 	  "max_rtt_ms": $max_rtt,
@@ -261,6 +278,7 @@ generate_json_config() {
 	  "load_aware": $load_aware_str,
 	  "load_target_ratio": $load_target,
 	  "load_recover_ratio": $load_recover,
+	  "allow_dynamic_weights_on_standard": $dyn_standard_str,
 	  "policies": [ $policies_json ],
 	  "flush_conntrack_on_down": $flush_str,
 	  "flush_conntrack_on_switch": $flush_switch_str,
@@ -281,16 +299,16 @@ generate_json_config() {
 		config_get metric "$section" metric 10
 		config_get weight "$section" weight 1
 
-		# metric / weight 是直接進 JSON 數字位置的欄位：非數字除了產生非法 JSON，
-		# 也是 JSON 注入的管道，必須先擋下來
+		# metric / weight 是直接进 JSON 数字位置的栏位：非数字除了产生非法 JSON，
+		# 也是 JSON 注入的管道，必须先挡下来
 		if ! is_uint "$metric" || ! is_uint "$weight"; then
 			logger -t mwan4 "section '$section': invalid metric/weight (metric='$metric', weight='$weight')"
 			invalid_iface=1
 			return 0
 		fi
 
-		# 這條線的最大頻寬（Mbps）。空字串 = 不設定（null）；進 JSON 前先驗證，
-		# 與 metric/weight 同一套防注入理由。舊名 down_mbps 仍相容。
+		# 这条线的最大频宽（Mbps）。空字串 = 不设定（null）；进 JSON 前先验证，
+		# 与 metric/weight 同一套防注入理由。旧名 down_mbps 仍相容。
 		local max_mbps up_mbps max_json up_json
 		config_get max_mbps "$section" max_mbps ""
 		[ -n "$max_mbps" ] || config_get max_mbps "$section" down_mbps ""
@@ -333,11 +351,11 @@ generate_json_config() {
 		}
 		config_list_foreach "$section" probe_targets add_target
 
-		# UCI 的 list 與 option 是兩種型別：`uci set mwan4.<sec>.probe_targets='...'`
-		# 建出來的是 option，config_list_foreach 讀不到。若就此帶過，下面那行會「安靜地」
-		# 退回預設值 —— 使用者以為指定生效了，其實這條線在探預設 DNS，
-		# 症狀是莫名的丟包與 DOWN（實測：vxlan 線因此被誤判，但設定檔看起來完全正常）。
-		# 這裡兩種型別都接受，並留一條 log 提醒改成 list。
+		# UCI 的 list 与 option 是两种型别：`uci set mwan4.<sec>.probe_targets='...'`
+		# 建出来的是 option，config_list_foreach 读不到。若就此带过，下面那行会「安静地」
+		# 退回预设值 —— 使用者以为指定生效了，其实这条线在探预设 DNS，
+		# 症状是莫名的丢包与 DOWN（实测：vxlan 线因此被误判，但设定档看起来完全正常）。
+		# 这里两种型别都接受，并留一条 log 提醒改成 list。
 		if [ -z "$target_json" ]; then
 			local single_targets
 			config_get single_targets "$section" probe_targets ""
@@ -352,13 +370,13 @@ generate_json_config() {
 
 		[ -n "$target_json" ] || target_json='"223.5.5.5:53", "114.114.114.114:53"'
 
-		# 隧道型 WAN（VXLAN 等）的 underlay 對端：自動探測並寫進設定。
+		# 隧道型 WAN（VXLAN 等）的 underlay 对端：自动探测并写进设定。
 		#
-		# 為什麼一定要有：隧道的封裝封包目的地就是這個對端位址，而它得靠 main 表的
-		# 預設路由送出。一旦預設路由是「含該隧道的 ECMP」，就會有約 1/N 的機率把
-		# 封裝封包再塞回同一條隧道 —— 自環。實測（VXLAN 做第二條線）切到 resilient 後
-		# 隧道立刻丟包 60% 並被判 DOWN，而 `ip route get <對端>` 還顯示正常的那條。
-		# 守護進程收到這個清單後，會為對端補一條走「非隧道線」的 /32，徹底避開自環。
+		# 为什么一定要有：隧道的封装封包目的地就是这个对端位址，而它得靠 main 表的
+		# 预设路由送出。一旦预设路由是「含该隧道的 ECMP」，就会有约 1/N 的机率把
+		# 封装封包再塞回同一条隧道 —— 自环。实测（VXLAN 做第二条线）切到 resilient 后
+		# 隧道立刻丢包 60% 并被判 DOWN，而 `ip route get <对端>` 还显示正常的那条。
+		# 守护进程收到这个清单后，会为对端补一条走「非隧道线」的 /32，彻底避开自环。
 		local underlay_json=""
 		add_underlay() {
 			[ -n "$1" ] || return 0
@@ -370,10 +388,10 @@ generate_json_config() {
 				underlay_json="\"$escaped\""
 			fi
 		}
-		# 明確指定的 underlay 對端優先（list，也接受 option 寫法）。
-		# 為什麼需要：自動探測靠 `ip -d link`，而精簡系統（例如只有 busybox ip，
-		# 京東雲 RE-SP-01B 實測 `ip -d` 直接回 usage）根本拿不到 remote，
-		# 於是隧道 WAN 少了那條防自環的 /32，ECMP 會把封裝封包塞回隧道自己。
+		# 明确指定的 underlay 对端优先（list，也接受 option 写法）。
+		# 为什么需要：自动探测靠 `ip -d link`，而精简系统（例如只有 busybox ip，
+		# 京东云 RE-SP-01B 实测 `ip -d` 直接回 usage）根本拿不到 remote，
+		# 于是隧道 WAN 少了那条防自环的 /32，ECMP 会把封装封包塞回隧道自己。
 		config_list_foreach "$section" underlay_targets add_underlay
 		if [ -z "$underlay_json" ]; then
 			local single_underlay
@@ -425,15 +443,15 @@ generate_json_config() {
 
 	config_foreach handle_interface interface
 
-	# 有 interface 段但欄位非法：整份設定視為失敗，不產生半套 JSON
+	# 有 interface 段但栏位非法：整份设定视为失败，不产生半套 JSON
 	if [ "$invalid_iface" -eq 1 ]; then
 		rm -f "$CONF_FILE"
 		logger -t mwan4 "Invalid interface configuration, refusing to start"
 		return 1
 	fi
 
-	# 沒有任何 interface 段時不要產生 {"interfaces": []}：
-	# 那會讓 daemon 在 validate() 失敗後退出，被 procd 無限重啟
+	# 没有任何 interface 段时不要产生 {"interfaces": []}：
+	# 那会让 daemon 在 validate() 失败后退出，被 procd 无限重启
 	if [ "$first" -eq 1 ]; then
 		rm -f "$CONF_FILE"
 		logger -t mwan4 "No WAN interface defined in /etc/config/mwan4, refusing to start"
@@ -456,15 +474,15 @@ start_service() {
 
 	config_load mwan4
 	generate_json_config || {
-		# 回傳 1 涵蓋「未啟用」與「沒有設定 interface」兩種情況，
-		# 兩者都不應該讓 procd 進入重啟迴圈
+		# 回传 1 涵盖「未启用」与「没有设定 interface」两种情况，
+		# 两者都不应该让 procd 进入重启回圈
 		logger -t mwan4 "mwan4 is disabled or has no WAN interface configured, not starting"
 		return 0
 	}
 
-	# 產生 JSON 後先讓 daemon 自我驗證（--check-config 只驗證、不啟動）。
-	# 設定錯誤時留下明確日誌並拒絕啟動，而不是讓 daemon 起飛即退出、被 procd 無限重啟；
-	# 這裡尚未 procd_open_instance，因此 return 1 不會產生重啟迴圈。
+	# 产生 JSON 后先让 daemon 自我验证（--check-config 只验证、不启动）。
+	# 设定错误时留下明确日志并拒绝启动，而不是让 daemon 起飞即退出、被 procd 无限重启；
+	# 这里尚未 procd_open_instance，因此 return 1 不会产生重启回圈。
 	if ! "$PROG" --check-config "$CONF_FILE"; then
 		logger -t mwan4 "Generated config $CONF_FILE failed --check-config, aborting start"
 		return 1

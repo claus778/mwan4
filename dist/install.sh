@@ -1,10 +1,10 @@
 #!/bin/sh
-# MWAN4 離線安裝腳本
+# MWAN4 离线安装脚本
 #
-# 安全注意：只接受「腳本所在目錄」或命令列明確指定的 bundle。
-# 舊版會自動從 /tmp 取 mwan4-*-bundle.tar.gz —— /tmp 是 1777，任何本機使用者
-# 都能預置一個含惡意 /usr/bin/mwan4 的 tar，管理員一執行 install.sh 就以 root
-# 解壓並執行，等同本機提權。這裡同時拒絕含絕對路徑或 .. 的 tar 成員。
+# 安全注意：只接受「脚本所在目录」或命令列明确指定的 bundle。
+# 旧版会自动从 /tmp 取 mwan4-*-bundle.tar.gz —— /tmp 是 1777，任何本机使用者
+# 都能预置一个含恶意 /usr/bin/mwan4 的 tar，管理员一执行 install.sh 就以 root
+# 解压并执行，等同本机提权。这里同时拒绝含绝对路径或 .. 的 tar 成员。
 set -e
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
@@ -32,7 +32,7 @@ fi
 BUNDLE_DIR=$(CDPATH= cd "$(dirname "$BUNDLE")" && pwd)
 BUNDLE_NAME=$(basename "$BUNDLE")
 
-# 完整性檢查：同目錄有 SHA256SUMS 就必須通過（bundle 未簽名，這只防傳輸損壞/誤放）
+# 完整性检查：同目录有 SHA256SUMS 就必须通过（bundle 未签名，这只防传输损坏/误放）
 if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
     line=$(grep -F "  $BUNDLE_NAME" "$BUNDLE_DIR/SHA256SUMS" || true)
     if [ -z "$line" ]; then
@@ -48,7 +48,7 @@ if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
     echo "==> Bundle checksum verified"
 fi
 
-# 解壓前拒絕絕對路徑與 .. 成員
+# 解压前拒绝绝对路径与 .. 成员
 if tar -tzf "$BUNDLE" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
     echo "Error: $BUNDLE_NAME contains unsafe paths, refusing to extract" >&2
     exit 1
@@ -56,7 +56,7 @@ fi
 
 echo "==> Installing MWAN4 from $BUNDLE ..."
 
-# 先備份既有設定：bundle 內含出廠預設設定，直接解壓會覆蓋使用者調整過的內容
+# 先备份既有设定：bundle 内含出厂预设设定，直接解压会覆盖使用者调整过的内容
 BACKUP_DIR=/etc/mwan4/preinstall-backup
 saved_uci=0
 saved_json=0
@@ -73,7 +73,7 @@ fi
 
 tar -xzf "$BUNDLE" -C /
 
-# 還原使用者設定（存在才還原；全新安裝則採用 bundle 內的預設值）
+# 还原使用者设定（存在才还原；全新安装则采用 bundle 内的预设值）
 if [ "$saved_uci" -eq 1 ]; then
     cp -p "$BACKUP_DIR/config.mwan4" /etc/config/mwan4
 fi

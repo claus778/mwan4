@@ -4,44 +4,67 @@ config global 'global'
 	option probe_timeout_ms '400'
 	option window_size '10'
 	option loss_threshold_down '0.5'
-	# 恢復門檻：滑動窗口丟包率「不超過」這個值才允許回 UP。
-	# 目前已不再由 daemon 讀取（恢復只看 recovery_success_count 與 RTT），保留僅為相容舊設定
+	# 恢复门槛：滑动窗口丢包率「不超过」这个值才允许回 UP。
+	# 目前已不再由 daemon 读取（恢复只看 recovery_success_count 与 RTT），保留仅为相容旧设定
 	option loss_threshold_up '0.1'
-	# 降級門檻：滑動窗口已填滿且丟包率 >= 這個值時，該線不參與 ECMP（仍繼續探測，
-	# 品質恢復後自動回歸）。必須小於 loss_threshold_down（0.5）。設 0 可關閉此功能
+	# 降级门槛：滑动窗口已填满且丢包率 >= 这个值时，该线不参与 ECMP（仍继续探测，
+	# 品质恢复后自动回归）。必须小于 loss_threshold_down（0.5）。设 0 可关闭此功能
 	option degrade_loss_threshold '0.2'
-	# 降級遲滯：退出降級需要丟包率 <= 降級門檻 - 這個值（預設 0.2 - 0.1 = 0.1）。
-	# 窗口步長是 10%，注入 12%~30% 丟包時丟包率會在 10%/20%/30% 之間擺動，
-	# 沒有遲滯就會每幾秒進出一次降級、反覆重下路由。必須嚴格小於降級門檻
+	# 降级迟滞：退出降级需要丢包率 <= 降级门槛 - 这个值（预设 0.2 - 0.1 = 0.1）。
+	# 窗口步长是 10%，注入 12%~30% 丢包时丢包率会在 10%/20%/30% 之间摆动，
+	# 没有迟滞就会每几秒进出一次降级、反复重下路由。必须严格小于降级门槛
 	option degrade_hysteresis '0.1'
-	# 退出降級所需的「連續」樣本次數（預設 6，約 3 秒）。中間夾一次不達標就重新數
+	# 退出降级所需的「连续」样本次数（预设 6，约 3 秒）。中间夹一次不达标就重新数
 	option degrade_exit_samples '6'
+	# 进入降级所需的「连续」样本数（预设 20，约 2 个窗口）。隧道型 WAN 满载时探针
+	# 偶尔超时，单一窗口达标就移出 ECMP 会让全部流量瞬时压到另一条线；设 1 = 旧行为
+	option degrade_enter_samples '20'
+	# 降级后至少离开 ECMP 几个样本才准回来（预设 20；0 = 不限制），挡掉秒级路由循环
+	option degrade_min_out_samples '20'
 	option consecutive_fail_down '3'
 	option recovery_success_count '5'
 	option max_rtt_ms '1500'
 	option flush_conntrack '1'
-	# 存活成員進出時是否清 conntrack（僅 standard ECMP 生效，主備模式只清新進成員）
+	# 存活成员进出时是否清 conntrack（仅 standard ECMP 生效，主备模式只清新进成员）
 	option flush_conntrack_on_switch '1'
-	# 退出時是否刪掉 mwan4 下發的預設路由。預設 0（保留），
-	# 否則服務重啟／升級的窗口內整台路由器會沒有預設路由
+	# 退出时是否删掉 mwan4 下发的预设路由。预设 0（保留），
+	# 否则服务重启／升级的窗口内整台路由器会没有预设路由
 	option remove_routes_on_exit '0'
-	# standard: 單一 multipath 路由，切換線路時既有連線可能被重哈希打斷
-	# resilient: 使用內核 resilient nexthop group（需 Linux 5.14+），只重映射故障線路的連線
-	# auto: 優先 resilient，內核不支援時自動退回 standard
-	option ecmp_mode 'standard'
-	# 多路徑哈希策略：空 = 沿用系統預設（多數為 l4）。可選 l3 / l4 / inner
-	option multipath_hash_policy ''
-	# 負載感知分流：啟用後依實測速率 vs 每條 interface 的容量，把過載線的 ECMP
-	# 權重下修、讓部分 flow 轉到空閒線。啟用時每條 interface 都必須填 max_mbps，
-	# 否則 daemon --check-config 會拒絕啟動
+	# standard: 单一 multipath 路由。**任何**成员/权重变更都会让内核重算整张 multipath
+	#   hash，实测连坐搬走 40%~43% 的既有连线（连健康线路上的连线也一起换出口）：
+	#   换出口=换 NAT 源 IP=连线被打断，玩家感觉就是「玩到一半突然卡顿」，因此不再是预设
+	# resilient: 内核 resilient nexthop group（需 Linux 5.14+），只重映射故障成员的 bucket
+	#   （使用中的 bucket 默认延后 120 秒才迁移），其余线路的既有连线原地不动
+	# auto（预设）: 优先 resilient，内核不支援时自动退回 standard 并记住结果
+	option ecmp_mode 'auto'
+	# 多路径哈希策略（预设 l4）：决定内核「怎么分」。
+	# 实测（Linux 7.1.8，netns，真实 UDP 封包以网卡 TX 计数判出口）：
+	#   l3   = 只哈希来源/目的 IP → 同一个目的 IP 的连线**全部挤在同一条 WAN**
+	#          （视频网站对同一个 CDN IP 开多条连线，正是这个形态，第二条线完全用不到）
+	#   l4   = 再加上来源/目的埠 → 同样的 24 条连线变成 12/12 分开（预设）
+	#   inner = 只对封装流量有用；对一般网页/视频流量等同 l3
+	# 注意 net.ipv4.fib_multipath_hash_fields：同一个实验里它写成 1/7/8/9/31/32
+	# 都不改变结果（可写入、可读回，但被内核忽略）——**真正有效的是这一个 policy**；
+	# daemon 仍会依 policy 把位元补齐，并把两者的读回值印在 log 与状态档。
+	# 要刻意维持 L3 粒度写 l3；要完全不碰内核设定（沿用系统预设）写空值。
+	option multipath_hash_policy 'l4'
+	# 负载感知分流：启用后依实测速率 vs 每条 interface 的容量，把过载线的 ECMP
+	# 权重下修、让部分 flow 转到空闲线。启用时每条 interface 都必须填 max_mbps，
+	# 否则 daemon --check-config 会拒绝启动
 	option load_aware '0'
-	# 過載門檻 / 解除門檻（比例）：利用率 >= 前者開始下修，<= 後者才完全恢復；
-	# 兩者之間是遲滯死區，用來避免權重來回震盪
+	# 过载门槛 / 解除门槛（比例）：利用率 >= 前者开始下修，<= 后者才完全恢复；
+	# 两者之间是迟滞死区，用来避免权重来回震荡
 	option load_target_ratio '0.80'
 	option load_recover_ratio '0.60'
-	# ECMP 權重模式：static（預設，固定 weight）/ quality（依實測丟包與 RTT 動態調整）
+	# ECMP 权重模式：static（预设，固定 weight）/ quality（依实测丢包与 RTT 动态调整）
+	# 注意：只有在内核实际安装的是 standard ECMP 时，quality / load_aware 的动态因子才会
+	# 被忽略（只留静态 weight/max_mbps 比例）——standard 的每次权重变更都会重算整张
+	# multipath hash、搬走 24%~39% 的既有连线却搬不动真正偏载的大流量。
+	# 预设 ecmp_mode 'auto' 在支援 nexthop object 的核心上装的是 resilient，动态权重直接
+	# 生效（实测权重变更搬走 0%）；要在 standard 下强行套用动态因子才需要把这个选项设 1
+	option allow_dynamic_weights_on_standard '0'
 	option weight_mode 'static'
-	# 動態權重的最小更新間隔（毫秒）與下修下限（比例）
+	# 动态权重的最小更新间隔（毫秒）与下修下限（比例）
 	option dynamic_weight_interval_ms '10000'
 	option dynamic_weight_min_ratio '0.25'
 
@@ -51,8 +74,8 @@ config interface 'wan1'
 	option gateway '192.168.1.1'
 	option metric '10'
 	option weight '1'
-	# 這條線的最大頻寬（Mbps）：設定後 ECMP 基準權重自動 ∝ 最大頻寬，
-	# 也作為 LAN 下載方向的容量；up 是 LAN 上傳方向（非對稱線路才需填，未填沿用 max）
+	# 这条线的最大频宽（Mbps）：设定后 ECMP 基准权重自动 ∝ 最大频宽，
+	# 也作为 LAN 下载方向的容量；up 是 LAN 上传方向（非对称线路才需填，未填沿用 max）
 	#option max_mbps '1000'
 	#option up_mbps '50'
 	list probe_targets '223.5.5.5:53'
@@ -67,8 +90,8 @@ config interface 'wan2'
 	list probe_targets '223.5.5.5:53'
 	list probe_targets '114.114.114.114:53'
 
-# 策略分流：匹配來源（可選目的）的流量走指定 WAN，其餘仍走 ECMP。
-# 目標 WAN 被判 DOWN 時規則自動移除，流量回退 ECMP。可有多個 config policy 段。
+# 策略分流：匹配来源（可选目的）的流量走指定 WAN，其余仍走 ECMP。
+# 目标 WAN 被判 DOWN 时规则自动移除，流量回退 ECMP。可有多个 config policy 段。
 #config policy 'guest'
 #	option name 'guest'
 #	list source '192.168.3.0/24'

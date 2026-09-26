@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── 品質關卡：格式、靜態檢查、單元測試 ────────────────────────────────
+  # ── 品质关卡：格式、静态检查、单元测试 ────────────────────────────────
   quality:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
@@ -40,12 +40,12 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
-  # ── 交叉編譯：靜態 musl 二進位（x86_64 與 aarch64）───────────────────
-  # 注意：musl target 仍會呼叫一個 `cc` 作為連結驅動（crt/libc 由 Rust 自帶的
+  # ── 交叉编译：静态 musl 二进位（x86_64 与 aarch64）───────────────────
+  # 注意：musl target 仍会呼叫一个 `cc` 作为连结驱动（crt/libc 由 Rust 自带的
   # self-contained sysroot 提供）。因此
-  #   - x86_64：runner 內建 gcc 即可，無需額外套件；
-  #   - aarch64：必須另外裝 gcc-aarch64-linux-gnu 並指定為 linker，
-  #              否則 x86_64 的 gcc 無法輸出 aarch64 執行檔。
+  #   - x86_64：runner 内建 gcc 即可，无需额外套件；
+  #   - aarch64：必须另外装 gcc-aarch64-linux-gnu 并指定为 linker，
+  #              否则 x86_64 的 gcc 无法输出 aarch64 执行档。
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -109,8 +109,8 @@ jobs:
           path: target/${{ matrix.target }}/release/mwan4
           if-no-files-found: error
 
-  # ── 打包鏈路：Python 語法、翻譯編譯、用假二進位做 APK/IPK/bundle 冒煙測試 ─
-  # 這些腳本改壞時不會影響 Rust 編譯，但會直接毀掉發布產物，所以獨立把關。
+  # ── 打包链路：Python 语法、翻译编译、用假二进位做 APK/IPK/bundle 冒烟测试 ─
+  # 这些脚本改坏时不会影响 Rust 编译，但会直接毁掉发布产物，所以独立把关。
   packaging:
     name: packaging scripts
     runs-on: ubuntu-latest
@@ -154,9 +154,9 @@ jobs:
           print("OK", ipk)
           PY
 
-  # ── 真實核心 netns 整合測試（advisory）────────────────────────────────
-  # GitHub runner 對 unprivileged userns 有 AppArmor 限制時會直接跑不起來，
-  # 因此不阻擋主線；本機能跑時才是有效的路由編碼驗證。
+  # ── 真实核心 netns 整合测试（advisory）────────────────────────────────
+  # GitHub runner 对 unprivileged userns 有 AppArmor 限制时会直接跑不起来，
+  # 因此不阻挡主线；本机能跑时才是有效的路由编码验证。
   netns:
     name: netns integration [advisory]
     runs-on: ubuntu-latest
@@ -180,10 +180,10 @@ jobs:
         run: |
           unshare -Urn sh -c             'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
 
-  # ── MSRV 守門：確保 Cargo.toml 宣告的 rust-version 真的能編過 ─────────
-  # Cargo.toml 使用 edition 2024 並宣告 rust-version = "1.85"。
-  # 此 job 為「預警」性質：若某個依賴悄悄把自身 MSRV 拉高，這裡會變紅提醒，
-  # 但不阻擋主線（continue-on-error），避免第三方套件更新時無故卡住發布。
+  # ── MSRV 守门：确保 Cargo.toml 宣告的 rust-version 真的能编过 ─────────
+  # Cargo.toml 使用 edition 2024 并宣告 rust-version = "1.85"。
+  # 此 job 为「预警」性质：若某个依赖悄悄把自身 MSRV 拉高，这里会变红提醒，
+  # 但不阻挡主线（continue-on-error），避免第三方套件更新时无故卡住发布。
   msrv:
     name: msrv (1.85) [advisory]
     runs-on: ubuntu-latest

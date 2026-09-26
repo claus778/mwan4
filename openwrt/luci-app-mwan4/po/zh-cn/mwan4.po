@@ -181,8 +181,8 @@ msgstr "内核 fib_multipath_hash_policy。l4（多数系统默认）同时哈�
 msgid "L3 (addresses only)"
 msgstr "L3（仅地址）"
 
-msgid "L4 (addresses + ports, recommended)"
-msgstr "L4（地址 + 端口，推荐）"
+msgid "L4 (addresses + ports, the default)"
+msgstr "L4（地址 + 端口，默认）"
 
 msgid "L3 + tunnel inner headers"
 msgstr "L3 + 隧道内层头"
@@ -324,3 +324,15 @@ msgstr "时钟偏差"
 
 msgid "missing"
 msgstr "缺失"
+
+msgid "Hash Granularity:"
+msgstr "哈希粒度："
+
+msgid "L3 only: one WAN per destination IP"
+msgstr "仅 L3：同一目的 IP 只走一条 WAN"
+
+msgid "l4: per-connection spreading"
+msgstr "l4：按连线分散"
+
+msgid "Leave the kernel default (L3: one WAN per destination IP)"
+msgstr "沿用内核默认（仅 L3：同一目的 IP 只走一条 WAN）"

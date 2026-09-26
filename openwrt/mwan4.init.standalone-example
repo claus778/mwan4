@@ -1,17 +1,17 @@
 #!/bin/sh /etc/rc.common
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# MWAN4 standalone init（純 JSON 設定，不經 UCI）
+# MWAN4 standalone init（纯 JSON 设定，不经 UCI）
 #
-# 注意：這「不是」套件安裝的 /etc/init.d/mwan4！
-#   套件（apk / ipk）安裝的是 openwrt/luci-app-mwan4/root/etc/init.d/mwan4，
-#   那支會讀 /etc/config/mwan4（UCI）並產生 /var/etc/mwan4.json。
+# 注意：这「不是」套件安装的 /etc/init.d/mwan4！
+#   套件（apk / ipk）安装的是 openwrt/luci-app-mwan4/root/etc/init.d/mwan4，
+#   那支会读 /etc/config/mwan4（UCI）并产生 /var/etc/mwan4.json。
 #
-# 本檔僅供「不使用 LuCI / UCI、直接用 JSON 設定」的部署方式參考，
-# 例如手動放到 /etc/init.d/ 並搭配 /etc/mwan4/mwan4.json。
-# 之所以改名脫離 mwan4.init，就是為了避免與套件內同名腳本互相覆蓋。
+# 本档仅供「不使用 LuCI / UCI、直接用 JSON 设定」的部署方式参考，
+# 例如手动放到 /etc/init.d/ 并搭配 /etc/mwan4/mwan4.json。
+# 之所以改名脱离 mwan4.init，就是为了避免与套件内同名脚本互相覆盖。
 #
-# 安裝方式：
+# 安装方式：
 #   cp mwan4.init.standalone-example /etc/init.d/mwan4
 #   chmod +x /etc/init.d/mwan4
 #   /etc/init.d/mwan4 enable && /etc/init.d/mwan4 start
@@ -35,8 +35,8 @@ start_service() {
         return 1
     }
 
-    # 先驗證設定再交給 procd；設定錯誤時留下明確日誌並拒絕啟動，
-    # 避免 daemon 一啟動就退出、被 procd 無限重啟。
+    # 先验证设定再交给 procd；设定错误时留下明确日志并拒绝启动，
+    # 避免 daemon 一启动就退出、被 procd 无限重启。
     if ! "$PROG" --check-config "$CONFIG"; then
         logger -t mwan4 "Configuration $CONFIG failed --check-config, not starting"
         return 1

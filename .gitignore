@@ -1,20 +1,20 @@
 /target
 
-# 開發機專用的 cargo registry 代理設定，絕不可提交（會讓 CI/其他機器走不通網路）
+# 开发机专用的 cargo registry 代理设定，绝不可提交（会让 CI/其他机器走不通网路）
 /.cargo/
 
-# 打包輸出的簽名私鑰：絕不可提交（公鑰 dist/packages/mwan4.rsa.pub 需入庫以供裝置驗簽）
+# 打包输出的签名私钥：绝不可提交（公钥 dist/packages/mwan4.rsa.pub 需入库以供装置验签）
 /dist/keys/
 *.rsa.key
 
-# 本機除錯日誌
+# 本机除错日志
 *.log
 
-# 本機臨時下載的 OpenWrt 依賴包與索引，非原始碼
+# 本机临时下载的 OpenWrt 依赖包与索引，非原始码
 /*.apk
 /apkindex.tar.gz
 
-# 打包產物：dist 下僅保留 install.sh 與 packages/mwan4.rsa.pub
+# 打包产物：dist 下仅保留 install.sh 与 packages/mwan4.rsa.pub
 /dist/bin/
 /dist/packages/*.ipk
 /dist/packages/*.apk
@@ -24,8 +24,8 @@
 __pycache__/
 *.pyc
 
-# WorkBuddy 工作區資料（會話記憶等）
+# WorkBuddy 工作区资料（会话记忆等）
 /.workbuddy/
 
-# 本機一次性調試腳本與記錄
+# 本机一次性调试脚本与记录
 /.deploy/

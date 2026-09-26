@@ -1,5 +1,5 @@
-// 本模組絕大部分程式碼只在 Linux 上參與編譯，
-// 在非 Linux 平台上（例如在 Windows 上 `cargo check`）會整批變成 dead code。
+// 本模组绝大部分程式码只在 Linux 上参与编译，
+// 在非 Linux 平台上（例如在 Windows 上 `cargo check`）会整批变成 dead code。
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 #[cfg(target_os = "linux")]
@@ -8,13 +8,13 @@ use std::io;
 use std::net::Ipv4Addr;
 
 // ---------------------------------------------------------------------------
-// 位元組安全的讀寫工具
+// 位元组安全的读写工具
 //
-// 注意：netlink 訊息緩衝區來自 `Vec<u8>` 或 `[u8; N]`（align_of == 1）。
-// 直接 `&*(ptr as *const NlMsgHdr)` 這種轉型在 x86/ARM64 上「碰巧能跑」，
-// 但在 MIPS 等嚴格對齊的 OpenWrt 平台上會觸發 SIGBUS，且形式上是 UB。
-// 因此所有 netlink 結構一律以「逐位元組 + from_ne_bytes / to_ne_bytes」
-// 方式編解碼，完全不使用指標轉型。
+// 注意：netlink 讯息缓冲区来自 `Vec<u8>` 或 `[u8; N]`（align_of == 1）。
+// 直接 `&*(ptr as *const NlMsgHdr)` 这种转型在 x86/ARM64 上「碰巧能跑」，
+// 但在 MIPS 等严格对齐的 OpenWrt 平台上会触发 SIGBUS，且形式上是 UB。
+// 因此所有 netlink 结构一律以「逐位元组 + from_ne_bytes / to_ne_bytes」
+// 方式编解码，完全不使用指标转型。
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -49,7 +49,7 @@ pub fn write_u32(buf: &mut [u8], off: usize, v: u32) {
     }
 }
 
-/// Netlink 訊息標頭（struct nlmsghdr），以位元組方式序列化
+/// Netlink 讯息标头（struct nlmsghdr），以位元组方式序列化
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NlMsgHdr {
     pub nlmsg_len: u32,
@@ -72,7 +72,7 @@ impl NlMsgHdr {
         b
     }
 
-    /// 從緩衝區開頭解析；長度不足回傳 None（不做任何指標轉型）
+    /// 从缓冲区开头解析；长度不足回传 None（不做任何指标转型）
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::LEN {
             return None;
@@ -87,7 +87,7 @@ impl NlMsgHdr {
     }
 }
 
-/// 根據網卡名稱取得 Linux ifindex (例如 "wan1" -> 2)
+/// 根据网卡名称取得 Linux ifindex (例如 "wan1" -> 2)
 pub fn if_nametoindex(name: &str) -> io::Result<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -106,11 +106,11 @@ pub fn if_nametoindex(name: &str) -> io::Result<u32> {
     }
 }
 
-/// 行程級長連 ioctl fd（每次查詢都 socket()+close() 太昂貴）。
+/// 行程级长连 ioctl fd（每次查询都 socket()+close() 太昂贵）。
 ///
-/// 用 `AtomicI32` 而不是 `OnceLock`：`OnceLock` 會把「第一次 socket() 失敗」的
-/// -1 永久快取，之後**所有**介面的 IP 查詢都會失敗（介面全顯示 No IP、
-/// conntrack 清理永久 no-op）。這裡失敗不寫入，下次呼叫會重新嘗試。
+/// 用 `AtomicI32` 而不是 `OnceLock`：`OnceLock` 会把「第一次 socket() 失败」的
+/// -1 永久快取，之后**所有**介面的 IP 查询都会失败（介面全显示 No IP、
+/// conntrack 清理永久 no-op）。这里失败不写入，下次呼叫会重新尝试。
 #[cfg(target_os = "linux")]
 static IOCTL_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -128,7 +128,7 @@ fn ioctl_fd() -> io::Result<libc::c_int> {
         return Err(io::Error::last_os_error());
     }
 
-    // 只有搶到「從 -1 變成 fd」的執行緒保留這個 fd，其他執行緒關掉自己多開的
+    // 只有抢到「从 -1 变成 fd」的执行绪保留这个 fd，其他执行绪关掉自己多开的
     match IOCTL_FD.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed) {
         Ok(_) => Ok(fd),
         Err(existing) => {
@@ -138,11 +138,11 @@ fn ioctl_fd() -> io::Result<libc::c_int> {
     }
 }
 
-/// 透過 SIOCGIFADDR ioctl 快速取得網卡的 IPv4 地址（用於 Conntrack 精準連線清理）
+/// 透过 SIOCGIFADDR ioctl 快速取得网卡的 IPv4 地址（用于 Conntrack 精准连线清理）
 pub fn get_interface_ipv4(name: &str) -> io::Result<Ipv4Addr> {
     #[cfg(target_os = "linux")]
     unsafe {
-        // SIOCGIFADDR 對任意 AF_INET/SOCK_DGRAM socket 都有效
+        // SIOCGIFADDR 对任意 AF_INET/SOCK_DGRAM socket 都有效
         let sock = ioctl_fd()?;
         if sock < 0 {
             return Err(io::Error::last_os_error());
@@ -176,15 +176,15 @@ pub fn get_interface_ipv4(name: &str) -> io::Result<Ipv4Addr> {
     }
 }
 
-/// 設定 netlink socket 的收/發逾時，避免核心不回應時永久阻塞住整個 daemon
+/// 设定 netlink socket 的收/发逾时，避免核心不回应时永久阻塞住整个 daemon
 #[cfg(target_os = "linux")]
 pub fn set_socket_timeouts(
     fd: libc::c_int,
     recv: Option<std::time::Duration>,
     send: Option<std::time::Duration>,
 ) -> io::Result<()> {
-    // 用 `as _` 讓編譯器自行推導 timeval 欄位型別，
-    // 避免直接引用 libc::time_t / suseconds_t（在 musl 上已標記 deprecated）
+    // 用 `as _` 让编译器自行推导 timeval 栏位型别，
+    // 避免直接引用 libc::time_t / suseconds_t（在 musl 上已标记 deprecated）
     unsafe {
         if let Some(d) = recv {
             let tv = libc::timeval {
@@ -231,7 +231,7 @@ pub fn set_socket_timeouts(
     Ok(())
 }
 
-/// Netlink 記憶體對齊工具函數
+/// Netlink 记忆体对齐工具函数
 #[inline]
 pub fn rta_align(len: usize) -> usize {
     (len + 3) & !3

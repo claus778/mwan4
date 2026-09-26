@@ -175,7 +175,7 @@ msgstr ""
 msgid "L3 (addresses only)"
 msgstr ""
 
-msgid "L4 (addresses + ports, recommended)"
+msgid "L4 (addresses + ports, the default)"
 msgstr ""
 
 msgid "L3 + tunnel inner headers"
@@ -317,4 +317,16 @@ msgid "clock skew"
 msgstr ""
 
 msgid "missing"
+msgstr ""
+
+msgid "Hash Granularity:"
+msgstr ""
+
+msgid "L3 only: one WAN per destination IP"
+msgstr ""
+
+msgid "l4: per-connection spreading"
+msgstr ""
+
+msgid "Leave the kernel default (L3: one WAN per destination IP)"
 msgstr ""

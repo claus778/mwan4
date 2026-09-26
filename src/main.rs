@@ -9,7 +9,7 @@ mod lqe;
 mod netlink;
 mod prober;
 
-use config::{DaemonConfig, MultipathHashPolicy, WeightMode};
+use config::{DaemonConfig, EcmpMode, HashField, MultipathHashPolicy, WeightMode};
 use lqe::{LinkQualityEstimator, LinkState};
 use netlink::conntrack::ConntrackManager;
 use netlink::route::{
@@ -20,31 +20,38 @@ use netlink::util::if_nametoindex;
 
 const STATUS_FILE: &str = "/tmp/mwan4_status.json";
 const STATUS_TMP_FILE: &str = "/tmp/mwan4_status.json.tmp";
-/// 單實例鎖：避免兩個 mwan4 行程互相搶奪同一條預設路由
+/// 单实例锁：避免两个 mwan4 行程互相抢夺同一条预设路由
 const PID_FILE: &str = "/var/run/mwan4.pid";
 
-/// PID 檔路徑（可用 `MWAN4_PID_FILE` 覆蓋）。
-/// 供整合測試在 userns/netns 裡跑（那些環境寫不進 /var/run）。
+/// PID 档路径（可用 `MWAN4_PID_FILE` 覆盖）。
+/// 供整合测试在 userns/netns 里跑（那些环境写不进 /var/run）。
 fn pid_file_path() -> String {
     std::env::var("MWAN4_PID_FILE").unwrap_or_else(|_| PID_FILE.to_string())
 }
 
-/// 後備輪詢間隔（約 5 分鐘）。
-/// 正常情況由 RTNLGRP_LINK / IFADDR 事件即時驅動，
-/// 這裡只是訂閱失敗或事件遺漏時的安全網。
+/// 后备轮询间隔（约 5 分钟）。
+/// 正常情况由 RTNLGRP_LINK / IFADDR 事件即时驱动，
+/// 这里只是订阅失败或事件遗漏时的安全网。
 const IFINDEX_REFRESH_TICKS: u64 = 600;
-/// netlink 指令佇列容量（worker 卡住時丟棄指令而不是無限堆積）
+/// netlink 指令伫列容量（worker 卡住时丢弃指令而不是无限堆积）
 const NETLINK_QUEUE_CAPACITY: usize = 64;
-/// 探針路徑（獨立表 + oif 規則）的定期重新校驗間隔（tick 數，約 30 秒）
+/// 探针路径（独立表 + oif 规则）的定期重新校验间隔（tick 数，约 30 秒）
 const PROBE_PATH_REFRESH_TICKS: u64 = 60;
-/// 存活集合沒有變化時，仍定期重下一次預設路由以自我修復（tick 數，約 30 秒）
+/// 存活集合没有变化时，仍定期重下一次预设路由以自我修复（tick 数，约 30 秒）
 const ROUTE_HEARTBEAT_TICKS: u64 = 60;
-/// 狀態檔新鮮度門檻（秒）：超過這個時間沒有更新，LuCI 會標成「資料已過期」，
-/// 而不是把最後一次快照（可能剛好是兩條 DOWN）當成即時狀態一直顯示。
+/// 状态档新鲜度门槛（秒）：超过这个时间没有更新，LuCI 会标成「资料已过期」，
+/// 而不是把最后一次快照（可能刚好是两条 DOWN）当成即时状态一直显示。
 const STATUS_STALE_SECS: u64 = 10;
 
-/// link watcher 失效後的重訂閱間隔（tick 數，約 30 秒）
+/// link watcher 失效后的重订阅间隔（tick 数，约 30 秒）
 const LINK_WATCH_RETRY_TICKS: u64 = 60;
+
+/// 过载状态转换时允许「插队」重下权重的最小间隔。
+///
+/// 转换点值得立刻生效（新连线该马上改走另一条线），但状态机在门槛附近仍可能
+/// 每秒翻转一次，而每一次权重变更都是一次 `RTM_NEWROUTE`；这里给一个 1 秒的下限，
+/// 让「立刻」不等于「每拍都写」。
+const WEIGHT_UPDATE_MIN_SPACING: Duration = Duration::from_millis(1000);
 
 fn print_help(bin_name: &str) {
     println!(
@@ -64,17 +71,17 @@ OPTIONS:
     );
 }
 
-/// PID 檔案持有的 flock；行程存活期間一直開著（行程結束由核心自動釋放）。
+/// PID 档案持有的 flock；行程存活期间一直开著（行程结束由核心自动释放）。
 static PID_FILE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
-/// 檢查是否已有另一個 mwan4 行程在跑，並取得 PID 檔案的獨佔鎖。
+/// 检查是否已有另一个 mwan4 行程在跑，并取得 PID 档案的独占锁。
 ///
-/// 為什麼用 `flock` 而不是「讀 PID → 查 /proc/<pid>」：
-/// - 兩個實例同時啟動時，讀-判斷-寫之間有 race，可能都通過檢查；
-/// - 行程被 abort（panic=abort）後舊 PID 會被核心複用，新實例看到 /proc/<pid>
-///   存在就誤判「已經有實例在跑」而拒絕啟動，procd 進入無盡重試。
+/// 为什么用 `flock` 而不是「读 PID → 查 /proc/<pid>」：
+/// - 两个实例同时启动时，读-判断-写之间有 race，可能都通过检查；
+/// - 行程被 abort（panic=abort）后旧 PID 会被核心复用，新实例看到 /proc/<pid>
+///   存在就误判「已经有实例在跑」而拒绝启动，procd 进入无尽重试。
 ///
-/// flock 隨行程結束自動釋放，兩種問題都不存在。檔案內容只是給人看的。
+/// flock 随行程结束自动释放，两种问题都不存在。档案内容只是给人看的。
 fn acquire_pid_file() -> Result<(), String> {
     let pid_file = pid_file_path();
     let path = std::path::Path::new(&pid_file);
@@ -125,41 +132,41 @@ fn release_pid_file() {
     let _ = std::fs::remove_file(pid_file_path());
 }
 
-/// 交給 netlink worker 執行緒處理的指令
+/// 交给 netlink worker 执行绪处理的指令
 ///
-/// Netlink 的 send/recv 都是阻塞式系統呼叫（conntrack 全表 dump 甚至可達數秒），
-/// 若直接在 `current_thread` 的非同步主迴圈裡執行，會把整個探測週期卡住。
-/// 因此統一丟到專屬執行緒處理，主迴圈只做非阻塞的 try_send。
+/// Netlink 的 send/recv 都是阻塞式系统呼叫（conntrack 全表 dump 甚至可达数秒），
+/// 若直接在 `current_thread` 的非同步主回圈里执行，会把整个探测周期卡住。
+/// 因此统一丢到专属执行绪处理，主回圈只做非阻塞的 try_send。
 enum NetlinkCmd {
-    /// 下發（或於清單為空時刪除）IPv4 預設路由
+    /// 下发（或于清单为空时删除）IPv4 预设路由
     Apply(Vec<ActiveWanRoute>),
-    /// 下發（或於清單為空時刪除）IPv6 預設路由
+    /// 下发（或于清单为空时删除）IPv6 预设路由
     ApplyV6(Vec<ActiveWanRouteV6>),
-    /// 建立／更新「探針路徑」：每張 WAN 一張獨立表 + 一條 `oif <wan>` 規則，
-    /// 必要時再於主表補探針目標的 /32（給 rp_filter 的反向路徑檢查用）。
-    /// 這是讓探針不再依賴主表預設路由的關鍵（見 netlink::route 的說明）。
+    /// 建立／更新「探针路径」：每张 WAN 一张独立表 + 一条 `oif <wan>` 规则，
+    /// 必要时再于主表补探针目标的 /32（给 rp_filter 的反向路径检查用）。
+    /// 这是让探针不再依赖主表预设路由的关键（见 netlink::route 的说明）。
     ///
-    /// `clean_host_routes` 只在啟動後第一次下發時為 true：把上一次執行可能殘留的
-    /// 主表 /32 先清掉，之後才按需補回。
+    /// `clean_host_routes` 只在启动后第一次下发时为 true：把上一次执行可能残留的
+    /// 主表 /32 先清掉，之后才按需补回。
     SetProbePaths(Vec<ProbePath>, bool),
-    /// 清理指定網卡們的 conntrack 連線（多張網卡合併為一次全表 dump）
+    /// 清理指定网卡们的 conntrack 连线（多张网卡合并为一次全表 dump）
     FlushConntrack(Vec<ConntrackTarget>),
-    /// 同步策略分流規則（`from`/`to` + 各 WAN 獨立表；空集合 = 全部移除）
+    /// 同步策略分流规则（`from`/`to` + 各 WAN 独立表；空集合 = 全部移除）
     SetPolicies(Vec<PolicyRule>),
-    /// 優雅退出：移除本程式下發的預設路由
+    /// 优雅退出：移除本程式下发的预设路由
     ClearRoutes,
 }
 
 type NetlinkSender = std::sync::mpsc::SyncSender<NetlinkCmd>;
 
-/// conntrack 清理目標：網卡名 +「DOWN 判定時記下的最後已知 IPv4」。
+/// conntrack 清理目标：网卡名 +「DOWN 判定时记下的最后已知 IPv4」。
 ///
-/// 為什麼要帶舊 IP：flush 是延後執行的，PPPoE 重撥 / USB 重插 / netifd 拆介面
-/// 之後現查 IP 會失敗或換新；沒有舊 IP 就清不到 NAT 到舊位址的既有連線
-/// ——正是「長連線卡死」最需要清理的場景。
+/// 为什么要带旧 IP：flush 是延后执行的，PPPoE 重拨 / USB 重插 / netifd 拆介面
+/// 之后现查 IP 会失败或换新；没有旧 IP 就清不到 NAT 到旧位址的既有连线
+/// ——正是「长连线卡死」最需要清理的场景。
 type ConntrackTarget = (String, Option<std::net::Ipv4Addr>);
 
-/// worker 執行過的「全量期望狀態」操作種類
+/// worker 执行过的「全量期望状态」操作种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetlinkOp {
     Ipv4Routes,
@@ -169,16 +176,16 @@ enum NetlinkOp {
     Policies,
 }
 
-/// 操作結果回報：主迴圈據此判斷「已入佇列」是否真的生效，
-/// 失敗就強制下個 tick 重下（而不是像以前一樣只印一行 error 就永久停留）。
+/// 操作结果回报：主回圈据此判断「已入伫列」是否真的生效，
+/// 失败就强制下个 tick 重下（而不是像以前一样只印一行 error 就永久停留）。
 #[derive(Debug, Clone)]
 struct NetlinkOutcome {
     op: NetlinkOp,
     ok: bool,
-    /// 失敗原因（給主迴圈做去重告警用；成功時為 None）
+    /// 失败原因（给主回圈做去重告警用；成功时为 None）
     detail: Option<String>,
-    /// 操作完成後「核心實際生效的 IPv4 預設路由變體」（僅 Ipv4Routes 會帶）。
-    /// `ecmp_mode=auto` 可能在內核不支援時退回 standard，主迴圈必須知道實情。
+    /// 操作完成后「核心实际生效的 IPv4 预设路由变体」（仅 Ipv4Routes 会带）。
+    /// `ecmp_mode=auto` 可能在内核不支援时退回 standard，主回圈必须知道实情。
     variant: Option<InstalledVariant>,
 }
 
@@ -220,9 +227,9 @@ fn spawn_netlink_worker(
             let mut conntrack_mgr = conntrack_mgr;
 
             while let Ok(cmd) = rx.recv() {
-                // worker 卡在耗時操作（如 conntrack 全表 dump）時，佇列裡可能積壓
-                // 多條陳舊的 Apply。它們都是「全量期望狀態」且冪等，只有最新一條
-                // 有意義——先排空佇列合併成一批再執行，避免把陳舊狀態逐條重放。
+                // worker 卡在耗时操作（如 conntrack 全表 dump）时，伫列里可能积压
+                // 多条陈旧的 Apply。它们都是「全量期望状态」且幂等，只有最新一条
+                // 有意义——先排空伫列合并成一批再执行，避免把陈旧状态逐条重放。
                 let mut batch = vec![cmd];
                 while let Ok(more) = rx.try_recv() {
                     batch.push(more);
@@ -286,17 +293,17 @@ fn spawn_netlink_worker(
                 }
                 if let Some((paths, clean_host_routes)) = probe_paths {
                     if clean_host_routes {
-                        // 按專屬 metric 轉儲掃描：連「已從設定移除的目標」留下的 /32
-                        // 也一起清掉（只清當前設定裡有的目標是不夠的）。
-                        // **只清探針 /32**：同一批指令裡的 Apply 才剛裝好 underlay /32，
-                        // 連它一起清就會讓隧道封裝封包走 ECMP 自環（見 route.rs 的
-                        // RUNTIME_SWEEP_METRICS 說明；啟動前那次才清 underlay）。
+                        // 按专属 metric 转储扫描：连「已从设定移除的目标」留下的 /32
+                        // 也一起清掉（只清当前设定里有的目标是不够的）。
+                        // **只清探针 /32**：同一批指令里的 Apply 才刚装好 underlay /32，
+                        // 连它一起清就会让隧道封装封包走 ECMP 自环（见 route.rs 的
+                        // RUNTIME_SWEEP_METRICS 说明；启动前那次才清 underlay）。
                         if let Err(e) = route_mgr.sweep_own_probe_host_routes() {
                             debug!("Probe host route cleanup failed: {e}");
                         }
                     }
-                    // 單一網卡暫時不可用（ENODEV / ENETUNREACH）屬預期情況：
-                    // 記 debug 並在下個週期重試，不要當成致命錯誤刷屏。
+                    // 单一网卡暂时不可用（ENODEV / ENETUNREACH）属预期情况：
+                    // 记 debug 并在下个周期重试，不要当成致命错误刷屏。
                     let (ok, detail) = match route_mgr.set_probe_paths(&paths) {
                         Ok(()) => (true, None),
                         Err(e) => {
@@ -345,8 +352,8 @@ fn spawn_netlink_worker(
 }
 
 // ---------------------------------------------------------------------------
-// 訊號處理：OpenWrt procd 停止服務時送的是 SIGTERM，
-// 只監聽 ctrl_c()（SIGINT）會導致服務永遠無法優雅退出。
+// 讯号处理：OpenWrt procd 停止服务时送的是 SIGTERM，
+// 只监听 ctrl_c()（SIGINT）会导致服务永远无法优雅退出。
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -404,14 +411,14 @@ fn install_signal_handlers() -> (SigHandle, SigHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// 網卡事件監看：訂閱核心的 link / ifaddr 組播，取代定時輪詢 ifindex 與 IP
+// 网卡事件监看：订阅核心的 link / ifaddr 组播，取代定时轮询 ifindex 与 IP
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 type LinkWatch = Option<netlink::link::LinkWatcher>;
-/// 非 Linux 平台沒有 netlink 可用。這裡刻意用一個空哨兵型別而不是 `()`，
-/// 好讓 `let mut link_watch = ...` 在所有平台都維持同樣的形狀
-/// （`()` 會觸發 clippy::let_unit_value）。
+/// 非 Linux 平台没有 netlink 可用。这里刻意用一个空哨兵型别而不是 `()`，
+/// 好让 `let mut link_watch = ...` 在所有平台都维持同样的形状
+/// （`()` 会触发 clippy::let_unit_value）。
 #[cfg(not(target_os = "linux"))]
 struct LinkWatch;
 
@@ -461,7 +468,7 @@ fn disable_link_watch(w: &mut LinkWatch) {
 #[cfg(not(target_os = "linux"))]
 fn disable_link_watch(_w: &mut LinkWatch) {}
 
-/// 目前是否仍有可用的 link 事件訂閱（非 Linux 平台永遠沒有）
+/// 目前是否仍有可用的 link 事件订阅（非 Linux 平台永远没有）
 #[cfg(target_os = "linux")]
 fn link_watch_active(w: &LinkWatch) -> bool {
     w.is_some()
@@ -472,13 +479,13 @@ fn link_watch_active(_w: &LinkWatch) -> bool {
     false
 }
 
-/// 重新解析某張網卡的 ifindex；解析不到就把它標成「不可用」（0）。
+/// 重新解析某张网卡的 ifindex；解析不到就把它标成「不可用」（0）。
 ///
-/// 舊行為是「解析失敗就保留舊值」，於是网卡被刪除／改名後，一個已經不存在
-/// （甚至可能被別的設備複用）的 ifindex 會被繼續寫進內核路由。這裡改成失敗即歸零，
-/// 而 `is_active` / 路由下發都要求 `ifindex != 0`，因此不會再拿死 index 去下發。
+/// 旧行为是「解析失败就保留旧值」，于是网卡被删除／改名后，一个已经不存在
+/// （甚至可能被别的设备复用）的 ifindex 会被继续写进内核路由。这里改成失败即归零，
+/// 而 `is_active` / 路由下发都要求 `ifindex != 0`，因此不会再拿死 index 去下发。
 ///
-/// 回傳 true 表示 ifindex 有變動（呼叫端可據此重下探針路徑）。
+/// 回传 true 表示 ifindex 有变动（呼叫端可据此重下探针路径）。
 fn refresh_ifindex(monitor: &mut WanMonitor, reason: &str) -> bool {
     match if_nametoindex(&monitor.ifname) {
         Ok(idx) => {
@@ -506,7 +513,7 @@ fn refresh_ifindex(monitor: &mut WanMonitor, reason: &str) -> bool {
     }
 }
 
-/// 依據核心事件更新各網卡的 ifindex 與快取 IP
+/// 依据核心事件更新各网卡的 ifindex 与快取 IP
 fn refresh_interface_state(monitors: &mut [WanMonitor], reason: &str) -> bool {
     let mut changed = false;
     for monitor in monitors.iter_mut() {
@@ -516,14 +523,14 @@ fn refresh_interface_state(monitors: &mut [WanMonitor], reason: &str) -> bool {
     changed
 }
 
-/// 依據核心事件只刷新「受影響的」網卡，而不是任何介面的事件都全量重查。
+/// 依据核心事件只刷新「受影响的」网卡，而不是任何介面的事件都全量重查。
 ///
-/// - Link 事件攜帶 IFLA_IFNAME：按名稱匹配（網卡重建後 ifindex 會變、名稱不變，
-///   所以必須能用名稱重新解析 ifindex）
-/// - Address 事件只有 ifindex：按當前 ifindex 匹配即可（位址變動不換 ifindex）
+/// - Link 事件携带 IFLA_IFNAME：按名称匹配（网卡重建后 ifindex 会变、名称不变，
+///   所以必须能用名称重新解析 ifindex）
+/// - Address 事件只有 ifindex：按当前 ifindex 匹配即可（位址变动不换 ifindex）
 ///
-/// 路由器上 LAN 橋、wifi、IPv6 臨時位址的事件遠多於 WAN 事件，
-/// 過濾掉不相關事件可避免每次都對全部網卡做 7~9 個系統呼叫。
+/// 路由器上 LAN 桥、wifi、IPv6 临时位址的事件远多于 WAN 事件，
+/// 过滤掉不相关事件可避免每次都对全部网卡做 7~9 个系统呼叫。
 #[cfg(target_os = "linux")]
 fn refresh_affected_interfaces(
     monitors: &mut [WanMonitor],
@@ -568,12 +575,12 @@ fn refresh_affected_interfaces(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 初始化日誌輸出（預設為 INFO 等級）
+    // 1. 初始化日志输出（预设为 INFO 等级）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
 
-    // 2. 解析命令列參數
+    // 2. 解析命令列参数
     let args: Vec<String> = env::args().collect();
     let bin_name = args.first().map(|s| s.as_str()).unwrap_or("mwan4");
 
@@ -631,7 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    // 3a. 只驗證設定檔而不啟動（給 init 腳本 / CI 使用，避免設定錯誤時靠 procd 重啟硬試）
+    // 3a. 只验证设定档而不启动（给 init 脚本 / CI 使用，避免设定错误时靠 procd 重启硬试）
     if let Some(path) = check_config_path {
         match DaemonConfig::load_from_file(&path) {
             Ok(_) => {
@@ -645,7 +652,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. 載入配置
+    // 3. 载入配置
     let config = match config_path {
         Some(path) => {
             info!("Loading configuration from: {path}");
@@ -680,7 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 3b. 單實例鎖：兩個 mwan4 同時操作同一條預設路由會互相覆蓋
+    // 3b. 单实例锁：两个 mwan4 同时操作同一条预设路由会互相覆盖
     if let Err(e) = acquire_pid_file() {
         error!("{e}");
         process::exit(1);
@@ -695,9 +702,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.ecmp_mode
     );
 
-    // 4. 初始化 Linux 核心 Netlink 控制器，並交由專屬執行緒操作
-    //    這裡用明確的錯誤訊息 + exit(1) 取代 expect()：
-    //    release 版開了 panic=abort，panic 只會留下一行堆疊，procd 也拿不到有用的退出碼
+    // 4. 初始化 Linux 核心 Netlink 控制器，并交由专属执行绪操作
+    //    这里用明确的错误讯息 + exit(1) 取代 expect()：
+    //    release 版开了 panic=abort，panic 只会留下一行堆叠，procd 也拿不到有用的退出码
     let route_mgr = match RouteManager::new(config.route_priority, config.ecmp_mode) {
         Ok(m) => m,
         Err(e) => {
@@ -706,33 +713,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(1);
         }
     };
-    // 啟動前先掃掉自己保留區段內殘留的探針規則／表內路由：上次執行的介面順序若與
-    // 這次不同，殘留的 `oif <wan> lookup <舊表>` 會把探針導向舊閘道。
+    // 启动前先扫掉自己保留区段内残留的探针规则／表内路由：上次执行的介面顺序若与
+    // 这次不同，残留的 `oif <wan> lookup <旧表>` 会把探针导向旧闸道。
     let mut route_mgr = route_mgr;
     if let Err(e) = route_mgr.sweep_probe_paths() {
         warn!("Failed to sweep stale probe paths on startup: {e}");
     }
-    // 清掉上一次執行可能留下的主表 /32：探針（metric 42760）與隧道 underlay（42761）
-    // 都在這裡清。按專屬 metric 轉儲掃描，能涵蓋已從設定移除、或當時設備還不存在的目標；
-    // underlay /32 的出口（ifindex/gateway）上次執行可能已經不同，開機時一次清乾淨，
-    // 之後由 apply_default_routes → sync_underlay_routes 按當前期望重新補回。
-    // 執行期（SetProbePaths 的 clean）則只清探針 /32——那裡清 underlay 會把剛裝好的刪掉。
+    // 清掉上一次执行可能留下的主表 /32：探针（metric 42760）与隧道 underlay（42761）
+    // 都在这里清。按专属 metric 转储扫描，能涵盖已从设定移除、或当时设备还不存在的目标；
+    // underlay /32 的出口（ifindex/gateway）上次执行可能已经不同，开机时一次清干净，
+    // 之后由 apply_default_routes → sync_underlay_routes 按当前期望重新补回。
+    // 执行期（SetProbePaths 的 clean）则只清探针 /32——那里清 underlay 会把刚装好的删掉。
     match route_mgr.sweep_all_own_host_routes() {
         Ok(0) => {}
         Ok(n) => info!("Cleaned up {n} leftover mwan4 host route(s) on startup"),
         Err(e) => warn!("Failed to clean up leftover mwan4 host routes: {e}"),
     }
-    // 策略分流規則的保留區段也先清：上次執行的規則可能指向已不存在的表/網關，
-    // 或與這次的 policy 集合不同（`set_policy_rules` 只信記憶體快取）。
+    // 策略分流规则的保留区段也先清：上次执行的规则可能指向已不存在的表/网关，
+    // 或与这次的 policy 集合不同（`set_policy_rules` 只信记忆体快取）。
     if let Err(e) = route_mgr.sweep_policy_rules() {
         warn!("Failed to sweep stale policy rules on startup: {e}");
     }
-    // 只用來「問內核路徑」的查詢用 socket：判斷主表有沒有涵蓋目標、以及探針失敗時
-    // 是不是「本機根本沒有路」。與 worker 的寫入 socket 分開，避免互相干擾。
+    // 只用来「问内核路径」的查询用 socket：判断主表有没有涵盖目标、以及探针失败时
+    // 是不是「本机根本没有路」。与 worker 的写入 socket 分开，避免互相干扰。
     let mut query_mgr = match RouteManager::new(config.route_priority, config.ecmp_mode) {
         Ok(m) => {
-            // 這是事件迴圈上同步使用的查詢 socket：逾時縮短到 300ms，避免內核一時
-            // 不回應時每次查詢阻塞 2 秒（多張網卡疊加會凍住整個 current_thread runtime）
+            // 这是事件回圈上同步使用的查询 socket：逾时缩短到 300ms，避免内核一时
+            // 不回应时每次查询阻塞 2 秒（多张网卡叠加会冻住整个 current_thread runtime）
             if let Err(e) = m.set_netlink_timeout(Duration::from_millis(300)) {
                 warn!(
                     "Failed to shorten netlink query socket timeouts ({e}); \
@@ -756,8 +763,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(1);
         }
     };
-    // worker 執行緒建立失敗（極端資源不足）不該用 expect 直接 abort：
-    // panic=abort 下 expect 會讓進程在 pid 檔與路由清理之前直接消失。
+    // worker 执行绪建立失败（极端资源不足）不该用 expect 直接 abort：
+    // panic=abort 下 expect 会让进程在 pid 档与路由清理之前直接消失。
     let (netlink_tx, netlink_rx, netlink_worker) =
         match spawn_netlink_worker(route_mgr, conntrack_mgr) {
             Ok(parts) => parts,
@@ -768,7 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-    // 5. 初始化各 WAN 網卡的 LQE 狀態機與 ifindex 解析
+    // 5. 初始化各 WAN 网卡的 LQE 状态机与 ifindex 解析
     let mut monitors: Vec<WanMonitor> = Vec::new();
     for iface_cfg in &config.interfaces {
         let ifindex = match if_nametoindex(&iface_cfg.name) {
@@ -825,31 +832,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 只有至少一張網卡設定了 gateway6 才需要處理 IPv6 路由
+    // 只有至少一张网卡设定了 gateway6 才需要处理 IPv6 路由
     let has_ipv6 = monitors.iter().any(|m| m.gateway6.is_some());
     if has_ipv6 {
         info!("IPv6 default route management enabled (interfaces with gateway6)");
+    } else if let Ok(table) = std::fs::read_to_string("/proc/net/ipv6_route") {
+        // 没设 gateway6 = 不管理 IPv6 路由：v6 流量会一直走 netifd 那一条预设路由（单线），
+        // 而这年头视频（YouTube、Bilibili 的 QUIC）常常正好走 v6 —— §6.1 的「按连线分流」
+        // 对它完全没有作用。这种「IPv4 分流调好了、v6 视频还是卡」的落差不说清楚很难查，
+        // 所以在真的存在 v6 预设路由时提示一次。
+        if has_kernel_ipv6_default_route(&table) {
+            info!(
+                "IPv6 default route exists but no interface has 'gateway6' configured: IPv6 \
+                 traffic is NOT managed by mwan4 (no failover, no per-connection spreading) and \
+                 keeps using the kernel's single default route. Video over IPv6 will not benefit \
+                 from the multipath hash policy. Set gateway6 on each WAN to include IPv6."
+            );
+        }
     }
 
-    // 多路徑哈希策略（選填）：寫入內核 sysctl，改善 flow 分流的均勻度。
-    // 失敗只告警（舊內核沒有這個檔案），不影響啟動。
-    if let Some(policy) = config.multipath_hash_policy {
-        apply_multipath_hash_policy(policy, has_ipv6);
+    // 多路径哈希策略：写入内核 sysctl，决定「怎么分」——只有 policy 这一个有效开关
+    // （见 `apply_multipath_hash` 的说明：实测 fields 会被内核忽略）。
+    // 失败只告警（旧内核没有这些档案），不影响启动。
+    let effective_hash = apply_multipath_hash(config.multipath_hash_policy, has_ipv6);
+    let effective_hash_v4 = effective_hash
+        .iter()
+        .find(|(label, _)| *label == "ipv4")
+        .map(|(_, eff)| *eff)
+        .unwrap_or_default();
+    // 两条线以上而内核只按 L3 哈希就是实打实的缺陷：同一个目的 IP（视频 CDN 的典型
+    // 形态）的所有连线只会走同一条 WAN，另一条线完全用不到——这正是「多 WAN 了还是卡」
+    // 最常见的成因。使用者明确选了 l3/inner 时只提示（他知道自己在做什么）；
+    // 若他是写 null（不写入、沿用系统预设）而拿到 L3，那是没预料到的 → 告警。
+    if monitors.len() >= 2 && effective_hash_v4.l3_only() {
+        if config.multipath_hash_policy.is_some() {
+            info!(
+                "Multipath hash granularity is L3-only ({}) because multipath_hash_policy is \
+                 set explicitly; connections to the same destination IP stay on one WAN \
+                 (video CDNs, multi-threaded downloads). Use \"l4\" to spread them per \
+                 connection.",
+                effective_hash_v4.describe()
+            );
+        } else {
+            warn!(
+                "Multipath hash granularity is L3-only ({}): with multipath_hash_policy set to \
+                 null the kernel's own default is used, and it hashes addresses only - every \
+                 connection to the same destination IP uses ONE WAN, so a video CDN's \
+                 connections cannot be spread over both lines. Set multipath_hash_policy to \
+                 \"l4\" (the default when the key is omitted).",
+                effective_hash_v4.describe()
+            );
+        }
     }
 
-    // 6. 主非同步事件循環 (Single-threaded Non-blocking Event Loop)
+    // 6. 主非同步事件循环 (Single-threaded Non-blocking Event Loop)
     let probe_interval = Duration::from_millis(config.check_interval_ms);
     let probe_timeout = Duration::from_millis(config.probe_timeout_ms);
     let conntrack_flush_min_interval =
         Duration::from_millis(config.conntrack_flush_min_interval_ms);
-    // 使用 resilient nexthop group 時，核心只會重映射故障成員的 flow，其餘連線本來
-    // 就不會斷；這時若還在「成員變動」時清 conntrack，反而會親手打斷那些被保留的連線。
-    // 因此實際安裝的是 resilient 時關閉 flush-on-switch（flush-on-down 仍然保留：
-    // 已死鏈路上的連線本來就該清掉）。
+    // 使用 resilient nexthop group 时，核心只会重映射故障成员的 flow，其余连线本来
+    // 就不会断；这时若还在「成员变动」时清 conntrack，反而会亲手打断那些被保留的连线。
+    // 因此实际安装的是 resilient 时关闭 flush-on-switch（flush-on-down 仍然保留：
+    // 已死链路上的连线本来就该清掉）。
     //
-    // FIX-8：判斷依據是 worker 回報的**實際安裝變體**，而不是設定值 `ecmp_mode`——
-    // `auto` 在內核不支援 resilient（< 5.14 或成員數超限）而退回 standard 時，
-    // 仍必須在切換瞬間清 conntrack。首次回報前保守視為 standard（與預設一致）。
+    // FIX-8：判断依据是 worker 回报的**实际安装变体**，而不是设定值 `ecmp_mode`——
+    // `auto` 在内核不支援 resilient（< 5.14 或成员数超限）而退回 standard 时，
+    // 仍必须在切换瞬间清 conntrack。首次回报前保守视为 standard（与预设一致）。
     let mut kernel_resilient = false;
     let mut kernel_variant_known = false;
     let mut ticker = tokio::time::interval(probe_interval);
@@ -859,46 +907,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut link_watch = install_link_watcher();
 
     let mut tick_count: u64 = 0;
-    // None 代表「尚未下發過任何路由」，與「已知沒有存活線路」區分開來，
-    // 避免開機第一次探測就把別人（netifd）的預設路由刪掉
+    // None 代表「尚未下发过任何路由」，与「已知没有存活线路」区分开来，
+    // 避免开机第一次探测就把别人（netifd）的预设路由删掉
     let mut last_active_ifindexes: Option<Vec<u32>> = None;
-    // IPv6 路由更新入隊失敗時暫存待重試的 payload。
-    // last_active_ifindexes 只跟隨 IPv4 的入隊結果更新，若不顯式重試，
-    // v6 更新在 need_apply 變回 false 後會永久丟失。
+    // IPv6 路由更新入队失败时暂存待重试的 payload。
+    // last_active_ifindexes 只跟随 IPv4 的入队结果更新，若不显式重试，
+    // v6 更新在 need_apply 变回 false 后会永久丢失。
     let mut v6_pending: Option<Vec<ActiveWanRouteV6>> = None;
-    // 探針路徑需要（重）下發：開機、ifindex 變動、上次失敗、或定期校驗
+    // 探针路径需要（重）下发：开机、ifindex 变动、上次失败、或定期校验
     let mut probe_paths_dirty = true;
     let mut probe_paths_inflight = false;
     let mut probe_paths_retry_at: u64 = 0;
-    // 第一次下發探針路徑時，順手清掉上一次執行可能殘留的主表 /32
+    // 第一次下发探针路径时，顺手清掉上一次执行可能残留的主表 /32
     let mut probe_host_routes_cleanup = true;
-    // 預設路由下發失敗（worker 回報）或心跳到期時，即使存活集合沒變也要重下
+    // 预设路由下发失败（worker 回报）或心跳到期时，即使存活集合没变也要重下
     let mut v4_apply_dirty = false;
     let mut v4_apply_inflight = false;
     let mut v4_retry_at: u64 = 0;
-    // link watcher 失效後的重訂閱時間點
+    // link watcher 失效后的重订阅时间点
     let mut link_watch_retry_at: u64 = 0;
-    // 路由下發失敗的告警去重（避免永久失敗時刷屏沖掉 logd 環形緩衝）
+    // 路由下发失败的告警去重（避免永久失败时刷屏冲掉 logd 环形缓冲）
     let mut route_fail_count: u64 = 0;
     let mut last_route_fail: Option<String> = None;
-    // conntrack 清理失敗的告警去重（同一種錯誤只提醒一次，之後每 20 次一次）
+    // conntrack 清理失败的告警去重（同一种错误只提醒一次，之后每 20 次一次）
     let mut conntrack_fail_count: u64 = 0;
     let mut last_conntrack_fail: Option<String> = None;
-    // netlink worker 意外結束只告警一次（避免每個 tick 刷屏）
+    // netlink worker 意外结束只告警一次（避免每个 tick 刷屏）
     let mut netlink_worker_gone = false;
-    // strict rp_filter + 共用探針目標的告警只說一次
+    // strict rp_filter + 共用探针目标的告警只说一次
     let mut strict_shared_warned = false;
-    // 「全部線路都降級、仍保底承載一條」的告警去重（品質恢復後重新允許告警）
+    // 「全部线路都降级、仍保底承载一条」的告警去重（品质恢复后重新允许告警）
     let mut degrade_fallback_warned = false;
-    // 動態/容量權重狀態：更新限速 + 需要重下路由的旗標。
-    // 起點刻意往前推一個 interval，讓第一個 tick 就算出容量比例/品質權重，
-    // 而不是先跑 10 秒的設定 weight 才切換。
+    // 「动态因子在 standard ECMP 下被忽略」的告警去重（只说一次）
+    let mut dynamic_factor_gate_warned = false;
+    // 动态/容量权重状态：更新限速 + 需要重下路由的旗标。
+    // 起点刻意往前推一个 interval，让第一个 tick 就算出容量比例/品质权重，
+    // 而不是先跑 10 秒的设定 weight 才切换。
     let dynamic_weight_interval = Duration::from_millis(config.dynamic_weight_interval_ms);
     let mut weights_dirty = false;
     let mut last_weight_update = Instant::now()
         .checked_sub(dynamic_weight_interval)
         .unwrap_or_else(Instant::now);
-    // 策略分流規則的下發狀態（差異比對 + 失敗重試 + 定期心跳）
+    // 策略分流规则的下发状态（差异比对 + 失败重试 + 定期心跳）
     let mut policies_dirty = !config.policies.is_empty();
     let mut policies_inflight = false;
     let mut policies_retry_at: u64 = 0;
@@ -914,8 +964,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             events = wait_link_event(&mut link_watch) => {
                 if events.is_empty() {
-                    // 訂閱失效是可恢復的：關掉它、退回輪詢，並在稍後嘗試重新訂閱
-                    // （舊行為是永久放棄事件驅動，ifindex 最長 5 分鐘才被修正）
+                    // 订阅失效是可恢复的：关掉它、退回轮询，并在稍后尝试重新订阅
+                    // （旧行为是永久放弃事件驱动，ifindex 最长 5 分钟才被修正）
                     warn!(
                         "Link watcher stopped; falling back to periodic refresh, will retry subscribing shortly"
                     );
@@ -927,8 +977,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ifindexes: Vec<u32> = events.iter().map(|e| e.ifindex()).collect();
                     debug!("Kernel link/address events for ifindex {ifindexes:?}");
                 }
-                // 接收緩衝溢位（ENOBUFS）代表中間有事件遺失：
-                // 做一次全量 resync，訂閱保持有效（低記憶體路由器開機期容易發生）
+                // 接收缓冲溢位（ENOBUFS）代表中间有事件遗失：
+                // 做一次全量 resync，订阅保持有效（低记忆体路由器开机期容易发生）
                 let ifindex_changed = if events
                     .iter()
                     .any(|e| matches!(e, netlink::link::LinkEvent::Resync))
@@ -945,16 +995,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = ticker.tick() => {
                 tick_count += 1;
 
-                // 0) 收集 worker 的操作結果。失敗不再只是「印一行 error 就永久停留」：
-                //    這裡把它標成 dirty，下個 tick 重下同一份期望狀態（Apply 是冪等的）。
+                // 0) 收集 worker 的操作结果。失败不再只是「印一行 error 就永久停留」：
+                //    这里把它标成 dirty，下个 tick 重下同一份期望状态（Apply 是幂等的）。
                 while let Ok(outcome) = netlink_rx.try_recv() {
                     match outcome.op {
                         NetlinkOp::Ipv4Routes => {
                             v4_apply_inflight = false;
                             if !outcome.ok {
-                                // 去重告警：同一個錯誤只報一次（之後每 20 次提醒一次），
-                                // 避免永久失敗時以每 2 秒一條的速度把 logd 環形緩衝沖掉，
-                                // 反而蓋掉真正有用的訊息
+                                // 去重告警：同一个错误只报一次（之后每 20 次提醒一次），
+                                // 避免永久失败时以每 2 秒一条的速度把 logd 环形缓冲冲掉，
+                                // 反而盖掉真正有用的讯息
                                 let detail = outcome.detail.unwrap_or_else(|| "unknown".into());
                                 route_fail_count += 1;
                                 if last_route_fail.as_deref() != Some(detail.as_str())
@@ -996,7 +1046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         NetlinkOp::Ipv6Routes => {
-                            // IPv6 的期望狀態會在心跳或集合變動時一起重送
+                            // IPv6 的期望状态会在心跳或集合变动时一起重送
                             if !outcome.ok {
                                 debug!("IPv6 FIB update failed; it will be re-applied with the next heartbeat");
                             }
@@ -1004,7 +1054,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         NetlinkOp::ProbePaths => {
                             probe_paths_inflight = false;
                             if !outcome.ok {
-                                // 網卡暫時不可用屬預期情況（設備已 down），退避後再試
+                                // 网卡暂时不可用属预期情况（设备已 down），退避后再试
                                 probe_paths_dirty = true;
                                 probe_paths_retry_at = tick_count + 6;
                             }
@@ -1023,8 +1073,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     last_conntrack_fail = Some(detail);
                                 }
-                                // 失敗的 flush 不能算「本次 DOWN 已清」：把仍在 DOWN 的線
-                                // 重設，靜默期與限流過後會再送一次（清理本身冪等）。
+                                // 失败的 flush 不能算「本次 DOWN 已清」：把仍在 DOWN 的线
+                                // 重设，静默期与限流过后会再送一次（清理本身幂等）。
                                 for monitor in monitors.iter_mut() {
                                     if monitor.down_since.is_some() {
                                         monitor.flushed_while_down = false;
@@ -1038,7 +1088,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         NetlinkOp::Policies => {
                             policies_inflight = false;
                             if !outcome.ok {
-                                // 保留舊簽章不動：下個週期會重送同一份期望狀態
+                                // 保留旧签章不动：下个周期会重送同一份期望状态
                                 policies_dirty = true;
                                 policies_retry_at = tick_count + 6;
                             }
@@ -1046,8 +1096,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // worker 若意外結束，try_recv 只回 Disconnected，上面的 while let 直接跳出
-                // 且不會有任何告警——inflight 旗標會永遠卡住，看起來像「一直在等下發」。
+                // worker 若意外结束，try_recv 只回 Disconnected，上面的 while let 直接跳出
+                // 且不会有任何告警——inflight 旗标会永远卡住，看起来像「一直在等下发」。
                 if !netlink_worker_gone
                     && matches!(
                         netlink_rx.try_recv(),
@@ -1061,7 +1111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // 0b) link watcher 若曾失效，這裡嘗試重新訂閱（不必等 5 分鐘輪詢）
+                // 0b) link watcher 若曾失效，这里尝试重新订阅（不必等 5 分钟轮询）
                 if !link_watch_active(&link_watch) && tick_count >= link_watch_retry_at {
                     link_watch = install_link_watcher();
                     if link_watch_active(&link_watch) {
@@ -1071,7 +1121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 上一個 tick 的 IPv6 路由更新若因佇列滿而未入隊，這裡補送
+                // 上一个 tick 的 IPv6 路由更新若因伫列满而未入队，这里补送
                 if let Some(pending) = v6_pending.take() {
                     match netlink_tx.try_send(NetlinkCmd::ApplyV6(pending)) {
                         Ok(()) => {}
@@ -1087,30 +1137,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 並行探測所有 WAN 接口（直接借用 monitors，不再每個 tick clone 一份）
+                // 并行探测所有 WAN 接口（直接借用 monitors，不再每个 tick clone 一份）
                 let mut probe_futs = Vec::with_capacity(monitors.len());
                 for monitor in monitors.iter() {
+                    // 上一拍失败的线视为「疑似故障」：把该线的所有探针目标同时发出，
+                    // 否则「先等主目标超时、再探其余目标」会让整拍花 2 × timeout
+                    // （预设 800ms > 500ms 周期），判 DOWN 与恢复都要多花近一倍时间。
                     probe_futs.push(prober::probe_interface(
                         &monitor.ifname,
                         &monitor.targets,
                         probe_timeout,
                         monitor.preferred_target,
+                        monitor.lqe.consecutive_timeouts > 0,
                     ));
                 }
                 let samples = futures_util::future::join_all(probe_futs).await;
                 let mut state_changed = false;
-                // 本 tick 內需要清理 conntrack 的網卡（以 monitors 下標記錄）。
-                // bool = 是否來自 flush-on-down：只有這種來源才需要在「成功入隊之後」
-                // 標記 `flushed_while_down`（flush-on-switch 時線路仍是 UP，沒有這回事）。
-                // 統一延後到路由下發之後才入隊：conntrack 全表 dump 可達數秒，
-                // 排在 Apply 前面（同一 worker 執行緒 FIFO）會拖慢故障切換的實際收斂。
+                // 本 tick 内需要清理 conntrack 的网卡（以 monitors 下标记录）。
+                // bool = 是否来自 flush-on-down：只有这种来源才需要在「成功入队之后」
+                // 标记 `flushed_while_down`（flush-on-switch 时线路仍是 UP，没有这回事）。
+                // 统一延后到路由下发之后才入队：conntrack 全表 dump 可达数秒，
+                // 排在 Apply 前面（同一 worker 执行绪 FIFO）会拖慢故障切换的实际收敛。
                 let mut flush_pending: Vec<(usize, bool)> = Vec::new();
 
-                // 餵入樣本更新各鏈路 LQE 狀態機
+                // 喂入样本更新各链路 LQE 状态机
                 for (monitor, sample) in monitors.iter_mut().zip(samples.into_iter()) {
-                    // 探通的目標成為下個週期的主目標：健康時每週期只發一條探針。
-                    // 某個目標被過濾時，它先失敗一次，之後由探通的那個接手，不會每週期
-                    // 都白吃一次超時；直到接手的主目標也失敗才會再回退到它。
+                    // 探通的目标成为下个周期的主目标：健康时每周期只发一条探针。
+                    // 某个目标被过滤时，它先失败一次，之后由探通的那个接手，不会每周期
+                    // 都白吃一次超时；直到接手的主目标也失败才会再回退到它。
                     if sample.success {
                         if let Some(idx) = monitor.targets.iter().position(|t| *t == sample.target) {
                             monitor.preferred_target = idx;
@@ -1120,12 +1174,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (new_state, changed) = monitor.lqe.update(&sample);
                     if changed {
                         state_changed = true;
-                        // 狀態切換時順勢刷新快取的 IP
+                        // 状态切换时顺势刷新快取的 IP
                         monitor.refresh_cached_ip();
 
-                        // 只記錄「何時進入 DOWN」（以及恢復時重置），
-                        // 真正的 conntrack 清理延後到確認這不是短暫抖動之後，
-                        // 見下方「抖動保護」排程處的說明。
+                        // 只记录「何时进入 DOWN」（以及恢复时重置），
+                        // 真正的 conntrack 清理延后到确认这不是短暂抖动之后，
+                        // 见下方「抖动保护」排程处的说明。
                         match new_state {
                             LinkState::Down => {
                                 let now = Instant::now();
@@ -1139,8 +1193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // 記錄最近一次失敗原因：這是現場區分「線路真的丟包」與
-                    // 「本機沒有路由／設備名錯誤」的唯一線索，必須進狀態檔。
+                    // 记录最近一次失败原因：这是现场区分「线路真的丢包」与
+                    // 「本机没有路由／设备名错误」的唯一线索，必须进状态档。
                     match sample.error_msg.as_deref() {
                         Some(msg) => {
                             let is_local = sample.error_kind == Some(prober::ProbeErrorKind::Local);
@@ -1160,9 +1214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             monitor.last_probe_error = Some(msg.to_string());
 
-                            // 「設備 UP 但沒有經它的路」時內核會按 on-link 送出，探針只會超時——
-                            // 這與真正的丟包在日誌上長得一模一樣。連續失敗時主動問一次內核，
-                            // 把這種情況標成 local_condition（每張網卡最多每 2 秒查一次）。
+                            // 「设备 UP 但没有经它的路」时内核会按 on-link 送出，探针只会超时——
+                            // 这与真正的丢包在日志上长得一模一样。连续失败时主动问一次内核，
+                            // 把这种情况标成 local_condition（每张网卡最多每 2 秒查一次）。
                             let due = monitor
                                 .last_path_check
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
@@ -1204,7 +1258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 啟動時解析不到 ifindex 的網卡，一旦可用就立刻補上（不必等輪詢）
+                // 启动时解析不到 ifindex 的网卡，一旦可用就立刻补上（不必等轮询）
                 for monitor in monitors.iter_mut() {
                     if monitor.ifindex == 0 && refresh_ifindex(monitor, "retry after startup") {
                         info!(
@@ -1215,40 +1269,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 後備輪詢：只在沒訂閱到核心事件時才需要每 5 分鐘兜一次
+                // 后备轮询：只在没订阅到核心事件时才需要每 5 分钟兜一次
                 if tick_count % IFINDEX_REFRESH_TICKS == 0
                     && refresh_interface_state(&mut monitors, "periodic refresh")
                 {
                     probe_paths_dirty = true;
                 }
 
-                // 依據 Metric 優先級挑選當前生效的網卡群：
-                // 1. 若存活網卡 Metric 相同（例如皆為預設 10），全部加入 Multipath ECMP 做分流
-                //    （按 flow 哈希，多並行連線的總吞吐可疊加）
-                // 2. 若存活網卡 Metric 不同，僅挑選 Metric 數值最小（優先級最高）的存活網卡下發為預設路由（完全主備容災）
+                // 依据 Metric 优先级挑选当前生效的网卡群：
+                // 1. 若存活网卡 Metric 相同（例如皆为预设 10），全部加入 Multipath ECMP 做分流
+                //    （按 flow 哈希，多并行连线的总吞吐可叠加）
+                // 2. 若存活网卡 Metric 不同，仅挑选 Metric 数值最小（优先级最高）的存活网卡下发为预设路由（完全主备容灾）
                 let min_up_metric = monitors
                     .iter()
                     .filter(|m| m.lqe.state == LinkState::Up && m.ifindex != 0)
                     .map(|m| m.metric)
                     .min();
 
-                // 「Up 且 metric 最小」= 尚未計入降級前的承載資格。
-                // ⚠️ 探針主表 /32 的 wants_it（下方 probe-path 決策）必須用這個，
-                // **不能**用 is_active：那裡的 `!active` 語意是「這條線當前不承載流量」，
-                // 而降級的線只是被移出 ECMP（仍在探測、仍是 Up 且 metric 最小），
-                // 不該被當成「非活躍線」去搶主表 /32。
+                // 「Up 且 metric 最小」= 尚未计入降级前的承载资格。
+                // ⚠️ 探针主表 /32 的 wants_it（下方 probe-path 决策）必须用这个，
+                // **不能**用 is_active：那里的 `!active` 语意是「这条线当前不承载流量」，
+                // 而降级的线只是被移出 ECMP（仍在探测、仍是 Up 且 metric 最小），
+                // 不该被当成「非活跃线」去抢主表 /32。
                 let up_primary = |m: &WanMonitor| {
                     m.lqe.state == LinkState::Up && m.ifindex != 0 && Some(m.metric) == min_up_metric
                 };
 
-                // 基於實測品質的降級：窗口已滿且丟包率達到 degrade_loss_threshold 的線
-                // 不參與 ECMP（但仍繼續探測，品質恢復後自動回歸）。
-                // 舊行為只看「有沒有判 DOWN」，於是 20%~50% 丟包的線照樣吃一半流量。
+                // 基于实测品质的降级：窗口已满且丢包率达到 degrade_loss_threshold 的线
+                // 不参与 ECMP（但仍继续探测，品质恢复后自动回归）。
+                // 旧行为只看「有没有判 DOWN」，于是 20%~50% 丢包的线照样吃一半流量。
                 let any_undegraded = monitors
                     .iter()
                     .any(|m| up_primary(m) && !m.lqe.is_degraded());
-                // 保底：全部降級時不能一條都不承載（否則會完全沒有預設路由），
-                // 在「Up 且 metric 最小」的線裡取設定順序最前面的那條。
+                // 保底：全部降级时不能一条都不承载（否则会完全没有预设路由），
+                // 在「Up 且 metric 最小」的线里取设定顺序最前面的那条。
                 let degrade_fallback_slot = if any_undegraded {
                     None
                 } else {
@@ -1280,37 +1334,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     up_primary(m) && (!m.lqe.is_degraded() || degrade_fallback_slot == Some(slot))
                 };
 
-                // 取樣各 WAN 的即時速率（狀態檔 / LuCI 顯示用，也讓分流效果可驗證）
+                // 取样各 WAN 的即时速率（状态档 / LuCI 显示用，也让分流效果可验证）
                 let stats_now = Instant::now();
                 for monitor in monitors.iter_mut() {
                     sample_interface_rates(monitor, stats_now);
                 }
 
-                // 動態權重：`weight_mode = quality`（依 LQE 品質）與 `load_aware`
-                // （依實測速率 vs 容量）可獨立或疊加。更新有限速——每次變更都會重下
-                // ECMP 路由，內核可能重算 multipath hash，過度頻繁會反覆打斷既有 flow。
-                // 品質差到門檻的線仍由降級/DOWN 機制移出。
-                // 容量比例分流（有 max_mbps）本身也是動態下發的一部分：
-                // 基準權重由 weight 換成 ∝ max_mbps，必須走同一條重下路徑。
+                // 动态权重：`weight_mode = quality`（依 LQE 品质）与 `load_aware`
+                // （依实测速率 vs 容量）可独立或叠加。更新有限速——每次变更都会重下
+                // ECMP 路由，内核可能重算 multipath hash，过度频繁会反复打断既有 flow。
+                // 品质差到门槛的线仍由降级/DOWN 机制移出。
+                // 容量比例分流（有 max_mbps）本身也是动态下发的一部分：
+                // 基准权重由 weight 换成 ∝ max_mbps，必须走同一条重下路径。
                 let dynamic_weights_on = config.weight_mode == WeightMode::Quality
                     || config.load_aware
                     || config.capacity_weights_on();
-                if dynamic_weights_on && last_weight_update.elapsed() >= dynamic_weight_interval {
-                    let active_flags: Vec<bool> = monitors
-                        .iter()
-                        .enumerate()
-                        .map(|(slot, m)| is_active(slot, m))
-                        .collect();
-                    if config.load_aware {
-                        update_load_pressure(
-                            &mut monitors,
-                            &active_flags,
-                            config.load_target_ratio,
-                            config.load_recover_ratio,
-                        );
-                    }
-                    let new_weights =
-                        compute_dynamic_weights(&monitors, |slot, _| active_flags[slot], &config);
+                // 动态因子（quality / load_aware）只在「不是 standard ECMP」或使用者明确
+                // 覆写时才生效：standard 模式底下的每一次权重变更都会重算整张 multipath
+                // hash，把 24%~39% 的**既有**连线改送到另一条 WAN（NAT 源 IP 跟著换 →
+                // 对端 RST/大量重传），而它无法把已建立的大流量搬走，净效果是「打断连线
+                // 却换不到分流」。实测（2026-09，使用者路由器）quality+load_aware+standard
+                // 让 wg 权重每 10~20 秒在 1 与 4 之间跳动，期间使用者持续回报卡顿。
+                let dynamic_factors_on = dynamic_factors_allowed(&config, kernel_resilient);
+                // 只在「已经知道内核实际装的是 standard」之后才告警。
+                // 为什么必须等回报：worker 的变体回报要等第一次下发才有，而闸门在开机第一拍
+                // 只能保守当成 standard——否则会在**支援 resilient 的机器上**（ecmp_mode:
+                // auto）印出「dynamic weight factors are IGNORED」，使用者照提示去改设定
+                // 才发现早就设好了（实机 2026-09 踩到）。
+                if dynamic_weights_on
+                    && !dynamic_factors_on
+                    && kernel_variant_known
+                    && !dynamic_factor_gate_warned
+                    && (config.weight_mode == WeightMode::Quality || config.load_aware)
+                {
+                    dynamic_factor_gate_warned = true;
+                    let remedy = if config.ecmp_mode == EcmpMode::Standard {
+                        "Use ecmp_mode: resilient (or auto) to make weight changes safe, or set \
+                         allow_dynamic_weights_on_standard: true to override this guard."
+                    } else {
+                        "ecmp_mode is 'auto'/'resilient' but this kernel has no usable nexthop \
+                         object support (auto falls back to standard), so the guard stays on; \
+                         set allow_dynamic_weights_on_standard: true only if you accept the \
+                         rehash cost above."
+                    };
+                    warn!(
+                        "weight_mode/load_aware is configured but the installed ECMP variant is \
+                         'standard': dynamic weight factors are IGNORED (keep only the static \
+                         weight / max_mbps ratio). In standard mode every weight change recomputes \
+                         the whole multipath hash and re-homes 24%~39% of *established* connections \
+                         (their NAT source IP changes -> RST / heavy retransmits), while it cannot \
+                         move the established flows that caused the imbalance. {remedy}"
+                    );
+                }
+                // 负载压力的 Schmitt 触发器每拍都要更新：它纯粹是记忆体状态（不写内核），
+                // 而「某条线刚开始吃满 / 刚解除」这个转换点必须被立刻看到——
+                // 旧版把它夹在 10 秒限速里，于是过载发生后的头 10 秒新连线照样往那条线丢，
+                // 视频就是在这段时间里开始缓冲。
+                let active_flags: Vec<bool> = monitors
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, m)| is_active(slot, m))
+                    .collect();
+                let pressure_transition = if dynamic_weights_on
+                    && config.load_aware
+                    && dynamic_factors_on
+                {
+                    update_load_pressure(
+                        &mut monitors,
+                        &active_flags,
+                        config.load_target_ratio,
+                        config.load_recover_ratio,
+                    )
+                } else {
+                    false
+                };
+                if dynamic_weights_on
+                    && weight_update_due(
+                        last_weight_update.elapsed(),
+                        dynamic_weight_interval,
+                        pressure_transition,
+                        WEIGHT_UPDATE_MIN_SPACING,
+                    )
+                {
+                    let new_weights = compute_dynamic_weights(
+                        &monitors,
+                        |slot, _| active_flags[slot],
+                        &config,
+                        dynamic_factors_on,
+                    );
                     let changed = monitors
                         .iter()
                         .enumerate()
@@ -1328,10 +1439,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .collect();
                         info!(
-                            "Dynamic ECMP weights updated (quality={}, load={}, capacity={}): {}",
+                            "Dynamic ECMP weights updated (quality={}, load={}, capacity={}, \
+                             load-transition={}): {}",
                             config.weight_mode == WeightMode::Quality,
                             config.load_aware,
                             config.capacity_weights_on(),
+                            pressure_transition,
                             desc.join(" ")
                         );
                         for (slot, monitor) in monitors.iter_mut().enumerate() {
@@ -1342,15 +1455,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     last_weight_update = Instant::now();
                 }
 
-                // 無分配的快速比較：多數 tick 存活集合其實沒變，
-                // 先用迭代直接比對，只有真的變了才構建路由描述並入隊。
+                // 无分配的快速比较：多数 tick 存活集合其实没变，
+                // 先用迭代直接比对，只有真的变了才构建路由描述并入队。
                 let active_count = monitors
                     .iter()
                     .enumerate()
                     .filter(|(slot, m)| is_active(*slot, m))
                     .count();
                 let set_unchanged = match &last_active_ifindexes {
-                    // 尚未下發過任何路由：沒有存活線路時維持「不做」（不刪除既有路由）
+                    // 尚未下发过任何路由：没有存活线路时维持「不做」（不删除既有路由）
                     None => active_count == 0,
                     Some(prev) => {
                         prev.len() == active_count
@@ -1363,14 +1476,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                // 只有在指令真的進佇列時才更新 last_active_ifindexes。
-                // 若佇列滿了就丟棄（worker 可能卡在 conntrack dump），
-                // 保留舊值讓下一個 tick 重試，否則路由會永久停留在錯誤狀態。
+                // 只有在指令真的进伫列时才更新 last_active_ifindexes。
+                // 若伫列满了就丢弃（worker 可能卡在 conntrack dump），
+                // 保留旧值让下一个 tick 重试，否则路由会永久停留在错误状态。
                 //
-                // need_apply 除了「集合真的變了」以外，還包含三種自我修復：
-                //   * weights_dirty：動態權重剛更新；
-                //   * v4_apply_dirty：worker 回報內核拒絕（EINVAL/ENODEV…）後重下；
-                //   * 心跳：集合沒變也定期重下，修復被別的程序／內核事件改掉的路由。
+                // need_apply 除了「集合真的变了」以外，还包含三种自我修复：
+                //   * weights_dirty：动态权重刚更新；
+                //   * v4_apply_dirty：worker 回报内核拒绝（EINVAL/ENODEV…）后重下；
+                //   * 心跳：集合没变也定期重下，修复被别的程序／内核事件改掉的路由。
                 let route_heartbeat =
                     tick_count % ROUTE_HEARTBEAT_TICKS == 0 && last_active_ifindexes.is_some();
                 let need_apply = (!set_unchanged
@@ -1393,13 +1506,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             new_set
                         );
                     } else {
+                        // 只印 `[3, 11] -> [3]` 完全看不出「为什么少了一条」：降级、
+                        // 判 DOWN、ifindex 解析失败都长得一样。把每条线的状态与
+                        // 「是否在集合内 / 是否降级」一起写出来，排障才不用猜。
+                        let detail: Vec<String> = monitors
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, m)| {
+                                format!(
+                                    "{}#{}:{}{}{}",
+                                    m.ifname,
+                                    m.ifindex,
+                                    m.lqe.state,
+                                    if is_active(slot, m) {
+                                        " in"
+                                    } else {
+                                        " out"
+                                    },
+                                    if m.lqe.is_degraded() { " degraded" } else { "" }
+                                )
+                            })
+                            .collect();
                         info!(
-                            "Active WAN set changed: {:?} -> {:?}",
-                            last_active_ifindexes, new_set
+                            "Active WAN set changed: {:?} -> {:?} [{}]",
+                            last_active_ifindexes,
+                            new_set,
+                            detail.join(" | ")
                         );
                     }
-                    // 存活集合一變，「哪些線需要主表 /32」也跟著變（見探針路徑那一段），
-                    // 這裡標記重下，否則 /32 會停留在不該留的時候
+                    // 存活集合一变，「哪些线需要主表 /32」也跟著变（见探针路径那一段），
+                    // 这里标记重下，否则 /32 会停留在不该留的时候
                     probe_paths_dirty = true;
 
                     let current_active: Vec<ActiveWanRoute> = monitors
@@ -1416,8 +1552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
 
-                    // 只有設定了 gateway6 的網卡才會產生 IPv6 nexthop；
-                    // IPv6 路由跟隨同一個 IPv4 健康狀態（同一條實體鏈路）
+                    // 只有设定了 gateway6 的网卡才会产生 IPv6 nexthop；
+                    // IPv6 路由跟随同一个 IPv4 健康状态（同一条实体链路）
                     let current_active_v6: Vec<ActiveWanRouteV6> = if has_ipv6 {
                         monitors
                             .iter()
@@ -1440,31 +1576,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             v4_apply_dirty = false;
                             weights_dirty = false;
 
-                            // ECMP 的 nexthop 集合一變，核心就會重算 multipath hash，
-                            // 既有連線可能被改送到另一條 WAN（源 IP 變了）而卡死，
-                            // 所以「成員新進入存活集合」時要清一次 conntrack，
-                            // 而不只是該線自己判 DOWN 的時候。開機首次下發不算切換，跳過。
+                            // ECMP 的 nexthop 集合一变，核心就会重算 multipath hash，
+                            // 既有连线可能被改送到另一条 WAN（源 IP 变了）而卡死，
+                            // 所以「成员新进入存活集合」时要清一次 conntrack，
+                            // 而不只是该线自己判 DOWN 的时候。开机首次下发不算切换，跳过。
                             //
-                            // 清理名單只包含「新進入存活集合」的成員：
+                            // 清理名单只包含「新进入存活集合」的成员：
                             //   `is_active(m) && !prev.contains(&m.ifindex)`
-                            // 為什麼不再連坐其他存活成員——修復前的條件是
+                            // 为什么不再连坐其他存活成员——修复前的条件是
                             // `is_active(m) && (multipath_involved || !prev.contains(&m.ifindex))`，
                             // 而 `multipath_involved = prev.len() > 1 || new_set.len() > 1`
-                            // 在雙線 ECMP 下**恆為真**，於是只要成員集合一變，所有存活成員
-                            // （包含一直健康的那條）都被列入清理名單；而清理本身是按 WAN IP
-                            // 匹配 ORIG/REPLY（conntrack.rs），列進名單等於清掉該線全部連線。
-                            // 實測日誌：
+                            // 在双线 ECMP 下**恒为真**，于是只要成员集合一变，所有存活成员
+                            // （包含一直健康的那条）都被列入清理名单；而清理本身是按 WAN IP
+                            // 匹配 ORIG/REPLY（conntrack.rs），列进名单等于清掉该线全部连线。
+                            // 实测日志：
                             //   [INFO ] [Conntrack] Flushing active conntrack sessions for wan1 ...
                             //   [INFO ] [Conntrack] Flushing active conntrack sessions for wan0, wan1 ...
-                            // 只有 wan1 健康卻被清、恢復瞬間兩條都清 → NAT 後的連線被 RST，
-                            // 使用者看到的就是「網站打不開、連線斷掉」。
+                            // 只有 wan1 健康却被清、恢复瞬间两条都清 → NAT 后的连线被 RST，
+                            // 使用者看到的就是「网站打不开、连线断掉」。
                             //
-                            // 離開集合的成員本來就不在 is_active 裡，由 flush-on-down 的
-                            // 25 秒靜默路徑（CONNTRACK_FLUSH_DOWN_QUIET）負責清理。
+                            // 离开集合的成员本来就不在 is_active 里，由 flush-on-down 的
+                            // 25 秒静默路径（CONNTRACK_FLUSH_DOWN_QUIET）负责清理。
                             //
-                            // flush-on-switch 是否生效由「實際安裝變體」決定（FIX-8）：
-                            // resilient 只重映射故障成員的 bucket，清 conntrack 反而
-                            // 會親手打斷被保留的連線，所以只有 standard 才清。
+                            // flush-on-switch 是否生效由「实际安装变体」决定（FIX-8）：
+                            // resilient 只重映射故障成员的 bucket，清 conntrack 反而
+                            // 会亲手打断被保留的连线，所以只有 standard 才清。
                             let flush_on_switch =
                                 config.flush_conntrack_on_switch && !kernel_resilient;
                             if !set_unchanged && flush_on_switch && last_active_ifindexes.is_some() {
@@ -1477,10 +1613,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .filter(|(slot, m)| {
                                             is_active(*slot, m)
                                                 && !prev.contains(&m.ifindex)
-                                                // 剛從 DOWN 回來的線還在抖動靜默期：
-                                                // flush-on-switch 若在此時清它，等於繞過
-                                                // 25 秒保護，把「其實還活著」的連線砍掉
-                                                // （README 承諾「期間若恢復就不清」）。
+                                                // 刚从 DOWN 回来的线还在抖动静默期：
+                                                // flush-on-switch 若在此时清它，等于绕过
+                                                // 25 秒保护，把「其实还活著」的连线砍掉
+                                                // （README 承诺「期间若恢复就不清」）。
                                                 && !m.last_down_at.is_some_and(|t| {
                                                     t.elapsed() < CONNTRACK_FLUSH_DOWN_QUIET
                                                 })
@@ -1497,8 +1633,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Err(err) => {
                                         let err_desc = err.to_string();
-                                        // try_send 失敗時指令會原樣退回，暫存待下個 tick 重試，
-                                        // 否則 v6 更新會隨 need_apply 變回 false 而永久丟失
+                                        // try_send 失败时指令会原样退回，暂存待下个 tick 重试，
+                                        // 否则 v6 更新会随 need_apply 变回 false 而永久丢失
                                         if let std::sync::mpsc::TrySendError::Full(
                                             NetlinkCmd::ApplyV6(v6),
                                         )
@@ -1523,55 +1659,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 探針路徑（每張 WAN 一張獨立表 + `oif <wan>` 規則）：讓探針完全不依賴
-                // 主表那條預設路由。這是「停線→恢復」不再自鎖的結構性保證。
-                // 觸發時機：開機、ifindex 變動、上次失敗、每 30 秒定期校驗。
+                // 探针路径（每张 WAN 一张独立表 + `oif <wan>` 规则）：让探针完全不依赖
+                // 主表那条预设路由。这是「停线→恢复」不再自锁的结构性保证。
+                // 触发时机：开机、ifindex 变动、上次失败、每 30 秒定期校验。
                 if tick_count % PROBE_PATH_REFRESH_TICKS == 0 {
                     probe_paths_dirty = true;
                 }
                 if probe_paths_dirty && !probe_paths_inflight && tick_count >= probe_paths_retry_at {
-                    // 「主表有沒有預設路由」是這一切的關鍵判斷，必須問內核，而且問的必須是
-                    // **預設路由**（含我們自己下發的那條）——不能問「有沒有到目標的路」：
-                    // 我們自己補的探針 /32 也是「到目標的路」，會形成自我參照
-                    // （補了 → 認為已涵蓋 → 決定不補 → 把剛補的刪掉 → 又沒涵蓋 → 再補），
-                    // 實測會變成裝/刪各 13 次的振盪，那條線永遠累積不到恢復所需的連續成功。
+                    // 「主表有没有预设路由」是这一切的关键判断，必须问内核，而且问的必须是
+                    // **预设路由**（含我们自己下发的那条）——不能问「有没有到目标的路」：
+                    // 我们自己补的探针 /32 也是「到目标的路」，会形成自我参照
+                    // （补了 → 认为已涵盖 → 决定不补 → 把刚补的删掉 → 又没涵盖 → 再补），
+                    // 实测会变成装/删各 13 次的振荡，那条线永远累积不到恢复所需的连续成功。
                     let main_has_default = match query_mgr
                         .as_mut()
                         .map(|q| q.has_main_default_route(AF_INET))
                     {
                         Some(Ok(has)) => has,
                         Some(Err(e)) => {
-                            // 查不到時偏向「沒有」：多補一條 /32 只是短暫影響該目標的轉發，
-                            // 而不補則可能讓線路永遠回不來（原本的 bug）
+                            // 查不到时偏向「没有」：多补一条 /32 只是短暂影响该目标的转发，
+                            // 而不补则可能让线路永远回不来（原本的 bug）
                             debug!("default-route query failed ({e}); assuming there is none");
                             false
                         }
                         None => false,
                     };
 
-                    // 1) 先算每條線「想不想要」主表 /32
+                    // 1) 先算每条线「想不想要」主表 /32
                     let mut wants: Vec<(usize, u32, bool, bool, bool, bool, bool)> = Vec::new();
                     for (slot, m) in monitors.iter().enumerate() {
                         if m.ifindex == 0 {
                             continue;
                         }
-                        // 「承載中」= Up 且 metric 最小，**不排除降級的線**。
+                        // 「承载中」= Up 且 metric 最小，**不排除降级的线**。
                         //
-                        // ⚠️ 這裡刻意不用 is_active：這個 `!active` 的語意是「這條線當前
-                        // 不承載流量 → 需要主表 /32 才收得到回程」。降級的線只是被移出
-                        // ECMP，它仍在探測、仍是 Up 且 metric 最小；若把它算成「非活躍線」，
-                        // 它就會以「想補 /32」的身分去跟真正承載的線搶同一個目標的 /32
-                        // （owner_of 只挑一個擁有者），反而讓承載中的線拿不到回程路徑。
+                        // ⚠️ 这里刻意不用 is_active：这个 `!active` 的语意是「这条线当前
+                        // 不承载流量 → 需要主表 /32 才收得到回程」。降级的线只是被移出
+                        // ECMP，它仍在探测、仍是 Up 且 metric 最小；若把它算成「非活跃线」，
+                        // 它就会以「想补 /32」的身分去跟真正承载的线抢同一个目标的 /32
+                        // （owner_of 只挑一个拥有者），反而让承载中的线拿不到回程路径。
                         let primary = up_primary(m);
                         let strict = effective_rp_filter(&m.ifname) == 1;
                         let shared = monitors.iter().any(|o| {
                             o.ifname != m.ifname && o.targets.iter().any(|t| m.targets.contains(t))
                         });
-                        // 活躍線走主表那條預設路由，反向檢查自然過，不需要補
+                        // 活跃线走主表那条预设路由，反向检查自然过，不需要补
                         let wants_it = !primary && (!main_has_default || (strict && !shared));
-                        // 「這條線能不能真的用」——用內核查詢判斷（綁定該設備時到目標有沒有路），
-                        // 比看 sysfs 可靠（netns/精簡系統不一定有 /sys/class/net）：
-                        // 設備已 down 時內核會回「沒有路」，我們就不該把唯一的 /32 給它。
+                        // 「这条线能不能真的用」——用内核查询判断（绑定该设备时到目标有没有路），
+                        // 比看 sysfs 可靠（netns/精简系统不一定有 /sys/class/net）：
+                        // 设备已 down 时内核会回「没有路」，我们就不该把唯一的 /32 给它。
                         let usable = match m.targets.iter().find_map(|t| match t.ip() {
                             std::net::IpAddr::V4(v4) => Some(v4),
                             std::net::IpAddr::V6(_) => None,
@@ -1586,10 +1722,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wants.push((slot, m.metric, primary, strict, shared, wants_it, usable));
                     }
 
-                    // 2) 同一個目標只能有一個擁有者（主表同一前綴只有一條路由）：
-                    //    在「想補」的線裡挑選，**優先挑設備真的可用的**（否則會把機會浪費在
-                    //    已經 down 的線上，另一條拿不到回程路徑 → 兩條一起掉），同群再取
-                    //    metric 最小者，讓主線優先被監測而不是取決於設定順序或競速。
+                    // 2) 同一个目标只能有一个拥有者（主表同一前缀只有一条路由）：
+                    //    在「想补」的线里挑选，**优先挑设备真的可用的**（否则会把机会浪费在
+                    //    已经 down 的线上，另一条拿不到回程路径 → 两条一起掉），同群再取
+                    //    metric 最小者，让主线优先被监测而不是取决于设定顺序或竞速。
                     let owner_of = |target: &std::net::SocketAddr| -> Option<usize> {
                         let mut pool: Vec<(usize, u32, bool)> = Vec::new();
                         for (slot, m) in monitors.iter().enumerate() {
@@ -1705,9 +1841,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 策略分流規則（from/to + 各 WAN 獨立表）：目標 WAN DOWN 時整條政策
-                // 從期望集合移除（流量回退 ECMP），恢復後自動回來；定期心跳重下，
-                // 修復被外部刪掉的規則（`set_policy_rules` 內部做差異比對）。
+                // 策略分流规则（from/to + 各 WAN 独立表）：目标 WAN DOWN 时整条政策
+                // 从期望集合移除（流量回退 ECMP），恢复后自动回来；定期心跳重下，
+                // 修复被外部删掉的规则（`set_policy_rules` 内部做差异比对）。
                 if tick_count % PROBE_PATH_REFRESH_TICKS == 0 {
                     policies_dirty = true;
                 }
@@ -1735,14 +1871,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 路由下發之後才排程 conntrack 清理：多張網卡合併為一條指令、
-                // worker 只掃一次全表。每網卡限流在這裡檢查，入隊成功才更新時間戳。
+                // 路由下发之后才排程 conntrack 清理：多张网卡合并为一条指令、
+                // worker 只扫一次全表。每网卡限流在这里检查，入队成功才更新时间戳。
                 //
-                // 抖動保護（重要）：線路剛被判 DOWN 就清 conntrack，會把該線路上「其實還活著」
-                // 的連線一次全砍掉。實測隧道抖動觸發一次 DOWN 就砍了 495 條，使用者直接看到
-                // 「網站打不開、連線斷掉」，而幾秒後線路自己就恢復了。
-                // 因此這裡改成：DOWN 之後再等 CONNTRACK_FLUSH_DOWN_QUIET，確認它「持續」
-                // 不可用才清；期間若恢復（抖動），連線就保住了，代價只是晚幾秒切換。
+                // 抖动保护（重要）：线路刚被判 DOWN 就清 conntrack，会把该线路上「其实还活著」
+                // 的连线一次全砍掉。实测隧道抖动触发一次 DOWN 就砍了 495 条，使用者直接看到
+                // 「网站打不开、连线断掉」，而几秒后线路自己就恢复了。
+                // 因此这里改成：DOWN 之后再等 CONNTRACK_FLUSH_DOWN_QUIET，确认它「持续」
+                // 不可用才清；期间若恢复（抖动），连线就保住了，代价只是晚几秒切换。
                 if config.flush_conntrack_on_down {
                     let now = Instant::now();
                     for (idx, monitor) in monitors.iter().enumerate() {
@@ -1751,13 +1887,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if let Some(since) = monitor.down_since {
                             if now.duration_since(since) >= CONNTRACK_FLUSH_DOWN_QUIET {
-                                // ⚠️ 這裡只收集，**不**先標記 `flushed_while_down`：
-                                // 下面還有 `conntrack_flush_min_interval` 限流，被跳過的線
-                                // 若已經標記，下個 tick 開頭就會被上面的
-                                // `if monitor.flushed_while_down { continue; }` 略過
-                                // → 整段 DOWN 期間再也不會嘗試清理（只有下次 UP→DOWN 才重置），
-                                // 這次 DOWN 的 flush 就永久丟失了。
-                                // 置位一律延後到真正入隊成功之後（見 flush_conntrack）。
+                                // ⚠️ 这里只收集，**不**先标记 `flushed_while_down`：
+                                // 下面还有 `conntrack_flush_min_interval` 限流，被跳过的线
+                                // 若已经标记，下个 tick 开头就会被上面的
+                                // `if monitor.flushed_while_down { continue; }` 略过
+                                // → 整段 DOWN 期间再也不会尝试清理（只有下次 UP→DOWN 才重置），
+                                // 这次 DOWN 的 flush 就永久丢失了。
+                                // 置位一律延后到真正入队成功之后（见 flush_conntrack）。
                                 flush_pending.push((idx, true));
                             }
                         }
@@ -1774,7 +1910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // 每 2 個週期（約 1 秒）或狀態變更時，原子更新 /tmp/mwan4_status.json 提供給 LuCI 即時讀取
+                // 每 2 个周期（约 1 秒）或状态变更时，原子更新 /tmp/mwan4_status.json 提供给 LuCI 即时读取
                 if tick_count % 2 == 0 || state_changed {
                     let active_names: Vec<&str> = monitors
                         .iter()
@@ -1783,10 +1919,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(_, m)| m.ifname.as_str())
                         .collect();
                     let route_desc = build_route_desc(&monitors, &active_names);
-                    write_status_file(&monitors, &route_desc, &config);
+                    write_status_file(&monitors, &route_desc, &config, effective_hash_v4);
                 }
 
-                // 每 10 個週期（約 5 秒）輸出一次所有 WAN 的即時品質摘要
+                // 每 10 个周期（约 5 秒）输出一次所有 WAN 的即时品质摘要
                 if tick_count % 10 == 0 {
                     for monitor in &monitors {
                         info!("[{}] {}", monitor.ifname, monitor.lqe.summary());
@@ -1796,21 +1932,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 7. 優雅退出
+    // 7. 优雅退出
     if config.remove_routes_on_exit {
-        // 移除本程式下發的預設路由，避免殘留指向已失效的鏈路。
-        // 注意：這會在「舊實例已退出、新實例還沒下發」的窗口內讓整台路由器失去出口，
-        // 因此預設是 false，需要明確開啟。
+        // 移除本程式下发的预设路由，避免残留指向已失效的链路。
+        // 注意：这会在「旧实例已退出、新实例还没下发」的窗口内让整台路由器失去出口，
+        // 因此预设是 false，需要明确开启。
         if let Err(e) = netlink_tx.send(NetlinkCmd::ClearRoutes) {
             warn!("Failed to request default route cleanup: {e}");
         }
     } else {
-        // 預設路由保留（避免重啟窗口斷網），但**探針路徑一定要拆掉**：
-        // 那是一組 `oif <wan> lookup <table>` 規則與獨立表路由，留著會指向
-        // 可能已經不存在的網關，也會讓下次啟動的規則語意變得不可預期。
+        // 预设路由保留（避免重启窗口断网），但**探针路径一定要拆掉**：
+        // 那是一组 `oif <wan> lookup <table>` 规则与独立表路由，留著会指向
+        // 可能已经不存在的网关，也会让下次启动的规则语意变得不可预期。
         info!("Leaving the mwan4 default route in place (remove_routes_on_exit = false)");
-        // 策略規則一定要拆：它們指向各 WAN 的探針表，而探針表馬上就會被拆掉；
-        // 留著會讓匹配的流量查不到路由（黑洞），而不是回退 ECMP。
+        // 策略规则一定要拆：它们指向各 WAN 的探针表，而探针表马上就会被拆掉；
+        // 留著会让匹配的流量查不到路由（黑洞），而不是回退 ECMP。
         if let Err(e) = netlink_tx.send(NetlinkCmd::SetPolicies(Vec::new())) {
             warn!("Failed to request policy rule cleanup: {e}");
         }
@@ -1818,7 +1954,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("Failed to request probe path cleanup: {e}");
         }
     }
-    // 斷開通道讓 worker 執行緒結束
+    // 断开通道让 worker 执行绪结束
     drop(netlink_tx);
     if netlink_worker.join().is_err() {
         warn!("Netlink worker thread panicked during shutdown");
@@ -1831,18 +1967,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 線路判 DOWN 之後，要「持續」不可用多久才動手清 conntrack。
+/// 线路判 DOWN 之后，要「持续」不可用多久才动手清 conntrack。
 ///
-/// 為什麼要拖：隧道型線路（VXLAN/WireGuard）常有幾秒到十幾秒的抖動，而清 conntrack
-/// 會把該線路上所有連線一次砍掉（實測一次 495 條），使用者立刻看到「網站打不開」。
+/// 为什么要拖：隧道型线路（VXLAN/WireGuard）常有几秒到十几秒的抖动，而清 conntrack
+/// 会把该线路上所有连线一次砍掉（实测一次 495 条），使用者立刻看到「网站打不开」。
 ///
-/// 這個值要蓋過「判 DOWN + 抖動本身 + 恢復所需時間」：
-/// 以預設參數為例，連續 3 次失敗 ≈ 2.4s 才判 DOWN，恢復要 5 次連續成功 ≈ 4s
-/// （實測這台設備用了 9 次 ≈ 7s），所以一次 8 秒的抖動實測約 12 秒才能回到 UP。
-/// 10 秒的靜默期剛好被跨過去、仍然誤清；25 秒能穩穩擋住這類抖動。
+/// 这个值要盖过「判 DOWN + 抖动本身 + 恢复所需时间」：
+/// 以预设参数为例，连续 3 次失败 ≈ 2.4s 才判 DOWN，恢复要 5 次连续成功 ≈ 4s
+/// （实测这台设备用了 9 次 ≈ 7s），所以一次 8 秒的抖动实测约 12 秒才能回到 UP。
+/// 10 秒的静默期刚好被跨过去、仍然误清；25 秒能稳稳挡住这类抖动。
 ///
-/// 代價：真斷線時晚 25 秒清連線。但用戶端 TCP 本來就要自我重傳超時（通常 20s+），
-/// 所以實際感受幾乎沒有差別；而誤清是「立刻全斷」，兩者不對等。
+/// 代价：真断线时晚 25 秒清连线。但用户端 TCP 本来就要自我重传超时（通常 20s+），
+/// 所以实际感受几乎没有差别；而误清是「立刻全断」，两者不对等。
 const CONNTRACK_FLUSH_DOWN_QUIET: Duration = Duration::from_secs(25);
 
 struct WanMonitor {
@@ -1852,63 +1988,63 @@ struct WanMonitor {
     gateway6: Option<std::net::Ipv6Addr>,
     metric: u32,
     weight: u32,
-    /// 實際下發到 ECMP 的權重：未啟用任何動態模式時等於 `weight`；
-    /// `weight_mode=quality` / `load_aware` 時由品質與負載計算
-    /// （見 `compute_dynamic_weights`）。
+    /// 实际下发到 ECMP 的权重：未启用任何动态模式时等于 `weight`；
+    /// `weight_mode=quality` / `load_aware` 时由品质与负载计算
+    /// （见 `compute_dynamic_weights`）。
     effective_weight: u32,
-    /// 介面累計位元組（取自 /sys/class/net/<if>/statistics），用於計算即時速率
+    /// 介面累计位元组（取自 /sys/class/net/<if>/statistics），用于计算即时速率
     last_tx_bytes: Option<u64>,
     last_rx_bytes: Option<u64>,
-    /// 上次取樣時刻與算出的速率（bit/s），供狀態檔 / LuCI 顯示
+    /// 上次取样时刻与算出的速率（bit/s），供状态档 / LuCI 显示
     last_stats_at: Option<Instant>,
     tx_bps: f64,
     rx_bps: f64,
-    /// 速率的 EWMA 平滑值（bit/s）。壓力判定看平滑值，避免單拍突發就觸發權重變更。
+    /// 速率的 EWMA 平滑值（bit/s）。压力判定看平滑值，避免单拍突发就触发权重变更。
     tx_bps_ewma: f64,
     rx_bps_ewma: f64,
-    /// EWMA 是否已用第一筆實測值初始化（從 0 慢慢爬升會讓剛啟動的線被誤判成空閒）。
+    /// EWMA 是否已用第一笔实测值初始化（从 0 慢慢爬升会让刚启动的线被误判成空闲）。
     load_ewma_ready: bool,
-    /// 這條線目前是否處於「過載、被下修權重」狀態（Schmitt trigger 的記憶位）。
+    /// 这条线目前是否处于「过载、被下修权重」状态（Schmitt trigger 的记忆位）。
     load_pressure_active: bool,
-    /// 下載（WAN 入口）容量（bit/s）；None = 未設定，不參與負載感知。
+    /// 下载（WAN 入口）容量（bit/s）；None = 未设定，不参与负载感知。
     down_bps_capacity: Option<f64>,
-    /// 上傳（WAN 出口）容量（bit/s）；未設定時沿用下載容量。
+    /// 上传（WAN 出口）容量（bit/s）；未设定时沿用下载容量。
     up_bps_capacity: Option<f64>,
     targets: Vec<std::net::SocketAddr>,
-    /// 下個探測週期的「主目標」下標（上次探通的那個）。健康時每週期只探它一條，
-    /// 失敗才回退其餘目標——這是壓低短命 TCP 連線數的關鍵，見 `prober::probe_interface`。
+    /// 下个探测周期的「主目标」下标（上次探通的那个）。健康时每周期只探它一条，
+    /// 失败才回退其余目标——这是压低短命 TCP 连线数的关键，见 `prober::probe_interface`。
     preferred_target: usize,
-    /// 這條線若是隧道（VXLAN/WireGuard），其 underlay 對端位址；非隧道留空。
-    /// 非空同時代表「不能拿這條線去當別條隧道的 underlay 出口」。
+    /// 这条线若是隧道（VXLAN/WireGuard），其 underlay 对端位址；非隧道留空。
+    /// 非空同时代表「不能拿这条线去当别条隧道的 underlay 出口」。
     underlay_targets: Vec<std::net::Ipv4Addr>,
-    /// 快取的介面 IPv4（每次寫狀態檔都做 socket + ioctl 太昂貴）
+    /// 快取的介面 IPv4（每次写状态档都做 socket + ioctl 太昂贵）
     cached_ip: Option<std::net::Ipv4Addr>,
-    /// 最後一次成功查到的介面 IPv4。**失敗時不清空**：介面消失/換 IP 後
-    /// conntrack 清理還需要用它來匹配 NAT 到舊位址的連線。
+    /// 最后一次成功查到的介面 IPv4。**失败时不清空**：介面消失/换 IP 后
+    /// conntrack 清理还需要用它来匹配 NAT 到旧位址的连线。
     last_known_ip: Option<std::net::Ipv4Addr>,
-    /// 上次對這張網卡做 conntrack 清理的時間（用於限流）
+    /// 上次对这张网卡做 conntrack 清理的时间（用于限流）
     last_conntrack_flush: Option<Instant>,
-    /// 最近一次探測失敗的原因（成功時清空）。
-    /// 寫進狀態檔，讓「介面不存在／本機無路由」不再被誤認成「運營商丟包」。
+    /// 最近一次探测失败的原因（成功时清空）。
+    /// 写进状态档，让「介面不存在／本机无路由」不再被误认成「运营商丢包」。
     last_probe_error: Option<String>,
-    /// 最近一次失敗是否屬於本機條件（依 errno 分類，不看 strerror 文案）。
-    /// 與 `probe_path_missing` 一起決定狀態檔的 `local_condition`。
+    /// 最近一次失败是否属于本机条件（依 errno 分类，不看 strerror 文案）。
+    /// 与 `probe_path_missing` 一起决定状态档的 `local_condition`。
     last_error_is_local: bool,
-    /// 是否已針對「本機條件造成的失敗」告警過（同一輪只提醒一次）
+    /// 是否已针对「本机条件造成的失败」告警过（同一轮只提醒一次）
     local_condition_warned: bool,
-    /// 內核查詢的結論：經這張網卡到探針目標「根本沒有路」。
-    /// 這種情況探針會以「超時」結束（內核按 on-link 丟進黑洞），必須另外標記，
-    /// 否則日誌與介面都會把它誤報成運營商丟包。
+    /// 内核查询的结论：经这张网卡到探针目标「根本没有路」。
+    /// 这种情况探针会以「超时」结束（内核按 on-link 丢进黑洞），必须另外标记，
+    /// 否则日志与介面都会把它误报成运营商丢包。
     probe_path_missing: bool,
-    /// 上次做「路徑是否存在」查詢的時間（限流，避免每 tick 都查）
+    /// 上次做「路径是否存在」查询的时间（限流，避免每 tick 都查）
     last_path_check: Option<Instant>,
-    /// 本輪進入 DOWN 的時刻；恢復 UP 時清空。
-    /// 用來區分「短暫抖動」與「真的掛了」——前者不該清 conntrack。
+    /// 本轮进入 DOWN 的时刻；恢复 UP 时清空。
+    /// 用来区分「短暂抖动」与「真的挂了」——前者不该清 conntrack。
     down_since: Option<Instant>,
-    /// 最後一次進入 DOWN 的時刻。**恢復後不清空**：用來判斷「剛從 DOWN 回來的線」
-    /// 還在抖動靜默期內，不該被 flush-on-switch 當成新進入成員清掉。
+    /// 最后一次进入 DOWN 的时刻。**恢复后不清空**：用来判断「刚从 DOWN 回来的线」
+    /// 还在抖动静默期内，不该被 flush-on-switch 当成新进入成员清掉。
     last_down_at: Option<Instant>,
-    /// 這次 DOWN 期間是否已經清過 conntrack（避免每 tick 重複清）
+    /// 这次 DOWN 期间是否已经清过 conntrack（避免每 tick 重复清）
     flushed_while_down: bool,
     lqe: LinkQualityEstimator,
 }
@@ -1916,9 +2052,9 @@ struct WanMonitor {
 impl WanMonitor {
     /// 刷新快取的介面 IP。
     ///
-    /// 查得到 → 同時更新 `cached_ip`（顯示）與 `last_known_ip`（conntrack 清理）。
-    /// 查不到 → **只清 `cached_ip`**，`last_known_ip` 保留：介面已消失/正在重撥時，
-    /// 舊 NAT 位址的連線還掛在 conntrack 裡，那正是最需要清理的對象。
+    /// 查得到 → 同时更新 `cached_ip`（显示）与 `last_known_ip`（conntrack 清理）。
+    /// 查不到 → **只清 `cached_ip`**，`last_known_ip` 保留：介面已消失/正在重拨时，
+    /// 旧 NAT 位址的连线还挂在 conntrack 里，那正是最需要清理的对象。
     fn refresh_cached_ip(&mut self) {
         match crate::netlink::util::get_interface_ipv4(&self.ifname) {
             Ok(ip) => {
@@ -1930,16 +2066,16 @@ impl WanMonitor {
     }
 }
 
-/// 把本 tick 收集到的 conntrack 清理候選送去 worker（同網卡去重 + 最小間隔限流），
-/// 並在**真正入隊成功之後**才更新 `last_conntrack_flush` 與 `flushed_while_down`。
+/// 把本 tick 收集到的 conntrack 清理候选送去 worker（同网卡去重 + 最小间隔限流），
+/// 并在**真正入队成功之后**才更新 `last_conntrack_flush` 与 `flushed_while_down`。
 ///
-/// `pending` 的元素是 `(monitors 下標, 是否來自 flush-on-down)`：flush-on-switch 的路徑
-/// 只是「成員集合變了，請清掉新進成員的連線」，線路本身仍是 UP，不該動 `flushed_while_down`。
+/// `pending` 的元素是 `(monitors 下标, 是否来自 flush-on-down)`：flush-on-switch 的路径
+/// 只是「成员集合变了，请清掉新进成员的连线」，线路本身仍是 UP，不该动 `flushed_while_down`。
 ///
-/// 為什麼置位必須晚於入隊（FIX-7）：這裡會因為 `conntrack_flush_min_interval` 跳過剛清過的
-/// 網卡。若呼叫端在收集階段就先設 `flushed_while_down = true`，被跳過的那條線下個 tick 開頭
-/// 就撞上 `if monitor.flushed_while_down { continue; }`，整段 DOWN 期間不會再嘗試清理
-/// （只有下一次 UP→DOWN 才會重置）—— 這次 DOWN 的清理就永久丟失了。
+/// 为什么置位必须晚于入队（FIX-7）：这里会因为 `conntrack_flush_min_interval` 跳过刚清过的
+/// 网卡。若呼叫端在收集阶段就先设 `flushed_while_down = true`，被跳过的那条线下个 tick 开头
+/// 就撞上 `if monitor.flushed_while_down { continue; }`，整段 DOWN 期间不会再尝试清理
+/// （只有下一次 UP→DOWN 才会重置）—— 这次 DOWN 的清理就永久丢失了。
 fn flush_conntrack(
     monitors: &mut [WanMonitor],
     pending: Vec<(usize, bool)>,
@@ -1948,7 +2084,7 @@ fn flush_conntrack(
     min_interval: Duration,
 ) {
     let mut targets: Vec<ConntrackTarget> = Vec::new();
-    // 與 targets 逐項對應：該網卡的下標、以及「是否來自 flush-on-down」
+    // 与 targets 逐项对应：该网卡的下标、以及「是否来自 flush-on-down」
     let mut marked: Vec<(usize, bool)> = Vec::new();
     for (idx, from_down) in pending {
         let monitor = &monitors[idx];
@@ -1961,8 +2097,8 @@ fn flush_conntrack(
                 continue;
             }
         }
-        // 同一張網卡只清一次；來源旗標用 OR 合併，避免重複項把 flush-on-down 的標記吞掉。
-        // 舊 IP 合併時「有值優先」：flush-on-switch 的項目可能是後加的。
+        // 同一张网卡只清一次；来源旗标用 OR 合并，避免重复项把 flush-on-down 的标记吞掉。
+        // 旧 IP 合并时「有值优先」：flush-on-switch 的项目可能是后加的。
         match targets.iter().position(|(n, _)| n == &monitor.ifname) {
             Some(pos) => {
                 marked[pos].1 |= from_down;
@@ -1994,11 +2130,11 @@ fn flush_conntrack(
     }
 }
 
-/// 產生 LuCI 顯示用的活躍路由描述字串。
+/// 产生 LuCI 显示用的活跃路由描述字串。
 ///
-/// `active_names` 由呼叫端用**同一套 is_active 判據**算出（含降級與保底），
-/// 避免這裡複製一份判斷而與路由下發的實際結果不一致（降級狀態若兩處判得不同，
-/// 介面顯示「Multipath ECMP」但核心只有一條路由）。
+/// `active_names` 由呼叫端用**同一套 is_active 判据**算出（含降级与保底），
+/// 避免这里复制一份判断而与路由下发的实际结果不一致（降级状态若两处判得不同，
+/// 介面显示「Multipath ECMP」但核心只有一条路由）。
 fn build_route_desc(monitors: &[WanMonitor], active_names: &[&str]) -> String {
     if active_names.len() > 1 {
         format!("Multipath ECMP ({})", active_names.join(", "))
@@ -2033,15 +2169,15 @@ struct InterfaceStatus {
     gateway: String,
     metric: u32,
     weight: u32,
-    /// 實際下發到 ECMP 的權重（動態權重啟用時可能與 `weight` 不同）
+    /// 实际下发到 ECMP 的权重（动态权重启用时可能与 `weight` 不同）
     effective_weight: u32,
-    /// 即時速率（bit/s，取樣自 /sys/class/net/<if>/statistics）
+    /// 即时速率（bit/s，取样自 /sys/class/net/<if>/statistics）
     tx_bps: f64,
     rx_bps: f64,
-    /// 負載利用率（%）：`max(rx/下載容量, tx/上傳容量) × 100`；未設定容量時為 null。
-    /// 這就是負載感知判斷「這條線是否過載」的依據。
+    /// 负载利用率（%）：`max(rx/下载容量, tx/上传容量) × 100`；未设定容量时为 null。
+    /// 这就是负载感知判断「这条线是否过载」的依据。
     load_pct: Option<f64>,
-    /// 這條線目前是否因過載而被下修權重（狀態檔/LuCI 用來看分流是否正在轉移）
+    /// 这条线目前是否因过载而被下修权重（状态档/LuCI 用来看分流是否正在转移）
     offloaded: bool,
     rtt_ms: f64,
     jitter_ms: f64,
@@ -2049,34 +2185,53 @@ struct InterfaceStatus {
     consecutive_successes: usize,
     consecutive_timeouts: usize,
     targets: Vec<String>,
-    /// 內核 ifindex；0 = 這張網卡目前不存在（多半是名字寫錯或介面被停用）
+    /// 内核 ifindex；0 = 这张网卡目前不存在（多半是名字写错或介面被停用）
     ifindex: u32,
-    /// 最近一次探測失敗的原因（成功時為 null）。
-    /// 用來區分「本機沒有路由／設備不存在」與「運營商丟包」。
+    /// 最近一次探测失败的原因（成功时为 null）。
+    /// 用来区分「本机没有路由／设备不存在」与「运营商丢包」。
     last_error: Option<String>,
-    /// last_error 是否屬於本機條件（true 時介面上會給出不同提示）
+    /// last_error 是否属于本机条件（true 时介面上会给出不同提示）
     local_condition: bool,
-    /// 這條線是否因實測丟包率超標而降級（= 不參與 ECMP，但仍繼續探測）
+    /// 这条线是否因实测丢包率超标而降级（= 不参与 ECMP，但仍继续探测）
     degraded: bool,
-    /// 目前滑動窗口內的樣本數（未達 window_size 前不做丟包率判定）
+    /// 目前滑动窗口内的样本数（未达 window_size 前不做丢包率判定）
     samples_in_window: usize,
-    /// 窗口是否已填滿（false 表示樣本還不夠，degraded/判死都還沒生效）
+    /// 窗口是否已填满（false 表示样本还不够，degraded/判死都还没生效）
     window_full: bool,
-    /// 最近一次狀態變更的原因：consecutive_timeouts / window_loss / rtt / recovery
-    /// （尚未發生過狀態變更時為 null）
+    /// 最近一次状态变更的原因：consecutive_timeouts / window_loss / rtt / recovery
+    /// （尚未发生过状态变更时为 null）
     state_reason: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 struct DaemonStatus {
     updated_at: u64,
-    /// 前端據此判斷資料是否過期（秒），避免把陳舊快照當成即時狀態
+    /// 前端据此判断资料是否过期（秒），避免把陈旧快照当成即时状态
     stale_after_secs: u64,
     active_routes: String,
     interfaces: Vec<InterfaceStatus>,
-    /// 策略分流規則狀態（未設定 policies 時省略）
+    /// 策略分流规则状态（未设定 policies 时省略）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     policies: Vec<PolicyStatus>,
+    /// 内核实际生效的多路径哈希设定（「怎么分」的粒度）
+    hash: HashStatus,
+}
+
+/// 内核实际生效的多路径哈希设定。
+///
+/// 为什么放进状态档：「设定档写了 l4」和「内核真的按连线分流」是两件事
+/// （内核版本、`/proc` 是否可写、有没有被别的程序改掉）。`l3_only: true` 就是
+/// 「同一个目的 IP 的所有连线只走一条 WAN」——视频网站（多条连线打同一个 CDN IP）
+/// 卡顿最常见的成因。
+#[derive(serde::Serialize)]
+struct HashStatus {
+    /// `fib_multipath_hash_policy` 的读回值（null = 内核没有这个档案）
+    policy: Option<u8>,
+    /// `fib_multipath_hash_fields` 的读回值（null = 旧核心没有这个档案）
+    fields: Option<u32>,
+    /// fields 的可读描述（例如 `31 (src_ip+dst_ip+ip_proto+src_port+dst_port)`）
+    fields_desc: String,
+    l3_only: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2084,57 +2239,268 @@ struct PolicyStatus {
     name: String,
     interface: String,
     priority: u32,
-    /// 目前是否已下發（目標 WAN 健康且規則同步成功）
+    /// 目前是否已下发（目标 WAN 健康且规则同步成功）
     active: bool,
     source: Vec<String>,
     destination: Vec<String>,
 }
 
-/// 把設定的多路徑哈希策略寫進內核 sysctl。
+/// `net.ipv{4,6}.fib_multipath_hash_fields` 的位元定义（内核 UAPI，见
+/// `Documentation/networking/ip-sysctl.rst`；数值以 Linux 6.18 实测确认）。
+/// 单一来源是 `config::HashField`，这里只是把常用组合（L3/L4）折成常数。
+const HASH_FIELDS_L3: u32 =
+    HashField::SrcIp.bit() | HashField::DstIp.bit() | HashField::IpProto.bit();
+/// L4 = L3 + 来源/目的埠。
+const HASH_FIELDS_L4: u32 = HASH_FIELDS_L3 | HashField::SrcPort.bit() | HashField::DstPort.bit();
+
+/// 位元遮罩的可读描述（日志/状态档用，例如 `31 (src_ip+dst_ip+ip_proto+src_port+dst_port)`）。
 ///
-/// 只在值不同時才寫；失敗只告警（舊內核沒有這個檔案、或 /proc 不可寫），
-/// 不影響守護進程啟動。IPv6 只有在介面設定了 gateway6 時才一起設定。
-fn apply_multipath_hash_policy(policy: MultipathHashPolicy, has_ipv6: bool) {
-    let want = policy.sysctl_value().to_string();
-    let mut paths = vec!["/proc/sys/net/ipv4/fib_multipath_hash_policy".to_string()];
-    if has_ipv6 {
-        paths.push("/proc/sys/net/ipv6/fib_multipath_hash_policy".to_string());
+/// 纯逻辑、可单元测试：把每个已设定位元映射回名称，未知位元以 `0x...` 标出，
+/// 排障时不必再回查内核文件。
+fn hash_fields_desc(mask: u32) -> String {
+    const ALL: [HashField; 11] = [
+        HashField::SrcIp,
+        HashField::DstIp,
+        HashField::IpProto,
+        HashField::SrcPort,
+        HashField::DstPort,
+        HashField::InnerSrcIp,
+        HashField::InnerDstIp,
+        HashField::InnerIpProto,
+        HashField::FlowLabel,
+        HashField::InnerSrcPort,
+        HashField::InnerDstPort,
+    ];
+    let mut names: Vec<&str> = ALL
+        .iter()
+        .filter(|f| mask & f.bit() != 0)
+        .map(|f| f.as_str())
+        .collect();
+    let known: u32 = ALL.iter().fold(0u32, |acc, f| acc | f.bit());
+    let unknown = mask & !known;
+    if unknown != 0 {
+        names.push("(unknown bits)");
     }
-    for path in paths {
-        let current = std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.trim().to_string());
-        if current.as_deref() == Some(want.as_str()) {
-            info!(
-                "Multipath hash policy already '{}' ({path})",
-                policy.as_str()
-            );
-            continue;
-        }
-        match std::fs::write(&path, format!("{want}\n")) {
-            Ok(()) => info!(
-                "Set multipath hash policy to '{}' ({path})",
-                policy.as_str()
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    format!("{mask} ({})", names.join("+"))
+}
+
+/// 内核实际生效的多路径哈希设定（写入后读回）。
+///
+/// 为什么必须读回：「设定档写了 l4」不等于「内核真的按连线分流」（内核版本不支援、
+/// `/proc` 不可写、被别的程序改掉都可能）。把读回值写进 log 与状态档，
+/// 才能一眼看出实际粒度、而不是靠猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct EffectiveHash {
+    /// `fib_multipath_hash_policy` 的读回值（档案不存在时为 None）
+    policy: Option<u8>,
+    /// `fib_multipath_hash_fields` 的读回值（旧核心没有这个档案时为 None）
+    fields: Option<u32>,
+}
+
+impl EffectiveHash {
+    /// 是否只按 L3 哈希 —— 也就是「同一个目的 IP 的所有连线只会走同一条 WAN」。
+    ///
+    /// 这一点直接决定「视频网站会不会卡」：同一个 CDN 网域解析出来的 IP 往往只有
+    /// 一两个，浏览器对它开的每条连线（TCP 分段请求、QUIC 串流）若只按 IP 哈希，
+    /// 就会全部挤在同一条 WAN 上，另一条线完全用不到 —— 多 WAN 却还在缓冲。
+    ///
+    /// 判据只用 **policy**：本机实测（Linux 7.1.8，netns，真实 UDP 封包以 TX 计数判出口，
+    /// 本地发出与**转发**流量都测过）`fib_multipath_hash_fields` 写成 1/7/8/9/31/32
+    /// 都不改变哈希结果，`policy` 才是有效开关；`policy=0`（L3）与 `policy=2`（inner，
+    /// 对未封装流量等同 L3）都不会按埠分散。刻意**不**把 fields 的埠位元当反证：
+    /// daemon 的 fields 写入本来就从 policy 推导（且只补不删），拿它当证据会让
+    /// 「使用者把 l4 改成 l3 之后 fields 还留着埠位元」这种情况静默失去提示。
+    fn l3_only(&self) -> bool {
+        !matches!(self.policy, Some(1))
+    }
+
+    fn describe(&self) -> String {
+        match self.fields {
+            Some(mask) => format!(
+                "policy={} fields={}",
+                self.policy
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "n/a".into()),
+                hash_fields_desc(mask)
             ),
-            Err(e) => warn!(
-                "Failed to set multipath hash policy '{}' at {path}: {e} \
-                 (kernel too old or /proc not writable?)",
-                policy.as_str()
+            None => format!(
+                "policy={} fields=n/a (kernel has no fib_multipath_hash_fields)",
+                self.policy
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "n/a".into())
             ),
         }
     }
 }
 
-/// 動態權重的「刻度」：整數權重若都是 1，`round(1 × 0.25)` 會被夾成 1，
-/// 下修完全沒有效果。啟用負載感知時把基準權重整體放大到至少這個刻度，
-/// 讓「空閒線」與「被下修的線」之間真的有整數差；倍率由最小設定權重反推，
-/// 因此**權重比例不變**（weight 1:1 放大成 4:4），只是刻度變細。
+/// 当 `fib_multipath_hash_fields` 非 0 时，所求策略该怎么处理。
+///
+/// 为什么还要处理位元：本机实测（Linux 7.1.8，netns，以网卡 TX 计数判出口）该档案
+/// **可写入、可读回，但完全不影响哈希结果**——策略才是有效开关（policy=0 时「同一个
+/// 目的 IP、只差来源埠」的 24 条连线 100% 走同一条 WAN；policy=1 时变成 12/12）。
+/// 但部分内核版本确实以位元为准（旧版本曾观测到相反行为），所以这里两者都写、
+/// 并把读回值回报给使用者，而不是假设哪一个才是真理。
+#[derive(Debug, PartialEq, Eq)]
+enum HashFieldsAction {
+    /// `fields == 0`（旧内核）：`fib_multipath_hash_policy` 才是有效开关，不动位元
+    PolicyGoverns,
+    /// 现有位元缺了策略要求的位元 → 补上后写回
+    Extend(u32),
+    /// 现有位元已涵盖策略要求（可能比要求更细，例如 l3 要求遇上 fields=31）
+    Covered,
+    /// `inner` 的语义无法与这组位元逐位对应 → 只告警，不猜
+    CannotExpress,
+}
+
+/// 依策略与现有位元决定动作（纯逻辑，I/O 在 `apply_multipath_hash`）。
+fn hash_fields_action(policy: MultipathHashPolicy, current: u32) -> HashFieldsAction {
+    let need = match policy {
+        MultipathHashPolicy::L3 => HASH_FIELDS_L3,
+        MultipathHashPolicy::L4 => HASH_FIELDS_L4,
+        MultipathHashPolicy::Inner => return HashFieldsAction::CannotExpress,
+    };
+    if current == 0 {
+        HashFieldsAction::PolicyGoverns
+    } else if current & need == need {
+        HashFieldsAction::Covered
+    } else {
+        HashFieldsAction::Extend(current | need)
+    }
+}
+
+/// 把设定的多路径哈希策略写进内核 sysctl，并回传实际生效的值。
+///
+/// - `policy = Some(p)` → 写入 `fib_multipath_hash_policy`（**有效开关**）；
+///   `None` = 完全不碰，沿用系统预设。
+/// - 另外依 `hash_fields_action` 把 `fib_multipath_hash_fields` 缺少的位元补齐
+///   （只补不删：内核不接受写 0，而且这个档案在部分内核上根本不被参考）。
+///
+/// 只在值不同时才写；失败只告警（旧内核没有这些档案、或 /proc 不可写），
+/// 不影响守护进程启动。IPv6 只有在介面设定了 gateway6 时才一起设定。
+///
+/// 为什么要读回并回传：设定档写了 `l4` 不等于「真的按连线分流」（可能内核不支援、
+/// /proc 不可写、或被别的程序改掉）。把两个档案的读回值写进 log 与状态档，
+/// 使用者才看得出**实际**粒度；`EffectiveHash::l3_only()` 就是「同一个目的 IP 的
+/// 多条连线会挤在同一条 WAN」的判据。
+fn apply_multipath_hash(
+    policy: Option<MultipathHashPolicy>,
+    has_ipv6: bool,
+) -> Vec<(&'static str, EffectiveHash)> {
+    let mut paths = vec![(
+        "ipv4",
+        "/proc/sys/net/ipv4/fib_multipath_hash_policy".to_string(),
+    )];
+    if has_ipv6 {
+        paths.push((
+            "ipv6",
+            "/proc/sys/net/ipv6/fib_multipath_hash_policy".to_string(),
+        ));
+    }
+
+    let mut applied = Vec::with_capacity(paths.len());
+    for (label, path) in paths {
+        let mut eff = EffectiveHash::default();
+
+        // 1) policy（有效开关）：只在有设定时才碰它
+        if let Some(policy) = policy {
+            let want = policy.sysctl_value().to_string();
+            let current = std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| s.trim().to_string());
+            if current.as_deref() != Some(want.as_str()) {
+                match std::fs::write(&path, format!("{want}\n")) {
+                    Ok(()) => info!(
+                        "Set multipath hash policy to '{}' ({path})",
+                        policy.as_str()
+                    ),
+                    Err(e) => warn!(
+                        "Failed to set multipath hash policy '{}' at {path}: {e} \
+                         (kernel too old or /proc not writable?)",
+                        policy.as_str()
+                    ),
+                }
+            }
+        }
+        eff.policy = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok());
+
+        // 2) fields：依策略补齐缺少的位元（只补不删）
+        let fields_path = path.replace("fib_multipath_hash_policy", "fib_multipath_hash_fields");
+        let current_fields = std::fs::read_to_string(&fields_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        eff.fields = current_fields;
+        if let (Some(current), Some(policy)) = (current_fields, policy) {
+            match hash_fields_action(policy, current) {
+                HashFieldsAction::PolicyGoverns | HashFieldsAction::Covered => {}
+                HashFieldsAction::Extend(want) => {
+                    match std::fs::write(&fields_path, format!("{want}\n")) {
+                        Ok(()) => {
+                            info!(
+                                "Extended fib_multipath_hash_fields {current} -> {} at \
+                                 {fields_path} (requested '{}')",
+                                hash_fields_desc(want),
+                                policy.as_str()
+                            );
+                            eff.fields = Some(want);
+                        }
+                        Err(e) => warn!(
+                            "Failed to extend fib_multipath_hash_fields to {want} at \
+                             {fields_path}: {e}; the requested '{}' granularity may not be in \
+                             effect",
+                            policy.as_str()
+                        ),
+                    }
+                }
+                HashFieldsAction::CannotExpress => warn!(
+                    "The '{}' hash policy is not bit-for-bit expressible by \
+                     fib_multipath_hash_fields (currently {current}), and measured on Linux \
+                     7.1.8 the policy is what actually selects the hash keys: \
+                     non-encapsulated traffic in 'inner' mode behaves exactly like 'l3' \
+                     (connections to the same destination IP stay on one WAN). Use 'l4' unless \
+                     you really need the inner-header behaviour.",
+                    policy.as_str()
+                ),
+            }
+        }
+
+        info!("Multipath hash in effect ({label}): {}", eff.describe());
+        applied.push((label, eff));
+    }
+    applied
+}
+
+/// 动态因子（`weight_mode: quality` / `load_aware`）是否允许套用。
+///
+/// 只有两种情况允许：内核**实际**安装的是 `resilient`（权重/成员变更只会重映射
+/// 故障或空闲的 bucket），或使用者明确以 `allow_dynamic_weights_on_standard` 覆写。
+///
+/// 为什么 standard 预设要挡：standard 是单一 `RTA_MULTIPATH` 路由，任何权重变更都会让
+/// 内核重算整张 multipath hash。实测（Linux 6.12/6.18、512 个 flow key）1:1 → 1:10
+/// 会把 **39%** 的既有 flow 改送到另一条 WAN、1:10 → 1:2 会搬走 **24%**；转发流量换了
+/// NAT 源 IP 后对端只看到未知四元组（RST／大量重传），而 per-flow 哈希本来就搬不动
+/// 已建立的大流量 —— 净效果是「打断连线却换不到分流」。实机 2026-09 案例：
+/// quality + load_aware + standard 让权重每 10~20 秒在 1 与 4 之间跳动，
+/// 使用者持续回报「一条线突然很卡、网路卡顿」。
+fn dynamic_factors_allowed(config: &DaemonConfig, kernel_resilient: bool) -> bool {
+    let wants_factors = config.weight_mode == WeightMode::Quality || config.load_aware;
+    !wants_factors || config.allow_dynamic_weights_on_standard || kernel_resilient
+}
+
+/// 动态权重的「刻度」：整数权重若都是 1，`round(1 × 0.25)` 会被夹成 1，
+/// 下修完全没有效果。启用负载感知时把基准权重整体放大到至少这个刻度，
+/// 让「空闲线」与「被下修的线」之间真的有整数差；倍率由最小设定权重反推，
+/// 因此**权重比例不变**（weight 1:1 放大成 4:4），只是刻度变细。
 const DYNAMIC_WEIGHT_RESOLUTION: u32 = 4;
 
-/// 這條線當前的負載利用率：`max(rx / 下載容量, tx / 上傳容量)`。
+/// 这条线当前的负载利用率：`max(rx / 下载容量, tx / 上传容量)`。
 ///
-/// 取兩個方向的最大值：全雙工乙太網的收發各自獨立，任一方向接近上限就代表
-/// 這條線的某個方向已經吃滿，該把部分流量移走。沒設定容量時回傳 `None`。
+/// 取两个方向的最大值：全双工乙太网的收发各自独立，任一方向接近上限就代表
+/// 这条线的某个方向已经吃满，该把部分流量移走。没设定容量时回传 `None`。
 fn load_utilization(m: &WanMonitor) -> Option<f64> {
     let down = m.down_bps_capacity?;
     let up = m.up_bps_capacity.unwrap_or(down);
@@ -2144,20 +2510,33 @@ fn load_utilization(m: &WanMonitor) -> Option<f64> {
     Some((m.rx_bps_ewma / down).max(m.tx_bps_ewma / up))
 }
 
-/// 更新每條線「是否處於過載下修」的遲滯狀態（Schmitt trigger）。
+/// 更新每条线「是否处于过载下修」的迟滞状态（Schmitt trigger）。
 ///
-/// 進入：利用率 >= `target`；退出：利用率 <= `recover`（recover < target）。
-/// 為什麼要記憶位：沒有它，一條線在 target 附近擺盪就會讓權重每幾秒跳一次，
-/// 而每次權重變更都是一次 `RTM_NEWROUTE`，可能重算 multipath hash、打斷既有 flow。
-fn update_load_pressure(monitors: &mut [WanMonitor], active: &[bool], target: f64, recover: f64) {
+/// 进入：利用率 >= `target`；退出：利用率 <= `recover`（recover < target）。
+/// 为什么要记忆位：没有它，一条线在 target 附近摆荡就会让权重每几秒跳一次，
+/// 而每次权重变更都是一次 `RTM_NEWROUTE`，可能重算 multipath hash、打断既有 flow。
+///
+/// 回传「这一次是否有任何一条线的压力状态发生变化」：转换点就是值得**立刻**
+/// 重下权重的时刻（见 `weight_update_due`）。持续在迟滞死区里微调则仍然受限速约束。
+fn update_load_pressure(
+    monitors: &mut [WanMonitor],
+    active: &[bool],
+    target: f64,
+    recover: f64,
+) -> bool {
+    let mut changed = false;
     for (slot, m) in monitors.iter_mut().enumerate() {
         if !active.get(slot).copied().unwrap_or(false) {
             continue;
         }
         let Some(util) = load_utilization(m) else {
-            m.load_pressure_active = false;
+            if m.load_pressure_active {
+                m.load_pressure_active = false;
+                changed = true;
+            }
             continue;
         };
+        let was = m.load_pressure_active;
         if m.load_pressure_active {
             if util <= recover {
                 m.load_pressure_active = false;
@@ -2165,13 +2544,31 @@ fn update_load_pressure(monitors: &mut [WanMonitor], active: &[bool], target: f6
         } else if util >= target {
             m.load_pressure_active = true;
         }
+        changed |= m.load_pressure_active != was;
     }
+    changed
 }
 
-/// 負載因子（`min_ratio` ~ 1.0）：過載的線下修，其餘維持 1.0。
+/// 这一次循环该不该重下 ECMP 权重？
 ///
-/// 在 target 與 recover 之間線性內插：稍微過載只小幅下修、嚴重過載才壓到下限，
-/// 比 0/1 階梯更容易收斂到平衡點而不來回震盪。
+/// - `elapsed` 距上次下发的间隔、`interval` = `dynamic_weight_interval_ms`：
+///   一般情况下的限速，避免每次权重微调都是一次 `RTM_NEWROUTE`。
+/// - `pressure_transition`：有线的过载状态刚翻转。这是「某条线开始吃满/刚解除」
+///   的瞬间，新连线该立刻改走另一条线——卡顿就发生在这一段里。因此允许跳过
+///   interval，但仍受 `min_spacing` 约束（状态机在门槛附近仍可能翻转，别把路由表刷爆）。
+fn weight_update_due(
+    elapsed: Duration,
+    interval: Duration,
+    pressure_transition: bool,
+    min_spacing: Duration,
+) -> bool {
+    elapsed >= interval || (pressure_transition && elapsed >= min_spacing)
+}
+
+/// 负载因子（`min_ratio` ~ 1.0）：过载的线下修，其余维持 1.0。
+///
+/// 在 target 与 recover 之间线性内插：稍微过载只小幅下修、严重过载才压到下限，
+/// 比 0/1 阶梯更容易收敛到平衡点而不来回震荡。
 fn load_factor(m: &WanMonitor, target: f64, recover: f64, min_ratio: f64) -> f64 {
     if !m.load_pressure_active {
         return 1.0;
@@ -2188,7 +2585,7 @@ fn load_factor(m: &WanMonitor, target: f64, recover: f64, min_ratio: f64) -> f64
     1.0 - pressure * (1.0 - min_ratio)
 }
 
-/// 品質因子（`min_ratio` ~ 1.0）：依 LQE 實測丟包與 RTT 下修。
+/// 品质因子（`min_ratio` ~ 1.0）：依 LQE 实测丢包与 RTT 下修。
 fn quality_factor(m: &WanMonitor, best_rtt: f64, min_ratio: f64) -> f64 {
     let loss = if m.lqe.window_full() {
         m.lqe.loss_rate().clamp(0.0, 1.0)
@@ -2204,30 +2601,36 @@ fn quality_factor(m: &WanMonitor, best_rtt: f64, min_ratio: f64) -> f64 {
     factor.clamp(min_ratio, 1.0)
 }
 
-/// 計算各線的等效 ECMP 權重（品質模式與負載感知各自獨立、也可疊加）。
+/// 计算各线的等效 ECMP 权重（品质模式与负载感知各自独立、也可叠加）。
 ///
-/// 基準權重（`base`）：
-/// - 只要任何一條線設定了 `max_mbps`，就啟用**容量比例分流**：
-///   `base = weight × (max_mbps / 活躍線中的最小 max_mbps)`，
-///   即權重比 = 最大頻寬比（最小那條正規化為 1）；非活躍線維持 `weight`。
-/// - 否則 `base = weight`。
+/// 基准权重（`base`）：
+/// - 只要任何一条线设定了 `max_mbps`，就启用**容量比例分流**：
+///   `base = weight × (max_mbps / 活跃线中的最小 max_mbps)`，
+///   即权重比 = 最大频宽比（最小那条正规化为 1）；非活跃线维持 `weight`。
+/// - 否则 `base = weight`。
 ///
-/// 動態因子（可獨立或疊加）：
-/// - `weight_mode = quality`：`factor_q = (1 - 丟包) × clamp(最佳 RTT / 本線 RTT, min, 1)`；
-/// - `load_aware`：`factor_l = 1 - 壓力 × (1 - min)`（見 `load_factor`）；
+/// 动态因子（可独立或叠加）：
+/// - `weight_mode = quality`：`factor_q = (1 - 丢包) × clamp(最佳 RTT / 本线 RTT, min, 1)`；
+/// - `load_aware`：`factor_l = 1 - 压力 × (1 - min)`（见 `load_factor`）；
 /// - 合成因子 = `factor_q × factor_l`。
 ///
-/// 最終權重 = `clamp(round(base × 刻度 × 因子), 1, 255)`。刻度是為了在小權重時
-/// 仍有整數解析度（見 `DYNAMIC_WEIGHT_RESOLUTION`），並限制在不會超過 255。
-/// 非承載線維持設定值（不會被下發，僅狀態檔顯示用）。
+/// 最终权重 = `clamp(round(base × 刻度 × 因子), 1, 255)`。刻度是为了在小权重时
+/// 仍有整数解析度（见 `DYNAMIC_WEIGHT_RESOLUTION`），并限制在不会超过 255。
+/// 非承载线维持设定值（不会被下发，仅状态档显示用）。
 fn compute_dynamic_weights(
     monitors: &[WanMonitor],
     is_active: impl Fn(usize, &WanMonitor) -> bool,
     config: &DaemonConfig,
+    allow_dynamic_factors: bool,
 ) -> Vec<u32> {
-    let quality_on = config.weight_mode == WeightMode::Quality;
-    // 容量比例分流改看「監控物件是否帶容量」，與實際用於比例的欄位一致
-    // （loop 的啟用判斷才看 config；兩者在 validate 下必然同步）。
+    // `allow_dynamic_factors = false`（standard ECMP 的预设）时只算**容量比例**的
+    // 静态基准权重，品质/负载因子完全不套用：standard 是单一 RTA_MULTIPATH 路由，
+    // 任何权重变更都会让内核重算整张 multipath hash（实测搬走 24%~39% 的既有 flow，
+    // 转发流量换源 IP 后连线被 RST/重传），而 per-flow 哈希本来就搬不动已建立的大流量，
+    // 因此那个变更只会打断连线、换不到分流。详见 `allow_dynamic_weights_on_standard`。
+    let quality_on = config.weight_mode == WeightMode::Quality && allow_dynamic_factors;
+    // 容量比例分流改看「监控物件是否带容量」，与实际用于比例的栏位一致
+    // （loop 的启用判断才看 config；两者在 validate 下必然同步）。
     let bandwidth_on = monitors.iter().any(|m| m.down_bps_capacity.is_some());
     let min_ratio = config.dynamic_weight_min_ratio.clamp(0.05, 1.0);
     let active_flags: Vec<bool> = monitors
@@ -2236,12 +2639,12 @@ fn compute_dynamic_weights(
         .map(|(slot, m)| is_active(slot, m))
         .collect();
     let active_count = active_flags.iter().filter(|a| **a).count();
-    // 只有一條承載線時無處可分（權重再怎麼調都只有它），不做負載下修以避免白寫路由。
-    let load_on = config.load_aware && active_count >= 2;
+    // 只有一条承载线时无处可分（权重再怎么调都只有它），不做负载下修以避免白写路由。
+    let load_on = config.load_aware && active_count >= 2 && allow_dynamic_factors;
 
-    // 基準權重：容量比例分流時 ∝ weight × 最大頻寬。
-    // 以「活躍線中的最小容量」正規化，讓最小那條為 1、其餘按比例放大
-    // （比例超過上限時最後會被 clamp，等效上限 255:1）。
+    // 基准权重：容量比例分流时 ∝ weight × 最大频宽。
+    // 以「活跃线中的最小容量」正规化，让最小那条为 1、其余按比例放大
+    // （比例超过上限时最后会被 clamp，等效上限 255:1）。
     let mut bases: Vec<f64> = monitors.iter().map(|m| m.weight.max(1) as f64).collect();
     if bandwidth_on {
         let min_cap = monitors
@@ -2263,8 +2666,8 @@ fn compute_dynamic_weights(
         }
     }
 
-    // 刻度放大只在「確實有線被下修」時套用：沒有壓力就保持原權重，
-    // 不為了放大刻度而多下發一次路由。
+    // 刻度放大只在「确实有线被下修」时套用：没有压力就保持原权重，
+    // 不为了放大刻度而多下发一次路由。
     let any_pressure = load_on
         && monitors
             .iter()
@@ -2280,7 +2683,7 @@ fn compute_dynamic_weights(
         let min_base = active_bases.iter().copied().fold(f64::INFINITY, f64::min);
         let max_base = active_bases.iter().copied().fold(0.0_f64, f64::max);
         if min_base.is_finite() && min_base > 0.0 && max_base > 0.0 {
-            // 想要的刻度（讓最小權重至少 RESOLUTION 格）與不超過上限的刻度取小。
+            // 想要的刻度（让最小权重至少 RESOLUTION 格）与不超过上限的刻度取小。
             let want = (DYNAMIC_WEIGHT_RESOLUTION as f64 / min_base).max(1.0);
             let fit = (config::MAX_WEIGHT as f64 / max_base).max(1.0);
             want.min(fit).max(1.0)
@@ -2324,10 +2727,10 @@ fn compute_dynamic_weights(
         .collect()
 }
 
-/// 把 `config.policies` 展開成可下發的策略規則集合。
+/// 把 `config.policies` 展开成可下发的策略规则集合。
 ///
-/// 目標 WAN 目前不健康（非 UP 或 ifindex 解析不到）時整條政策停用，
-/// 讓流量自動回退到 ECMP 預設路由，而不是黑洞在死線上。
+/// 目标 WAN 目前不健康（非 UP 或 ifindex 解析不到）时整条政策停用，
+/// 让流量自动回退到 ECMP 预设路由，而不是黑洞在死线上。
 fn build_policy_rules(config: &DaemonConfig, monitors: &[WanMonitor]) -> Vec<PolicyRule> {
     let mut rules = Vec::new();
     for (index, policy) in config.policies.iter().enumerate() {
@@ -2381,14 +2784,14 @@ fn build_policy_rules(config: &DaemonConfig, monitors: &[WanMonitor]) -> Vec<Pol
     rules
 }
 
-/// 負載取樣的 EWMA 平滑係數。取樣週期即探測週期（預設 500ms），
-/// alpha = 0.3 的時間常數約 1.5 秒：足以濾掉單拍突發，又不會慢到跟不上一次真實的流量轉移。
+/// 负载取样的 EWMA 平滑系数。取样周期即探测周期（预设 500ms），
+/// alpha = 0.3 的时间常数约 1.5 秒：足以滤掉单拍突发，又不会慢到跟不上一次真实的流量转移。
 const LOAD_EWMA_ALPHA: f64 = 0.3;
 
-/// 讀取網卡累計位元組並換算即時速率（bit/s）。讀不到就保持上次的值。
+/// 读取网卡累计位元组并换算即时速率（bit/s）。读不到就保持上次的值。
 ///
-/// 來源是 `/sys/class/net/<if>/statistics/{tx,rx}_bytes`（介面累計值），
-/// 對路由器轉發流量而言這正是該 WAN 的實際承載量，用來驗證分流是否均勻。
+/// 来源是 `/sys/class/net/<if>/statistics/{tx,rx}_bytes`（介面累计值），
+/// 对路由器转发流量而言这正是该 WAN 的实际承载量，用来验证分流是否均匀。
 fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
     let read = |kind: &str| -> Option<u64> {
         std::fs::read_to_string(format!(
@@ -2408,13 +2811,13 @@ fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
     ) {
         let secs = now.duration_since(prev_at).as_secs_f64();
         if secs > 0.0 {
-            // 介面重建時計數器可能歸零：saturating_sub 讓速率歸零而不是暴衝
+            // 介面重建时计数器可能归零：saturating_sub 让速率归零而不是暴冲
             let d_tx = tx.saturating_sub(prev_tx);
             let d_rx = rx.saturating_sub(prev_rx);
             monitor.tx_bps = d_tx as f64 * 8.0 / secs;
             monitor.rx_bps = d_rx as f64 * 8.0 / secs;
-            // EWMA 平滑：壓力判定看平滑值，單拍突發不該讓 ECMP 權重跳動。
-            // 第一筆直接當初值，否則從 0 慢慢爬升會讓剛啟動的線被誤判成空閒。
+            // EWMA 平滑：压力判定看平滑值，单拍突发不该让 ECMP 权重跳动。
+            // 第一笔直接当初值，否则从 0 慢慢爬升会让刚启动的线被误判成空闲。
             if monitor.load_ewma_ready {
                 monitor.tx_bps_ewma += LOAD_EWMA_ALPHA * (monitor.tx_bps - monitor.tx_bps_ewma);
                 monitor.rx_bps_ewma += LOAD_EWMA_ALPHA * (monitor.rx_bps - monitor.rx_bps_ewma);
@@ -2430,11 +2833,11 @@ fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
     monitor.last_stats_at = Some(now);
 }
 
-/// 讀取某張網卡「有效」的 rp_filter 值（`all` 與該裝置取大者，與內核規則一致）。
+/// 读取某张网卡「有效」的 rp_filter 值（`all` 与该装置取大者，与内核规则一致）。
 ///
-/// 為什麼需要：內核的反向路徑檢查**只查主表**。strict（1）時回程必須走同一張
-/// 網卡，因此非活躍線必須在主表有一條到探針目標的 /32 才收得到 SYN-ACK；
-/// loose（2）時只要主表有任何到該目標的路由即可（有一條預設路由就夠）。
+/// 为什么需要：内核的反向路径检查**只查主表**。strict（1）时回程必须走同一张
+/// 网卡，因此非活跃线必须在主表有一条到探针目标的 /32 才收得到 SYN-ACK；
+/// loose（2）时只要主表有任何到该目标的路由即可（有一条预设路由就够）。
 fn effective_rp_filter(ifname: &str) -> u8 {
     let read = |path: String| -> u8 {
         std::fs::read_to_string(path)
@@ -2446,11 +2849,11 @@ fn effective_rp_filter(ifname: &str) -> u8 {
         .max(read(format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter")))
 }
 
-/// 這張網卡目前「可用」嗎（不是 admin down、也不是載波掉）？
+/// 这张网卡目前「可用」吗（不是 admin down、也不是载波掉）？
 ///
-/// 用途：主表同一個共用探針目標只能有一個 /32 擁有者，必須挑一條真的能把路由裝上的
-/// 線——否則機會會浪費在已經 down 的那條上，另一條拿不到回程路徑，兩條會一起掉
-/// （本地 netns 實測踩過這個坑）。讀不到（例如部分虛擬裝置沒有這個檔案）時保守回傳 true。
+/// 用途：主表同一个共用探针目标只能有一个 /32 拥有者，必须挑一条真的能把路由装上的
+/// 线——否则机会会浪费在已经 down 的那条上，另一条拿不到回程路径，两条会一起掉
+/// （本地 netns 实测踩过这个坑）。读不到（例如部分虚拟装置没有这个档案）时保守回传 true。
 fn interface_oper_usable(ifname: &str) -> bool {
     match std::fs::read_to_string(format!("/sys/class/net/{ifname}/operstate")) {
         Ok(state) => {
@@ -2461,9 +2864,9 @@ fn interface_oper_usable(ifname: &str) -> bool {
     }
 }
 
-/// 問內核「這個目標有沒有路」。`oif` 有值時問的是「綁定該設備時有沒有路」。
+/// 问内核「这个目标有没有路」。`oif` 有值时问的是「绑定该设备时有没有路」。
 ///
-/// 回傳 `None` = 查不到（socket 不可用或查詢失敗），呼叫端要保守處理。
+/// 回传 `None` = 查不到（socket 不可用或查询失败），呼叫端要保守处理。
 fn kernel_has_route(
     mgr: &mut Option<RouteManager>,
     target: std::net::Ipv4Addr,
@@ -2480,7 +2883,35 @@ fn kernel_has_route(
     }
 }
 
-fn write_status_file(monitors: &[WanMonitor], active_routes: &str, config: &DaemonConfig) {
+/// 内核目前有没有一条**真正的**（非 `lo`）IPv6 预设路由 `::/0`？
+///
+/// 用途：没设定 `gateway6` 时守护进程不管理 IPv6 路由，v6 流量会一直走 netifd 那条
+/// 单线预设路由；IPv6 上跑的常常正好是视频（QUIC/HTTP-3），值得提示一次
+/// （见启动处的说明）。刻意排除 `lo`：多数系统在 `lo` 上有一条 `::/0` 的 null route
+/// （metric ffffffff），把它算成「有 v6 出口」会让提示永远不出现。
+///
+/// `/proc/net/ipv6_route` 每行格式：`<dest 32hex> <plen 2hex> <src> <splen> <nexthop>
+/// <metric> <refcnt> <use> <flags> <dev>`。
+fn has_kernel_ipv6_default_route(table: &str) -> bool {
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let dest = fields.next().unwrap_or("");
+        let plen = fields.next().unwrap_or("");
+        let dev = fields.last().unwrap_or("");
+        dest.len() == 32
+            && dest.bytes().all(|b| b == b'0')
+            && plen == "00"
+            && !dev.is_empty()
+            && dev != "lo"
+    })
+}
+
+fn write_status_file(
+    monitors: &[WanMonitor],
+    active_routes: &str,
+    config: &DaemonConfig,
+    hash: EffectiveHash,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2516,7 +2947,7 @@ fn write_status_file(monitors: &[WanMonitor], active_routes: &str, config: &Daem
         });
     }
 
-    // 策略規則狀態：`active` = 目標 WAN 健康且規則在期望集合內（與實際下發同步）
+    // 策略规则状态：`active` = 目标 WAN 健康且规则在期望集合内（与实际下发同步）
     let policy_rules = build_policy_rules(config, monitors);
     let policies: Vec<PolicyStatus> = config
         .policies
@@ -2543,6 +2974,15 @@ fn write_status_file(monitors: &[WanMonitor], active_routes: &str, config: &Daem
         active_routes: active_routes.to_string(),
         interfaces: iface_statuses,
         policies,
+        hash: HashStatus {
+            policy: hash.policy,
+            fields: hash.fields,
+            fields_desc: hash
+                .fields
+                .map(hash_fields_desc)
+                .unwrap_or_else(|| "n/a".to_string()),
+            l3_only: hash.l3_only(),
+        },
     };
 
     if let Ok(json) = serde_json::to_string(&status) {
@@ -2552,12 +2992,12 @@ fn write_status_file(monitors: &[WanMonitor], active_routes: &str, config: &Daem
     }
 }
 
-/// 原子且防符號連結地寫入狀態檔。
+/// 原子且防符号连结地写入状态档。
 ///
-/// `/tmp` 是 1777：可寫者能預先放一個指向任意路徑的符號連結，讓 root 的
-/// `fs::write` 跟著它覆寫目標檔案。這裡改用 `create_new`（O_CREAT|O_EXCL）：
-/// 目標已存在（含符號連結）時直接失敗，先移除再建立（`remove_file` 只刪連結本身、
-/// 不會跟隨），最後用 rename 原子替換。
+/// `/tmp` 是 1777：可写者能预先放一个指向任意路径的符号连结，让 root 的
+/// `fs::write` 跟著它覆写目标档案。这里改用 `create_new`（O_CREAT|O_EXCL）：
+/// 目标已存在（含符号连结）时直接失败，先移除再建立（`remove_file` 只删连结本身、
+/// 不会跟随），最后用 rename 原子替换。
 fn write_status_atomic(json: &str) -> io::Result<()> {
     use std::io::Write;
     let _ = std::fs::remove_file(STATUS_TMP_FILE);
@@ -2572,11 +3012,150 @@ fn write_status_atomic(json: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // 測試裡「先取預設值、再改一兩個欄位」比整包 struct literal 清楚得多，
-    // 尤其只需要動 config 的單一欄位時。
+    // 测试里「先取预设值、再改一两个栏位」比整包 struct literal 清楚得多，
+    // 尤其只需要动 config 的单一栏位时。
     #![allow(clippy::field_reassign_with_default)]
 
     use super::*;
+
+    /// `fib_multipath_hash_fields` 非 0 时，`fib_multipath_hash_policy` 会被内核忽略，
+    /// 因此必须靠位元补写才能让设定生效；`inner` 无法逐位对应，只告警不猜。
+    #[test]
+    fn test_hash_fields_action_matches_kernel_semantics() {
+        use MultipathHashPolicy::{Inner, L3, L4};
+
+        // 旧内核（没有这个档案时读不到，或被写成 0）：policy 就是有效开关
+        assert_eq!(hash_fields_action(L3, 0), HashFieldsAction::PolicyGoverns);
+        assert_eq!(hash_fields_action(L4, 0), HashFieldsAction::PolicyGoverns);
+
+        // Linux 6.18 预设 fields=7：l4 缺埠位元必须补上，否则「按连线分流」是假的
+        assert_eq!(hash_fields_action(L4, 7), HashFieldsAction::Extend(31));
+        // 已含埠位元（或更细）就不再动它：不覆写使用者/发行版原本的设定
+        assert_eq!(hash_fields_action(L4, 31), HashFieldsAction::Covered);
+        assert_eq!(hash_fields_action(L4, 63), HashFieldsAction::Covered);
+        // 只缺部分位元时补成联集，不覆盖既有位元
+        assert_eq!(hash_fields_action(L4, 8), HashFieldsAction::Extend(31));
+        // l3 只要有 IP + 协议位元即满足；fields=31 比要求更细，属已涵盖
+        assert_eq!(hash_fields_action(L3, 7), HashFieldsAction::Covered);
+        assert_eq!(hash_fields_action(L3, 31), HashFieldsAction::Covered);
+        assert_eq!(hash_fields_action(L3, 2), HashFieldsAction::Extend(7));
+        // inner 的语义（外层 + 内层五元组按封装与否切换）无法用这组位元逐位表达
+        assert_eq!(
+            hash_fields_action(Inner, 7),
+            HashFieldsAction::CannotExpress
+        );
+        assert_eq!(
+            hash_fields_action(Inner, 0),
+            HashFieldsAction::CannotExpress
+        );
+    }
+
+    /// 位元遮罩的可读描述：日志/状态档靠它说明「实际生效的粒度」。
+    #[test]
+    fn test_hash_fields_desc_renders_names() {
+        assert_eq!(hash_fields_desc(0), "none");
+        assert_eq!(hash_fields_desc(7), "7 (src_ip+dst_ip+ip_proto)");
+        assert_eq!(
+            hash_fields_desc(HASH_FIELDS_L4),
+            "31 (src_ip+dst_ip+ip_proto+src_port+dst_port)"
+        );
+        // 内层标头与 flow label 也要认得（隧道/QUIC 视频流量用的位元）
+        assert_eq!(
+            hash_fields_desc(
+                HASH_FIELDS_L4 | HashField::InnerSrcPort.bit() | HashField::InnerDstPort.bit()
+            ),
+            "1567 (src_ip+dst_ip+ip_proto+src_port+dst_port+inner_src_port+inner_dst_port)"
+        );
+        assert_eq!(
+            hash_fields_desc(HashField::FlowLabel.bit()),
+            "256 (flow_label)"
+        );
+        // 不认得的位元不能被静默吃掉，否则日志会误导
+        assert_eq!(hash_fields_desc(1 << 20), "1048576 ((unknown bits))");
+    }
+
+    /// 「只按 L3 哈希」的判定：只看 policy（实测 fields 会被内核忽略，
+    /// daemon 的 fields 值本身就是从 policy 推导出来的）。
+    #[test]
+    fn test_effective_hash_l3_only_semantics() {
+        // 内核预设：policy=0 只哈希 IP → 同一个目的 IP 的连线全走一条 WAN
+        assert!(
+            EffectiveHash {
+                policy: Some(0),
+                fields: Some(7),
+            }
+            .l3_only()
+        );
+        // 从 l4 改回 l3 时 fields 仍留着埠位元（只补不删）——不得因此失去提示
+        assert!(
+            EffectiveHash {
+                policy: Some(0),
+                fields: Some(31),
+            }
+            .l3_only()
+        );
+        // l4：按连线分流
+        assert!(
+            !EffectiveHash {
+                policy: Some(1),
+                fields: Some(31),
+            }
+            .l3_only()
+        );
+        // inner 对未封装流量等同 L3（实测：只差来源埠的连线全部同一条线）
+        assert!(
+            EffectiveHash {
+                policy: Some(2),
+                fields: Some(224),
+            }
+            .l3_only()
+        );
+        // 读不到 policy（/proc 不可写）时保守当 L3：宁可多一次提示
+        assert!(EffectiveHash::default().l3_only());
+        assert!(
+            EffectiveHash {
+                policy: None,
+                fields: Some(31)
+            }
+            .l3_only()
+        );
+        // 旧内核没有 fields 档案时 policy 就是唯一判据
+        assert!(
+            !EffectiveHash {
+                policy: Some(1),
+                fields: None
+            }
+            .l3_only()
+        );
+        assert!(
+            EffectiveHash {
+                policy: Some(0),
+                fields: None
+            }
+            .l3_only()
+        );
+    }
+
+    /// IPv6 覆盖提示的判据：只看「非 lo 的 ::/0」。
+    #[test]
+    fn test_has_kernel_ipv6_default_route_ignores_lo_reject_route() {
+        // 多数系统在 lo 上有一条 ::/0 的 null route（metric ffffffff）：不算出口
+        let lo_only = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+                       00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n";
+        assert!(!has_kernel_ipv6_default_route(lo_only));
+        // 真的有一张网卡承载 ::/0 → 提示
+        let real = format!(
+            "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+             00000000000000000000000000000000 00000400 00000001 00000000 00000001   wan1\n{lo_only}"
+        );
+        assert!(has_kernel_ipv6_default_route(&real));
+        // 只有非 ::/0 的前缀（fe80::/64、/128 主机路由）不算
+        let other = "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 \
+                     00000000000000000000000000000000 00000400 00000001 00000000 00000001 eth0\n";
+        assert!(!has_kernel_ipv6_default_route(other));
+        // 空表 / 读取失败
+        assert!(!has_kernel_ipv6_default_route(""));
+    }
 
     fn monitor(name: &str, last_flush: Option<Instant>) -> WanMonitor {
         WanMonitor {
@@ -2621,40 +3200,40 @@ mod tests {
             Ok(NetlinkCmd::FlushConntrack(targets)) => {
                 targets.into_iter().map(|(name, _)| name).collect()
             }
-            Ok(_) => panic!("應送出 FlushConntrack，實際送出了其他指令"),
-            Err(err) => panic!("應送出 FlushConntrack，實際沒有送出指令：{err}"),
+            Ok(_) => panic!("应送出 FlushConntrack，实际送出了其他指令"),
+            Err(err) => panic!("应送出 FlushConntrack，实际没有送出指令：{err}"),
         }
     }
 
-    /// FIX-7 回歸：被最小間隔限流跳過的 flush-on-down 候選**不得**被標記成「本次 DOWN 已清過」。
+    /// FIX-7 回归：被最小间隔限流跳过的 flush-on-down 候选**不得**被标记成「本次 DOWN 已清过」。
     ///
-    /// 舊版順序是「先置位、後限流」，於是那條線在下個 tick 開頭就被
-    /// `if monitor.flushed_while_down { continue; }` 略過，整段 DOWN 期間再也不會嘗試清理
-    /// （只有下一次 UP→DOWN 才重置）→ 這次 DOWN 的 flush 永久丟失。
+    /// 旧版顺序是「先置位、后限流」，于是那条线在下个 tick 开头就被
+    /// `if monitor.flushed_while_down { continue; }` 略过，整段 DOWN 期间再也不会尝试清理
+    /// （只有下一次 UP→DOWN 才重置）→ 这次 DOWN 的 flush 永久丢失。
     #[test]
     fn test_flush_on_down_marker_is_set_only_after_enqueue() {
         let now = Instant::now();
         let min_interval = Duration::from_secs(10);
         let (tx, rx) = std::sync::mpsc::sync_channel::<NetlinkCmd>(4);
-        // 1 秒前才清過 → 這次落在最小間隔內
+        // 1 秒前才清过 → 这次落在最小间隔内
         let mut monitors = vec![monitor("wan1", Some(now - Duration::from_secs(1)))];
 
         flush_conntrack(&mut monitors, vec![(0, true)], &tx, now, min_interval);
         assert!(
             rx.try_recv().is_err(),
-            "最小間隔內不該送出任何 conntrack 清理指令"
+            "最小间隔内不该送出任何 conntrack 清理指令"
         );
         assert!(
             !monitors[0].flushed_while_down,
-            "被限流跳過的線若先被標記，整段 DOWN 期間都不會再重試"
+            "被限流跳过的线若先被标记，整段 DOWN 期间都不会再重试"
         );
         assert_eq!(
             monitors[0].last_conntrack_flush,
             Some(now - Duration::from_secs(1)),
-            "被跳過時不該更新清理時間戳"
+            "被跳过时不该更新清理时间戳"
         );
 
-        // 間隔過後重試：這次真的入隊，才准標記
+        // 间隔过后重试：这次真的入队，才准标记
         let later = now + Duration::from_secs(11);
         flush_conntrack(&mut monitors, vec![(0, true)], &tx, later, min_interval);
         assert_eq!(flushed_names(&rx), vec!["wan1".to_string()]);
@@ -2662,8 +3241,8 @@ mod tests {
         assert_eq!(monitors[0].last_conntrack_flush, Some(later));
     }
 
-    /// flush-on-switch 進來的候選不該動 `flushed_while_down`（線路仍是 UP）；
-    /// 同一張網卡同時來自兩個來源時只清一次，且來源旗標必須合併。
+    /// flush-on-switch 进来的候选不该动 `flushed_while_down`（线路仍是 UP）；
+    /// 同一张网卡同时来自两个来源时只清一次，且来源旗标必须合并。
     #[test]
     fn test_flush_on_switch_does_not_mark_down_flush() {
         let now = Instant::now();
@@ -2681,20 +3260,20 @@ mod tests {
         assert_eq!(
             flushed_names(&rx),
             vec!["wan1".to_string(), "wan0".to_string()],
-            "同一張網卡只能出現一次，且順序依第一次出現的下標"
+            "同一张网卡只能出现一次，且顺序依第一次出现的下标"
         );
         assert!(
             monitors[0].flushed_while_down,
-            "wan1 也來自 flush-on-down，來源旗標應合併"
+            "wan1 也来自 flush-on-down，来源旗标应合并"
         );
         assert!(
             !monitors[1].flushed_while_down,
-            "flush-on-switch 不得把線路標成『DOWN 期間已清』"
+            "flush-on-switch 不得把线路标成『DOWN 期间已清』"
         );
     }
 
-    /// 品質模式：RTT 較差的線被下修。`load_aware` 關閉時不套用刻度放大，
-    /// 因此維持舊行為（4 × 0.25 = 1）。
+    /// 品质模式：RTT 较差的线被下修。`load_aware` 关闭时不套用刻度放大，
+    /// 因此维持旧行为（4 × 0.25 = 1）。
     #[test]
     fn test_compute_quality_weights_rtt_and_loss() {
         let mut cfg = DaemonConfig::default();
@@ -2708,22 +3287,22 @@ mod tests {
         c.weight = 4;
         a.lqe.rtt_ewma_ms = Some(100.0);
         b.lqe.rtt_ewma_ms = Some(400.0);
-        c.lqe.rtt_ewma_ms = None; // 沒有 RTT 樣本 → 不懲罰
+        c.lqe.rtt_ewma_ms = None; // 没有 RTT 样本 → 不惩罚
         let monitors = vec![a, b, c];
-        // 全部承載；視窗未填滿 → 丟包不計
-        let weights = compute_dynamic_weights(&monitors, |_, _| true, &cfg);
-        assert_eq!(weights[0], 4, "最佳 RTT 維持原權重");
+        // 全部承载；视窗未填满 → 丢包不计
+        let weights = compute_dynamic_weights(&monitors, |_, _| true, &cfg, true);
+        assert_eq!(weights[0], 4, "最佳 RTT 维持原权重");
         assert_eq!(weights[1], 1, "RTT 4 倍差 → 下修到 min_ratio（4*0.25=1）");
-        assert_eq!(weights[2], 4, "沒有 RTT 樣本不該被懲罰");
+        assert_eq!(weights[2], 4, "没有 RTT 样本不该被惩罚");
 
-        // 非承載線維持設定權重（不會被下發，但狀態檔顯示用）
-        let weights = compute_dynamic_weights(&monitors, |slot, _| slot == 0, &cfg);
+        // 非承载线维持设定权重（不会被下发，但状态档显示用）
+        let weights = compute_dynamic_weights(&monitors, |slot, _| slot == 0, &cfg, true);
         assert_eq!(weights[1], 4);
         assert_eq!(weights[2], 4);
     }
 
-    /// 負載感知：一條線過載時，透過「刻度放大 + 下修因子」把 ECMP 權重比例
-    /// 往空閒線傾斜（把部分 flow 轉移過去）；壓力解除後還原設定權重。
+    /// 负载感知：一条线过载时，透过「刻度放大 + 下修因子」把 ECMP 权重比例
+    /// 往空闲线倾斜（把部分 flow 转移过去）；压力解除后还原设定权重。
     #[test]
     fn test_compute_load_weights_shifts_traffic_to_idle_line() {
         let mut cfg = DaemonConfig::default();
@@ -2734,7 +3313,7 @@ mod tests {
 
         let mut busy = monitor("wan1", None);
         let mut idle = monitor("wan2", None);
-        // 兩條線容量相同（100 Mbps），busy 打滿、idle 幾乎沒流量
+        // 两条线容量相同（100 Mbps），busy 打满、idle 几乎没流量
         for m in [&mut busy, &mut idle] {
             m.down_bps_capacity = Some(100_000_000.0);
             m.up_bps_capacity = Some(100_000_000.0);
@@ -2750,14 +3329,14 @@ mod tests {
             cfg.load_target_ratio,
             cfg.load_recover_ratio,
         );
-        assert!(monitors[0].load_pressure_active, "95% 應觸發過載下修");
-        assert!(!monitors[1].load_pressure_active, "5% 不該觸發");
+        assert!(monitors[0].load_pressure_active, "95% 应触发过载下修");
+        assert!(!monitors[1].load_pressure_active, "5% 不该触发");
 
-        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg);
+        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg, true);
         // busy factor = 0.25、idle = 1.0；刻度放大 4 倍 → 1 : 4
-        assert_eq!(weights, vec![1, 4], "過載線應被下修、空閒線放大來接流量");
+        assert_eq!(weights, vec![1, 4], "过载线应被下修、空闲线放大来接流量");
 
-        // 遲滯死區（60%~80%）：已下修的線不解除，避免在門檻附近來回跳動
+        // 迟滞死区（60%~80%）：已下修的线不解除，避免在门槛附近来回跳动
         monitors[0].rx_bps_ewma = 70_000_000.0;
         update_load_pressure(
             &mut monitors,
@@ -2767,10 +3346,10 @@ mod tests {
         );
         assert!(
             monitors[0].load_pressure_active,
-            "落在 recover 與 target 之間應保持下修"
+            "落在 recover 与 target 之间应保持下修"
         );
 
-        // 低於 recover（60%）→ 壓力解除、權重還原，且不再套用刻度放大
+        // 低于 recover（60%）→ 压力解除、权重还原，且不再套用刻度放大
         monitors[0].rx_bps_ewma = 10_000_000.0;
         update_load_pressure(
             &mut monitors,
@@ -2779,10 +3358,10 @@ mod tests {
             cfg.load_recover_ratio,
         );
         assert!(!monitors[0].load_pressure_active);
-        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg);
-        assert_eq!(weights, vec![1, 1], "壓力解除後回到設定權重");
+        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg, true);
+        assert_eq!(weights, vec![1, 1], "压力解除后回到设定权重");
 
-        // 兩條線都過載：因子相同 → 權重比例不變（無處可去，不製造無意義的路由變更）
+        // 两条线都过载：因子相同 → 权重比例不变（无处可去，不制造无意义的路由变更）
         let mut a = monitor("wan1", None);
         let mut b = monitor("wan2", None);
         for m in [&mut a, &mut b] {
@@ -2796,17 +3375,17 @@ mod tests {
             cfg.load_target_ratio,
             cfg.load_recover_ratio,
         );
-        let weights = compute_dynamic_weights(&both, |s, _| active[s], &cfg);
-        assert_eq!(weights, vec![1, 1], "全線過載時維持原比例");
+        let weights = compute_dynamic_weights(&both, |s, _| active[s], &cfg, true);
+        assert_eq!(weights, vec![1, 1], "全线过载时维持原比例");
 
-        // 只有一條承載線時不做負載下修（無處可分）
+        // 只有一条承载线时不做负载下修（无处可分）
         let only = vec![monitor("wan1", None)];
-        let weights = compute_dynamic_weights(&only, |_, _| true, &cfg);
+        let weights = compute_dynamic_weights(&only, |_, _| true, &cfg, true);
         assert_eq!(weights, vec![1]);
     }
 
-    /// 容量比例分流：設定 max_mbps 後，基準權重自動 ∝ 最大頻寬，
-    /// 不需要手動換算 weight（1000 vs 200 → 5:1；1000 vs 10 → 100:1）。
+    /// 容量比例分流：设定 max_mbps 后，基准权重自动 ∝ 最大频宽，
+    /// 不需要手动换算 weight（1000 vs 200 → 5:1；1000 vs 10 → 100:1）。
     #[test]
     fn test_compute_bandwidth_proportional_weights() {
         let cfg = DaemonConfig::default();
@@ -2816,46 +3395,74 @@ mod tests {
         let mut b = monitor("wan2", None);
         a.down_bps_capacity = Some(1_000_000_000.0);
         b.down_bps_capacity = Some(200_000_000.0);
-        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg);
-        assert_eq!(weights, vec![5, 1], "權重比應等於最大頻寬比 1000:200");
+        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg, true);
+        assert_eq!(weights, vec![5, 1], "权重比应等于最大频宽比 1000:200");
 
-        // 極端差距（1000 : 10 = 100 : 1）仍可表達
+        // 极端差距（1000 : 10 = 100 : 1）仍可表达
         let mut a = monitor("wan1", None);
         let mut b = monitor("wan2", None);
         a.down_bps_capacity = Some(1_000_000_000.0);
         b.down_bps_capacity = Some(10_000_000.0);
-        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg);
+        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg, true);
         assert_eq!(weights, vec![100, 1]);
 
-        // 差距超過 255:1 時夾在單一 nexthop 的上限
+        // 差距超过 255:1 时夹在单一 nexthop 的上限
         let mut a = monitor("wan1", None);
         let mut b = monitor("wan2", None);
         a.down_bps_capacity = Some(1_000_000_000.0);
         b.down_bps_capacity = Some(1_000_000.0);
-        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg);
-        assert_eq!(weights, vec![config::MAX_WEIGHT, 1], "超過 255:1 應夾住");
+        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg, true);
+        assert_eq!(weights, vec![config::MAX_WEIGHT, 1], "超过 255:1 应夹住");
 
-        // weight 仍可當手動倍率：2×1000 : 1×500 = 4 : 1
+        // weight 仍可当手动倍率：2×1000 : 1×500 = 4 : 1
         let mut a = monitor("wan1", None);
         let mut b = monitor("wan2", None);
         a.weight = 2;
         a.down_bps_capacity = Some(1_000_000_000.0);
         b.down_bps_capacity = Some(500_000_000.0);
-        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg);
+        let weights = compute_dynamic_weights(&[a, b], |_, _| true, &cfg, true);
         assert_eq!(weights, vec![4, 1]);
 
-        // 完全沒設容量 → 退回設定 weight（既有行為不變）
+        // 完全没设容量 → 退回设定 weight（既有行为不变）
         let cfg2 = DaemonConfig::default();
         assert!(!cfg2.capacity_weights_on());
         let weights = compute_dynamic_weights(
             &[monitor("wan1", None), monitor("wan2", None)],
             |_, _| true,
             &cfg2,
+            true,
         );
         assert_eq!(weights, vec![1, 1]);
     }
 
-    /// 容量比例分流 + 負載感知：過載線在容量基準上再被下修。
+    #[test]
+    fn test_dynamic_factors_gate_requires_resilient_or_opt_in() {
+        // 只有容量比例（没开 quality / load_aware）时没有动态因子要挡
+        let cfg = DaemonConfig::default();
+        assert!(dynamic_factors_allowed(&cfg, false));
+        assert!(dynamic_factors_allowed(&cfg, true));
+
+        // standard（kernel_resilient = false）下 quality / load_aware 一律被忽略…
+        let mut quality = DaemonConfig::default();
+        quality.weight_mode = WeightMode::Quality;
+        assert!(!dynamic_factors_allowed(&quality, false));
+
+        let mut load = DaemonConfig::default();
+        load.load_aware = true;
+        assert!(!dynamic_factors_allowed(&load, false));
+
+        // …除非内核实际安装的是 resilient…
+        assert!(dynamic_factors_allowed(&quality, true));
+        assert!(dynamic_factors_allowed(&load, true));
+
+        // …或使用者明确覆写。
+        let mut override_cfg = DaemonConfig::default();
+        override_cfg.load_aware = true;
+        override_cfg.allow_dynamic_weights_on_standard = true;
+        assert!(dynamic_factors_allowed(&override_cfg, false));
+    }
+
+    /// 容量比例分流 + 负载感知：过载线在容量基准上再被下修。
     #[test]
     fn test_bandwidth_baseline_plus_load_offload() {
         let mut cfg = DaemonConfig::default();
@@ -2870,7 +3477,7 @@ mod tests {
         busy.up_bps_capacity = Some(1_000_000_000.0);
         idle.down_bps_capacity = Some(200_000_000.0);
         idle.up_bps_capacity = Some(200_000_000.0);
-        busy.rx_bps_ewma = 950_000_000.0; // wan1 95%（過載）
+        busy.rx_bps_ewma = 950_000_000.0; // wan1 95%（过载）
         idle.rx_bps_ewma = 10_000_000.0; // wan2 5%
         let mut monitors = vec![busy, idle];
         let active = [true, true];
@@ -2882,13 +3489,13 @@ mod tests {
         );
         assert!(monitors[0].load_pressure_active);
 
-        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg);
-        // 基準 5:1；wan1 因子 0.25（刻度 4）→ 20×0.25=5、wan2=4 → 5:4
-        assert_eq!(weights, vec![5, 4], "過載線在容量基準上被進一步下修");
+        let weights = compute_dynamic_weights(&monitors, |s, _| active[s], &cfg, true);
+        // 基准 5:1；wan1 因子 0.25（刻度 4）→ 20×0.25=5、wan2=4 → 5:4
+        assert_eq!(weights, vec![5, 4], "过载线在容量基准上被进一步下修");
     }
 
-    /// 未設定容量時（未啟用 load_aware 的設定不會走到這裡，但函式要防守）
-    /// 利用率視為未知，不得觸發壓力。
+    /// 未设定容量时（未启用 load_aware 的设定不会走到这里，但函式要防守）
+    /// 利用率视为未知，不得触发压力。
     #[test]
     fn test_load_pressure_requires_capacity() {
         let mut m = monitor("wan1", None);
@@ -2896,7 +3503,88 @@ mod tests {
         assert_eq!(load_utilization(&m), None);
         let mut monitors = vec![m];
         update_load_pressure(&mut monitors, &[true], 0.8, 0.6);
-        assert!(!monitors[0].load_pressure_active, "沒有容量就不判定過載");
+        assert!(!monitors[0].load_pressure_active, "没有容量就不判定过载");
+    }
+
+    /// 过载状态转换要能被「看见」（回传值就是 main 回圈用来插队重下权重的讯号），
+    /// 但没有转换时不得回传 true（否则每拍都会重下路由）。
+    #[test]
+    fn test_load_pressure_reports_transitions_only() {
+        let mut busy = monitor("wan1", None);
+        let mut calm = monitor("wan2", None);
+        busy.down_bps_capacity = Some(100_000_000.0);
+        busy.up_bps_capacity = Some(100_000_000.0);
+        calm.down_bps_capacity = Some(100_000_000.0);
+        calm.up_bps_capacity = Some(100_000_000.0);
+        busy.rx_bps_ewma = 90_000_000.0; // 90% → 过载
+        calm.rx_bps_ewma = 10_000_000.0; // 10%
+        let mut monitors = vec![busy, calm];
+        let active = [true, true];
+
+        // 进入过载：一次转换
+        assert!(update_load_pressure(&mut monitors, &active, 0.8, 0.6));
+        assert!(monitors[0].load_pressure_active);
+        // 维持在门槛与恢复线之间（0.7）：状态不变 → 不该再产生转换
+        monitors[0].rx_bps_ewma = 70_000_000.0;
+        assert!(!update_load_pressure(&mut monitors, &active, 0.8, 0.6));
+        assert!(monitors[0].load_pressure_active, "迟滞死区内维持原状态");
+        // 掉到恢复线以下 0.5 → 解除，也是一次转换
+        monitors[0].rx_bps_ewma = 50_000_000.0;
+        assert!(update_load_pressure(&mut monitors, &active, 0.8, 0.6));
+        assert!(!monitors[0].load_pressure_active);
+
+        // 非活跃线不参与判定，也不该产生转换（否则停机期间会白写路由）
+        monitors[0].rx_bps_ewma = 99_000_000.0;
+        assert!(!update_load_pressure(
+            &mut monitors,
+            &[false, true],
+            0.8,
+            0.6
+        ));
+
+        // 容量被清掉（例如设定改变）时压力必须解除，否则权重会永远被下修
+        monitors[0].down_bps_capacity = None;
+        monitors[0].load_pressure_active = true;
+        assert!(update_load_pressure(&mut monitors, &active, 0.8, 0.6));
+        assert!(!monitors[0].load_pressure_active);
+    }
+
+    /// 权重下发的时机：平常受限速约束；过载状态转换时允许插队（新连线该马上改走另一条线），
+    /// 但仍保留一个最小间隔，避免状态机在门槛附近翻转时把路由表刷爆。
+    #[test]
+    fn test_weight_update_due_rate_limit_and_transition_bypass() {
+        let interval = Duration::from_secs(10);
+        let floor = Duration::from_millis(1000);
+
+        // 没到期、没有转换 → 不重下
+        assert!(!weight_update_due(
+            Duration::from_millis(500),
+            interval,
+            false,
+            floor
+        ));
+        // 没到期但有转换 → 插队（只要超过最小间隔）
+        assert!(weight_update_due(
+            Duration::from_millis(1000),
+            interval,
+            true,
+            floor
+        ));
+        // 转换 + 仍在最小间隔内 → 不重下（挡掉门槛附近的每秒翻转）
+        assert!(!weight_update_due(
+            Duration::from_millis(999),
+            interval,
+            true,
+            floor
+        ));
+        // 到期就一定重下（即使没有转换）
+        assert!(weight_update_due(interval, interval, false, floor));
+        assert!(weight_update_due(
+            Duration::from_secs(30),
+            interval,
+            false,
+            floor
+        ));
     }
 
     #[test]
@@ -2932,19 +3620,19 @@ mod tests {
         let monitors = vec![down, up];
 
         let rules = build_policy_rules(&cfg, &monitors);
-        assert_eq!(rules.len(), 2, "2 個來源 × 1 個目的，且 Down 的政策被跳過");
+        assert_eq!(rules.len(), 2, "2 个来源 × 1 个目的，且 Down 的政策被跳过");
         for rule in &rules {
             assert_eq!(rule.name, "guest");
             assert_eq!(rule.ifindex, 22);
-            assert_eq!(rule.table, PROBE_TABLE_BASE + 1, "用目標 WAN 的獨立表");
-            assert_eq!(rule.priority, POLICY_RULE_PRIORITY_BASE, "預設依政策順序");
+            assert_eq!(rule.table, PROBE_TABLE_BASE + 1, "用目标 WAN 的独立表");
+            assert_eq!(rule.priority, POLICY_RULE_PRIORITY_BASE, "预设依政策顺序");
             assert_eq!(rule.destination, Some(("10.0.0.0".parse().unwrap(), 8)));
         }
         let sources: Vec<_> = rules.iter().filter_map(|r| r.source).collect();
         assert!(sources.contains(&("192.168.3.0".parse().unwrap(), 24)));
         assert!(sources.contains(&("192.168.4.0".parse().unwrap(), 24)));
 
-        // 目標恢復 UP 後，match-all 的政策也回來（source/destination 都是 None）
+        // 目标恢复 UP 后，match-all 的政策也回来（source/destination 都是 None）
         let mut up_dead = monitor("wan1", None);
         up_dead.lqe.state = LinkState::Up;
         up_dead.ifindex = 11;

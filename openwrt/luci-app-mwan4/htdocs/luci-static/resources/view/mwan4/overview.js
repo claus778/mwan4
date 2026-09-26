@@ -18,9 +18,9 @@ function readStatusJson() {
 	});
 }
 
-/* 內核設備名清單：daemon 用 SO_BINDTODEVICE + if_nametoindex 都需要「內核設備名」，
-   而 UCI 裏的 network interface 是邏輯名（wan/wanb…），兩者經常不同名。
-   橋接（br-*）是 LAN 側，當 WAN 用幾乎一定是選錯了，這裡直接排除。 */
+/* 内核设备名清单：daemon 用 SO_BINDTODEVICE + if_nametoindex 都需要「内核设备名」，
+   而 UCI 里的 network interface 是逻辑名（wan/wanb…），两者经常不同名。
+   桥接（br-*）是 LAN 侧，当 WAN 用几乎一定是选错了，这里直接排除。 */
 function listNetdevs() {
 	return fs.list('/sys/class/net').then(function(list) {
 		return (list || []).filter(function(name) {
@@ -31,18 +31,18 @@ function listNetdevs() {
 	});
 }
 
-/* 容忍的時鐘偏差（秒）：瀏覽器時鐘落後路由器時，只有差距超過這個值才說
-   「無法判斷」。實測路由器（NTP 同步）與瀏覽器差十幾秒是常態，
-   原本用 stale_after_secs（10 秒）當門檻會把正常運作誤報成 clock skew。 */
+/* 容忍的时钟偏差（秒）：浏览器时钟落后路由器时，只有差距超过这个值才说
+   「无法判断」。实测路由器（NTP 同步）与浏览器差十几秒是常态，
+   原本用 stale_after_secs（10 秒）当门槛会把正常运作误报成 clock skew。 */
 var CLOCK_SKEW_TOLERANCE_SECS = 300;
 
-/* 上一次看到的 updated_at：用來判斷 daemon 是否還在寫狀態檔。
-   兩邊時鐘差多少不影響這個判斷——只要 updated_at 還在變大，daemon 就是活的。 */
+/* 上一次看到的 updated_at：用来判断 daemon 是否还在写状态档。
+   两边时钟差多少不影响这个判断——只要 updated_at 还在变大，daemon 就是活的。 */
 var lastSeenUpdatedAt = null;
 
-/* 狀態檔新鮮度：卡片與徽章都必須據此判斷，否則 daemon 被殺掉之後
-   最後一次快照（可能剛好是兩條 DOWN）會被當成即時狀態一直顯示。
-   回傳 'fresh' | 'stale' | 'skew' | 'missing' */
+/* 状态档新鲜度：卡片与徽章都必须据此判断，否则 daemon 被杀掉之后
+   最后一次快照（可能刚好是两条 DOWN）会被当成即时状态一直显示。
+   回传 'fresh' | 'stale' | 'skew' | 'missing' */
 function freshnessOf(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return 'missing';
@@ -51,14 +51,14 @@ function freshnessOf(statusData) {
 	var advanced = lastSeenUpdatedAt !== null && updated > lastSeenUpdatedAt;
 	if (lastSeenUpdatedAt === null || updated > lastSeenUpdatedAt)
 		lastSeenUpdatedAt = updated;
-	// daemon 還在推進 updated_at → 確定活著，與兩邊時鐘差多少無關
+	// daemon 还在推进 updated_at → 确定活著，与两边时钟差多少无关
 	if (advanced)
 		return 'fresh';
 
 	var age = Date.now() / 1000 - updated;
 	if (age > staleAfter)
 		return 'stale';
-	// 瀏覽器時鐘落後：只有差距大到無法用「時鐘偏差」解釋時才說不可判斷
+	// 浏览器时钟落后：只有差距大到无法用「时钟偏差」解释时才说不可判断
 	if (age < -CLOCK_SKEW_TOLERANCE_SECS)
 		return 'skew';
 	return 'fresh';
@@ -99,13 +99,13 @@ function runText(fresh) {
 
 function stateText(iface) {
 	if (iface.state !== 'UP') return _('Offline (DOWN)');
-	// 降級 = 仍 UP、仍探測，但已因實測丟包率超標被移出 ECMP（見 degrade_loss_threshold）
+	// 降级 = 仍 UP、仍探测，但已因实测丢包率超标被移出 ECMP（见 degrade_loss_threshold）
 	return iface.degraded
 		? _('Online (UP, degraded - not carrying traffic)')
 		: _('Online (UP)');
 }
 
-/* 卡片提示：資料不可信 > 本機條件錯誤 > 一般探針錯誤 > 降級 */
+/* 卡片提示：资料不可信 > 本机条件错误 > 一般探针错误 > 降级 */
 function cardAlert(iface, fresh) {
 	if (fresh === 'stale')
 		return _('Status is stale: the daemon may have stopped. This is the last known state.');
@@ -125,7 +125,7 @@ function cardAlert(iface, fresh) {
 	return '';
 }
 
-/* 狀態檔年齡（人看得懂的形式）；時鐘嚴重不同步時明說，不要瞎報秒數 */
+/* 状态档年龄（人看得懂的形式）；时钟严重不同步时明说，不要瞎报秒数 */
 function statusAgeText(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return _('missing');
@@ -158,7 +158,7 @@ function jitterText(iface) { return iface.state === 'UP' ? iface.jitter_ms.toFix
 function lossText(iface) { return (iface.loss_rate || 0).toFixed(1) + '%'; }
 function pwText(iface) {
 	var w = 'W:' + iface.weight;
-	// 動態權重啟用且與設定值不同時一併顯示，方便驗證品質感知分流
+	// 动态权重启用且与设定值不同时一并显示，方便验证品质感知分流
 	if (iface.effective_weight !== undefined && iface.effective_weight !== iface.weight)
 		w = 'W:' + iface.weight + ' \u2192 ' + iface.effective_weight;
 	return (iface.metric ? ('P:' + iface.metric + ' / ') : '') + w;
@@ -173,7 +173,7 @@ function formatRate(bps) {
 function rateText(iface) {
 	if (iface.state !== 'UP') return '\u2191 --  \u2193 --';
 	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
-	// 負載感知啟用且該線設有容量時，附上利用率與是否正被下修
+	// 负载感知启用且该线设有容量时，附上利用率与是否正被下修
 	if (iface.load_pct !== undefined && iface.load_pct !== null) {
 		text += '  (' + iface.load_pct.toFixed(0) + '%';
 		if (iface.offloaded) text += ', ' + _('offloaded');
@@ -187,6 +187,22 @@ function policyText(statusData) {
 	return list.map(function(p) {
 		return p.name + '\u2192' + p.interface + (p.active ? '' : _(' (inactive)'));
 	}).join(', ');
+}
+
+/* 内核「实际生效」的多路径哈希粒度（读回值，不是设定值）：
+   l3_only = 同一个目的 IP 的所有连线只会走一条 WAN，也就是视频 CDN 的多条连线
+   用不到第二条线（「多 WAN 却还是卡」最常见的成因）。 */
+function hashInfo(statusData) {
+	var h = statusData && statusData.hash;
+	if (!h) return { level: 'muted', text: _('Unknown') };
+	var policy = (h.policy === null || h.policy === undefined) ? 'n/a' : h.policy;
+	var detail = 'policy=' + policy + ' fields=' + (h.fields_desc || 'n/a');
+	return {
+		level: h.l3_only ? 'warn' : 'ok',
+		text: (h.l3_only
+			? _('L3 only: one WAN per destination IP')
+			: _('l4: per-connection spreading')) + ' (' + detail + ')'
+	};
 }
 function succText(iface) { return _('Consecutive Successes: ') + iface.consecutive_successes; }
 function toText(iface) { return _('Consecutive Timeouts: ') + iface.consecutive_timeouts; }
@@ -284,6 +300,13 @@ return view.extend({
 					E('span', { 'class': 'mwan4-badge' }, [
 						E('span', { 'data-role': 'policy-text' }, policyText(statusData) || '')
 					])
+				]),
+				E('span', { 'class': 'mwan4-meta-item' }, [
+					E('span', { 'class': 'mwan4-meta-key' }, _('Hash Granularity:')),
+					E('span', { 'class': 'mwan4-badge' }, [
+						dot(hashInfo(statusData).level, 'hash-dot'),
+						E('span', { 'data-role': 'hash-text' }, hashInfo(statusData).text)
+					])
 				])
 			])
 		]);
@@ -292,7 +315,7 @@ return view.extend({
 	renderCard: function(iface, fresh) {
 		var up = iface.state === 'UP';
 		var loss = iface.loss_rate || 0;
-		// 首帧就要用真正的新鮮度，否則載入一個陳舊快照時第一眼會是「即時狀態」
+		// 首帧就要用真正的新鲜度，否则载入一个陈旧快照时第一眼会是「即时状态」
 		var trust = fresh || 'fresh';
 		var alert = cardAlert(iface, trust);
 		var stale = (trust === 'stale' || trust === 'skew' || trust === 'missing');
@@ -404,7 +427,7 @@ return view.extend({
 		setText(pick(card, 'state-text'), stateText(iface));
 		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + (up ? 'ok' : 'bad'));
 
-		// 過期／本機條件錯誤一律標在卡片上：不要讓「最後一次快照」偽裝成即時狀態
+		// 过期／本机条件错误一律标在卡片上：不要让「最后一次快照」伪装成即时状态
 		var alert = cardAlert(iface, fresh);
 		var alertEl = pick(card, 'alert');
 		if (alertEl) {
@@ -445,6 +468,9 @@ return view.extend({
 			var policyItem = pick(header, 'policy-item');
 			if (policyItem) policyItem.style.display = pt ? '' : 'none';
 			setText(pick(header, 'policy-text'), pt || '');
+			var hi = hashInfo(statusData);
+			setText(pick(header, 'hash-text'), hi.text);
+			setCls(pick(header, 'hash-dot'), 'mwan4-dot ' + hi.level);
 		}
 
 		var container = document.getElementById('mwan4_cards_container');
@@ -639,7 +665,7 @@ return view.extend({
 				font-family: monospace;
 			}
 
-			/* 資料過期：虛線 + 淡化，避免「最後一次快照」被當成即時狀態 */
+			/* 资料过期：虚线 + 淡化，避免「最后一次快照」被当成即时状态 */
 			.mwan4-card-stale {
 				border-style: dashed !important;
 				opacity: .75;
@@ -888,8 +914,8 @@ return view.extend({
 		this.viewRoot = viewRoot;
 		this.pollMisses = 0;
 		this.pollFn = this.updateDashboard.bind(this);
-		// 與 LuCI 全域預設一致的 5 秒輪詢：守護進程每秒寫一次狀態檔，
-		// 2 秒一拉的頻率對低配路由器上的 uhttpd/rpcd 是純粹的常駐開銷
+		// 与 LuCI 全域预设一致的 5 秒轮询：守护进程每秒写一次状态档，
+		// 2 秒一拉的频率对低配路由器上的 uhttpd/rpcd 是纯粹的常驻开销
 		poll.add(this.pollFn, 5);
 
 
@@ -934,7 +960,7 @@ return view.extend({
 		o.value('standard', _('Standard ECMP (multipath route)'));
 		o.value('auto', _('Automatic (resilient when supported)'));
 		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
-		o.default = 'standard';
+		o.default = 'auto';
 		o.rmempty = false;
 
 		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
@@ -974,8 +1000,10 @@ return view.extend({
 
 		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'));
 		o.value('l3', _('L3 (addresses only)'));
-		o.value('l4', _('L4 (addresses + ports, recommended)'));
+		o.value('l4', _('L4 (addresses + ports, the default)'));
 		o.value('inner', _('L3 + tunnel inner headers'));
+		o.value('', _('Leave the kernel default (L3: one WAN per destination IP)'));
+		o.default = 'l4';
 		o.rmempty = true;
 
 		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'));

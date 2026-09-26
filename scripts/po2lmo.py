@@ -80,8 +80,8 @@ def parse_po(filename):
 
     current_msg = {"ctxt": None, "id": None, "str": None}
     state = None
-    # `#, fuzzy` 表示翻譯尚未定稿（msgmerge 後常見）：不要編進 UI，
-    # 否則使用者會看到半成品翻譯，而譯者以為還標著 fuzzy 沒人用。
+    # `#, fuzzy` 表示翻译尚未定稿（msgmerge 后常见）：不要编进 UI，
+    # 否则使用者会看到半成品翻译，而译者以为还标著 fuzzy 没人用。
     current_fuzzy = False
 
     lines = content.splitlines()
