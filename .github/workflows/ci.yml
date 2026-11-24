@@ -178,7 +178,18 @@ jobs:
 
       - name: Run netns route lifecycle tests
         run: |
-          unshare -Urn sh -c             'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
+          # Ubuntu 24.04 起 kernel.apparmor_restrict_unprivileged_userns=1，`unshare -Urn`
+          # 会被直接拒（unshare failed: Operation not permitted），job 永远是红的 ——
+          # 这不是测试失败，是 runner 环境不允许无特权 user namespace。
+          # runner 上 sudo 免密，root 建 netns 不需要 -U，所以先试无特权、不行再提权。
+          if unshare -Urn sh -c 'echo userns-ok' >/dev/null 2>&1; then
+            unshare -Urn sh -c 'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
+          else
+            echo "::notice::unprivileged userns blocked; retrying netns tests under sudo"
+            sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+              "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+              unshare -n sh -c 'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
+          fi
 
   # ── MSRV 守门：确保 Cargo.toml 宣告的 rust-version 真的能编过 ─────────
   # Cargo.toml 使用 edition 2024 并宣告 rust-version = "1.85"。
