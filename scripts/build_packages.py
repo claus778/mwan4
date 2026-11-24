@@ -53,8 +53,8 @@ LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r12"
-IPK_RELEASE = "12"
+APK_RELEASE = "r13"
+IPK_RELEASE = "13"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
@@ -299,6 +299,7 @@ def create_exact_apk_package(
     private_key: rsa.RSAPrivateKey,
     post_install: str | None = None,
     post_upgrade: str | None = None,
+    pre_deinstall: str | None = None,
     depends: list[str] | None = None,
     provides: list[str] | None = None,
 ) -> None:
@@ -373,6 +374,11 @@ def create_exact_apk_package(
         control_tar.extend(make_ustar_header(".post-upgrade", len(pu_bytes), 0o755, b"0"))
         control_tar.extend(pad512(pu_bytes))
 
+    if pre_deinstall:
+        pd_bytes = pre_deinstall.replace("\r\n", "\n").encode("utf-8")
+        control_tar.extend(make_ustar_header(".pre-deinstall", len(pd_bytes), 0o755, b"0"))
+        control_tar.extend(pad512(pd_bytes))
+
     control_gz_bytes = compress_gz(bytes(control_tar))
 
     # --- Stream 1 (Signature) ---
@@ -399,6 +405,7 @@ def create_ipk_package(
     desc: str,
     data_entries: list[dict],
     postinst: str | None = None,
+    prerm: str | None = None,
     depends: list[str] | None = None,
     conffiles: list[str] | None = None,
 ) -> None:
@@ -440,6 +447,10 @@ def create_ipk_package(
         pi_bytes = postinst.replace("\r\n", "\n").encode("utf-8")
         control_tar.extend(make_ustar_header("postinst", len(pi_bytes), 0o755, b"0"))
         control_tar.extend(pad512(pi_bytes))
+    if prerm:
+        pr_bytes = prerm.replace("\r\n", "\n").encode("utf-8")
+        control_tar.extend(make_ustar_header("prerm", len(pr_bytes), 0o755, b"0"))
+        control_tar.extend(pad512(pr_bytes))
     if conffiles:
         # opkg 读 control.tar.gz 里的 conffiles 档（一行一个绝对路径），
         # 没有它会把 /etc 下的设定当普通档案：升级时用包内容覆盖、移除时直接删掉。
@@ -497,6 +508,16 @@ if [ -x /usr/bin/mwan4 ] && [ -f /etc/mwan4/mwan4.json ]; then
 fi
 /etc/init.d/mwan4 enable
 /etc/init.d/mwan4 restart
+exit 0
+"""
+
+PRE_DEINSTALL_TEMPLATE = """#!/bin/sh
+[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+# 卸载前优雅停止并禁用服务，确保守护进程释放探针规则、策略规则、underlay/DNS 主机路由与 PID 锁
+if [ -x /etc/init.d/mwan4 ]; then
+    /etc/init.d/mwan4 stop 2>/dev/null || true
+    /etc/init.d/mwan4 disable 2>/dev/null || true
+fi
 exit 0
 """
 
@@ -592,11 +613,11 @@ fi
 
 chmod +x /usr/bin/mwan4 /etc/init.d/mwan4
 
+# /etc/init.d/mwan4 实际读取 /etc/config/mwan4 并生成 /var/etc/mwan4.json（启动时会自动 --check-config）；
+# 若存在独立的 /etc/mwan4/mwan4.json，仅做友好提示而不阻断 UCI 模式的安装。
 if [ -f /etc/mwan4/mwan4.json ]; then
-    if ! /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json; then
-        echo "Error: /etc/mwan4/mwan4.json failed validation, aborting install" >&2
-        exit 1
-    fi
+    /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \\
+        echo "Warning: standalone /etc/mwan4/mwan4.json failed validation (UCI /etc/config/mwan4 will still be validated by init.d)" >&2
 fi
 
 /etc/init.d/mwan4 enable
@@ -832,6 +853,7 @@ def main() -> int:
             data_entries=data_entries,
             private_key=private_key,
             post_install=POST_INSTALL_TEMPLATE,
+            pre_deinstall=PRE_DEINSTALL_TEMPLATE,
             depends=[arch.libc_dep],
             provides=[f"cmd:{PKG_NAME}={apk_ver}"],
         )
@@ -844,6 +866,7 @@ def main() -> int:
             desc="Ultra-lightweight Multi-WAN failover & health monitor daemon for OpenWrt",
             data_entries=data_entries,
             postinst=POST_INSTALL_TEMPLATE,
+            prerm=PRE_DEINSTALL_TEMPLATE,
             depends=["libc"],
             conffiles=["/etc/config/mwan4", "/etc/mwan4/mwan4.json"],
         )

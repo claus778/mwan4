@@ -83,11 +83,11 @@ fi
 
 chmod +x /usr/bin/mwan4 /etc/init.d/mwan4
 
+# /etc/init.d/mwan4 实际读取 /etc/config/mwan4 并生成 /var/etc/mwan4.json（启动时会自动 --check-config）；
+# 若存在独立的 /etc/mwan4/mwan4.json，仅做友好提示而不阻断 UCI 模式的安装。
 if [ -f /etc/mwan4/mwan4.json ]; then
-    if ! /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json; then
-        echo "Error: /etc/mwan4/mwan4.json failed validation, aborting install" >&2
-        exit 1
-    fi
+    /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \
+        echo "Warning: standalone /etc/mwan4/mwan4.json failed validation (UCI /etc/config/mwan4 will still be validated by init.d)" >&2
 fi
 
 /etc/init.d/mwan4 enable

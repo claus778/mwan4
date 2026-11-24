@@ -72,8 +72,8 @@ msgid "Consecutive probe timeouts before interface is marked DOWN (default: 3)"
 msgstr "连续超时达到此数值直接判定线路为 DOWN（默认 3 次）"
 msgid "Recovery Success Count (Hysteresis)"
 msgstr "防震荡恢复次数 (Hysteresis)"
-msgid "Consecutive successful probes with <10% loss required before recovering to UP (default: 5)"
-msgstr "线路断开后需连续成功此数值且丢包<10%才恢复为 UP（默认 5 次）"
+msgid "Consecutive successful probes with normal RTT required before recovering to UP (default: 5)"
+msgstr "线路断开后需连续成功此数值且 RTT 正常才恢复为 UP（默认 5 次）"
 msgid "Flush Conntrack on DOWN"
 msgstr "掉线自动清理 Conntrack"
 msgid "Flush TCP/UDP connections on an interface when it goes down."
@@ -226,3 +226,123 @@ msgstr "合计速率"
 
 msgid "RTT Trend"
 msgstr "RTT 趋势"
+
+msgid "DNS Pinning:"
+msgstr "DNS 出口绑定："
+
+msgid "Health Probe Protocol"
+msgstr "健康探测协议"
+
+msgid "tcp uses lightweight TCP SYN handshakes; dns sends real UDP DNS queries (ephemeral port, never conflicts with AdGuardHome / SmartDNS / MosDNS / dnsmasq) to detect broken DNS or hijacked links."
+msgstr "tcp 使用轻量 TCP SYN 握手；dns 发送真实 UDP DNS 查询（临时端口，绝不与 AdGuardHome / SmartDNS / MosDNS / dnsmasq 冲突），可识别假通或 DNS 故障。"
+
+msgid "TCP SYN (default)"
+msgstr "TCP SYN（默认）"
+
+msgid "DNS Query (UDP)"
+msgstr "DNS 查询（UDP）"
+
+msgid "DNS Probe Domain"
+msgstr "DNS 探测域名"
+
+msgid "Domain queried when Health Probe Protocol is set to DNS Query (default: baidu.com)."
+msgstr "健康探测协议设为 DNS 查询时请求的测试域名（默认 baidu.com）。"
+
+msgid "Packet Loss Threshold for DOWN"
+msgstr "断线丢包率阈值"
+
+msgid "Sliding-window packet loss ratio (0.0 - 1.0) above which a link is marked DOWN (default: 0.5)."
+msgstr "滑动窗口丢包率（0.0 - 1.0）高于此值直接判定线路 DOWN（默认 0.5）。"
+
+msgid "Maximum Allowed RTT (ms)"
+msgstr "最大容许 RTT（毫秒）"
+
+msgid "Smoothed RTT ceiling before consecutive violations mark the link DOWN (default: 1500 ms)."
+msgstr "平滑 RTT 连续超标判定线路 DOWN 的上限（默认 1500 毫秒）。"
+
+msgid "Degrade Exit Hysteresis"
+msgstr "降级退出迟滞"
+
+msgid "Degrade Enter Samples"
+msgstr "进入降级连续样本数"
+
+msgid "Degrade Exit Samples"
+msgstr "退出降级连续样本数"
+
+msgid "Degrade Minimum Out Samples"
+msgstr "降级最短离开样本数"
+
+msgid "Load Offload Threshold"
+msgstr "负载转移触发阈值"
+
+msgid "Load Recover Threshold"
+msgstr "负载恢复阈值"
+
+msgid "Healthy DNS Export File (Optional)"
+msgstr "健康 DNS 导出文件（可选）"
+
+msgid "Leave empty to disable (recommended when using AdGuardHome / SmartDNS / MosDNS / dnsmasq). If set to an independent path like /tmp/mwan4_resolv.conf, mwan4 writes healthy per-WAN DNS servers there without touching /etc/resolv.conf."
+msgstr "留空即关闭（使用 AdGuardHome / SmartDNS / MosDNS / dnsmasq 时建议留空）。若指定独立路径如 /tmp/mwan4_resolv.conf，mwan4 会将健康 WAN 的 DNS 写入该文件，绝不覆盖 /etc/resolv.conf。"
+
+msgid "Remove Default Route on Exit"
+msgstr "退出时移除默认路由"
+
+msgid "Keep disabled (default) to avoid brief internet loss during service restarts. Probe paths, policies, underlay and DNS host routes are always cleaned up."
+msgstr "建议保持关闭（默认），避免重启服务期间短暂断网。探针路径、策略规则、underlay 与 DNS 主机路由退出时一律自动清理。"
+
+msgid "Gateway, ECMP weight, probe targets and optional per-WAN DNS pinning for each WAN interface."
+msgstr "每个出口网卡的网关、ECMP 权重、探测目标及可选上游 DNS 出口绑定。"
+
+msgid "Leave empty or 0.0.0.0 for point-to-point / PPPoE / WireGuard interfaces."
+msgstr "点对点 / PPPoE / WireGuard 接口可留空或填 0.0.0.0。"
+
+msgid "IPv6 Gateway"
+msgstr "IPv6 网关"
+
+msgid "Probe Protocol Override"
+msgstr "单接口探测协议覆写"
+
+msgid "Inherit global setting"
+msgstr "继承全局设置"
+
+msgid "Pinned Upstream DNS (IPv4)"
+msgstr "绑定的上游 DNS (IPv4)"
+
+msgid "Optional ISP/upstream DNS IPs pinned to this WAN via kernel /32 routes while healthy. Works transparently under AdGuardHome, SmartDNS, MosDNS and dnsmasq without touching port 53."
+msgstr "可选：填写该 WAN 专属运营商/上游 DNS IP，链路健康时通过内核 /32 路由固定从本 WAN 发出。对 AdGuardHome、SmartDNS、MosDNS 和 dnsmasq 完全透明，不占用 53 端口。"
+
+msgid "Tunnel Underlay Peers (IPv4)"
+msgstr "隧道 Underlay 对端 (IPv4)"
+
+msgid "For tunnel WANs (VXLAN/WireGuard): peer IPs pinned to a non-tunnel WAN to avoid ECMP self-loop."
+msgstr "用于隧道型 WAN（VXLAN/WireGuard）：将对端 IP 固定走非隧道 WAN，防止 ECMP 自环。"
+
+msgid "Degraded: sliding-window packet loss reached the degrade threshold, so this WAN is excluded from the default route. It is still probed and rejoins automatically once its loss drops."
+msgstr "已降级：滑动窗口丢包率达到降级阈值，该 WAN 已临时移出默认路由；守护进程仍持续探测，丢包恢复后将自动回归。"
+
+msgid "Router clock differs from this browser, so freshness cannot be judged. These values may be the last known state of a stopped daemon."
+msgstr "路由器系统时间与当前浏览器偏差较大，无法判断状态新鲜度；以下数值可能是守护进程停止前的最后快照。"
+
+msgid "DNS"
+msgstr "DNS"
+
+msgid "DNS:"
+msgstr "DNS："
+
+msgid "Expected IPv4 or IPv4:Port"
+msgstr "请输入有效的 IPv4 或 IPv4:端口"
+
+msgid "DNS Forward Port (0 = Off)"
+msgstr "DNS 转发端口（0 = 关闭）"
+
+msgid "DNS Listen Address"
+msgstr "DNS 监听地址"
+
+msgid "DNS Forward Timeout (ms)"
+msgstr "DNS 转发超时（毫秒）"
+
+msgid "Upstream DNS (IP[:Port])"
+msgstr "上游 DNS (IP[:端口])"
+
+msgid "Aggregate spreading (headroom-aware)"
+msgstr "聚合分流（余量感知）"

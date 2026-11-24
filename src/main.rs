@@ -5,16 +5,21 @@ use std::process;
 use std::time::{Duration, Instant};
 
 mod config;
+mod dns;
 mod lqe;
 mod netlink;
 mod prober;
+mod uci;
 
-use config::{DaemonConfig, EcmpMode, HashField, MultipathHashPolicy, WeightMode};
+use config::{
+    DaemonConfig, DnsServer, EcmpMode, HashField, MultipathHashPolicy, ProbeMode, WeightMode,
+};
 use lqe::{LinkQualityEstimator, LinkState};
 use netlink::conntrack::ConntrackManager;
 use netlink::route::{
-    AF_INET, ActiveWanRoute, ActiveWanRouteV6, InstalledVariant, POLICY_RULE_PRIORITY_BASE,
-    PROBE_RULE_PRIORITY_BASE, PROBE_TABLE_BASE, PolicyRule, ProbePath, RouteManager,
+    AF_INET, ActiveWanRoute, ActiveWanRouteV6, DnsRoute, InstalledVariant,
+    POLICY_RULE_PRIORITY_BASE, PROBE_RULE_PRIORITY_BASE, PROBE_TABLE_BASE, PolicyRule, ProbePath,
+    RouteManager,
 };
 use netlink::util::if_nametoindex;
 
@@ -51,14 +56,18 @@ fn print_help(bin_name: &str) {
 
 USAGE:
     {bin_name} [OPTIONS]
+    {bin_name} uci [-f <FILE>] <COMMAND> [ARGS...]
 
 OPTIONS:
-    -c, --config <FILE>    Path to JSON configuration file (e.g. /etc/mwan4/mwan4.json)
+    -c, --config <FILE>    Path to JSON or OpenWrt UCI config file (e.g. /etc/config/mwan4)
     -t, --check-config <FILE>
-                           Validate a configuration file and exit (0 = valid, 1 = invalid)
+                           Validate a JSON or UCI config file and exit (0 = valid, 1 = invalid)
     --gen-config           Output default JSON configuration template to stdout
     -v, --version          Print version information
     -h, --help             Print this help message
+
+SUBCOMMANDS:
+    uci                    Native OpenWrt UCI command interface (show/get/set/add_list/del_list/delete/commit/export-json)
 "#
     );
 }
@@ -126,6 +135,10 @@ enum NetlinkCmd {
     SetProbePaths(Vec<ProbePath>, bool),
     FlushConntrack(Vec<ConntrackTarget>),
     SetPolicies(Vec<PolicyRule>),
+    /// 每 WAN 专属上游 DNS `/32` 出口绑定路由（空清单 = 全部移除）。
+    SetDnsRoutes(Vec<DnsRoute>),
+    /// 退出但保留预设路由时，仍须拆除隧道 underlay `/32`，避免旧闸道失效造成封装封包黑洞。
+    ClearUnderlayRoutes,
     ClearRoutes,
 }
 
@@ -141,6 +154,7 @@ enum NetlinkOp {
     ProbePaths,
     Conntrack,
     Policies,
+    DnsRoutes,
 }
 
 /// 主回圈据此判断「已入伫列」是否真的生效，失败就强制下个 tick 重下。
@@ -151,6 +165,8 @@ struct NetlinkOutcome {
     detail: Option<String>,
     /// 内核实际生效的 IPv4 变体：`ecmp_mode=auto` 可能被内核退成 standard。
     variant: Option<InstalledVariant>,
+    /// 仅在 Conntrack 失败时回传本次参与清理的网卡名，避免误重置其他早已清完的 DOWN 网卡。
+    failed_ifaces: Vec<String>,
 }
 
 impl NetlinkOutcome {
@@ -160,11 +176,17 @@ impl NetlinkOutcome {
             ok,
             detail,
             variant: None,
+            failed_ifaces: Vec::new(),
         }
     }
 
     fn with_variant(mut self, variant: InstalledVariant) -> Self {
         self.variant = Some(variant);
+        self
+    }
+
+    fn with_failed_ifaces(mut self, ifaces: Vec<String>) -> Self {
+        self.failed_ifaces = ifaces;
         self
     }
 }
@@ -202,6 +224,8 @@ fn spawn_netlink_worker(
                 let mut probe_paths: Option<(Vec<ProbePath>, bool)> = None;
                 let mut flush: Vec<ConntrackTarget> = Vec::new();
                 let mut policies: Option<Vec<PolicyRule>> = None;
+                let mut dns_routes: Option<Vec<DnsRoute>> = None;
+                let mut clear_underlay = false;
                 let mut clear_routes = false;
                 for c in batch {
                     match c {
@@ -223,6 +247,8 @@ fn spawn_netlink_worker(
                             }
                         }
                         NetlinkCmd::SetPolicies(rules) => policies = Some(rules),
+                        NetlinkCmd::SetDnsRoutes(routes) => dns_routes = Some(routes),
+                        NetlinkCmd::ClearUnderlayRoutes => clear_underlay = true,
                         NetlinkCmd::ClearRoutes => clear_routes = true,
                     }
                 }
@@ -280,20 +306,34 @@ fn spawn_netlink_worker(
                     };
                     let _ = result_tx.send(NetlinkOutcome::new(NetlinkOp::Policies, ok, detail));
                 }
-                if !flush.is_empty() {
-                    let names = flush
-                        .iter()
-                        .map(|(name, _)| name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let (ok, detail) = match conntrack_mgr.flush_interfaces_conntrack(&flush) {
-                        Ok(_) => (true, None),
+                if let Some(routes) = dns_routes {
+                    let (ok, detail) = match route_mgr.sync_dns_routes(&routes) {
+                        Ok(()) => (true, None),
                         Err(e) => {
-                            debug!("[{names}] Conntrack flush failed: {e}");
+                            debug!("DNS host route update failed: {e}");
                             (false, Some(e.to_string()))
                         }
                     };
-                    let _ = result_tx.send(NetlinkOutcome::new(NetlinkOp::Conntrack, ok, detail));
+                    let _ = result_tx.send(NetlinkOutcome::new(NetlinkOp::DnsRoutes, ok, detail));
+                }
+                if !flush.is_empty() {
+                    let iface_names: Vec<String> =
+                        flush.iter().map(|(name, _)| name.clone()).collect();
+                    let names = iface_names.join(", ");
+                    let outcome = match conntrack_mgr.flush_interfaces_conntrack(&flush) {
+                        Ok(_) => NetlinkOutcome::new(NetlinkOp::Conntrack, true, None),
+                        Err(e) => {
+                            debug!("[{names}] Conntrack flush failed: {e}");
+                            NetlinkOutcome::new(NetlinkOp::Conntrack, false, Some(e.to_string()))
+                                .with_failed_ifaces(iface_names)
+                        }
+                    };
+                    let _ = result_tx.send(outcome);
+                }
+                if clear_underlay {
+                    if let Err(e) = route_mgr.clear_underlay_routes() {
+                        warn!("Failed to remove tunnel underlay routes on shutdown: {e}");
+                    }
                 }
                 if clear_routes {
                     if let Err(e) = route_mgr.cleanup_routes() {
@@ -517,6 +557,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let bin_name = args.first().map(|s| s.as_str()).unwrap_or("mwan4");
 
+    // 原生 UCI 子命令：`mwan4 uci show|get|set|add_list|del_list|delete|commit|validate|export-json`
+    if args.get(1).map(|s| s.as_str()) == Some("uci") {
+        if let Err(e) = uci::run_uci_cli(bin_name, &args[2..]) {
+            eprintln!("uci error: {e}");
+            process::exit(1);
+        }
+        return Ok(());
+    }
+
     let mut config_path: Option<String> = None;
     let mut check_config_path: Option<String> = None;
     let mut i = 1;
@@ -594,11 +643,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             info!(
-                "No config file specified, checking /etc/mwan4/mwan4.json or fallback to defaults..."
+                "No config file specified, checking /etc/mwan4/mwan4.json, {} or defaults...",
+                uci::DEFAULT_UCI_PATH
             );
             if std::path::Path::new("/etc/mwan4/mwan4.json").exists() {
                 DaemonConfig::load_from_file("/etc/mwan4/mwan4.json").unwrap_or_else(|e| {
                     error!("Failed to load /etc/mwan4/mwan4.json: {e}");
+                    process::exit(1);
+                })
+            } else if std::path::Path::new(uci::DEFAULT_UCI_PATH).exists() {
+                DaemonConfig::load_from_file(uci::DEFAULT_UCI_PATH).unwrap_or_else(|e| {
+                    error!("Failed to load {}: {e}", uci::DEFAULT_UCI_PATH);
                     process::exit(1);
                 })
             } else {
@@ -646,7 +701,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 用明确错误讯息 + exit(1) 取代 expect()：panic=abort 下 panic 只会留下一行堆叠。
     let route_mgr = match RouteManager::new(config.route_priority, config.ecmp_mode) {
-        Ok(m) => m,
+        Ok(m) => m.with_resilient_idle_timer(config.resilient_idle_timer_secs),
         Err(e) => {
             error!("Failed to initialize Netlink Route socket: {e} (is CAP_NET_ADMIN granted?)");
             release_pid_file();
@@ -745,6 +800,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .or(iface_cfg.max_mbps)
                 .map(|mbps| mbps * 1_000_000.0),
             targets: iface_cfg.probe_targets.clone(),
+            probe_mode: iface_cfg.probe_mode.unwrap_or(config.probe_mode),
+            dns_servers: iface_cfg.dns_servers.clone(),
             preferred_target: 0,
             underlay_targets: iface_cfg.underlay_targets.clone(),
             cached_ip: crate::netlink::util::get_interface_ipv4(&iface_cfg.name).ok(),
@@ -761,6 +818,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lqe: LinkQualityEstimator::new(iface_cfg.name.clone(), &config),
         });
     }
+
+    let has_dns_routes = monitors.iter().any(|m| !m.dns_servers.is_empty());
+    if has_dns_routes {
+        info!(
+            "Per-WAN upstream DNS route pinning enabled (FIB /32 metric {}; zero impact on local port 53 / third-party DNS software)",
+            netlink::route::DNS_ROUTE_METRIC
+        );
+    }
+    if config.probe_mode == ProbeMode::Dns
+        || monitors.iter().any(|m| m.probe_mode == ProbeMode::Dns)
+    {
+        info!(
+            "DNS query health probing active (domain: {})",
+            config.dns_probe_domain
+        );
+    }
+    if let Some(ref resolv_path) = config.dns_resolv_file {
+        if dns::is_system_resolv_path(resolv_path) {
+            warn!(
+                "dns_resolv_file is set to system path '{resolv_path}': this may overwrite files \
+                 managed by dnsmasq / third-party DNS software (AdGuardHome, SmartDNS, MosDNS). \
+                 Consider using an independent path such as /tmp/mwan4_resolv.conf."
+            );
+        } else {
+            info!("Healthy WAN DNS list will be exported to: {resolv_path}");
+        }
+    }
+
+    let dns_forwarder = if config.dns_listen_port > 0 {
+        if config.dns_listen_port == 53 {
+            warn!(
+                "dns_listen_port is set to 53: this may conflict with dnsmasq / AdGuardHome / \
+                 SmartDNS / MosDNS; consider using an independent port such as 5354"
+            );
+        }
+        let bind_ip: std::net::IpAddr = config
+            .dns_listen_addr
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let bind_addr = std::net::SocketAddr::new(bind_ip, config.dns_listen_port);
+        match dns::spawn_dns_forwarder(
+            bind_addr,
+            Duration::from_millis(config.dns_forward_timeout_ms),
+            build_dns_upstreams(&monitors),
+        )
+        .await
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                error!(
+                    "Failed to start built-in DNS forwarder on {bind_addr}: {e} \
+                     (port already in use by another DNS service?); continuing without DNS forwarding"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dns_listen_display: Option<String> =
+        dns_forwarder.as_ref().map(|h| h.local_addr.to_string());
+    let mut last_dns_upstreams: Option<Vec<dns::DnsUpstreamWan>> = None;
 
     let has_ipv6 = monitors.iter().any(|m| m.gateway6.is_some());
     if has_ipv6 {
@@ -850,6 +969,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut policies_inflight = false;
     let mut policies_retry_at: u64 = 0;
     let mut last_policy_signature: Option<Vec<PolicyRule>> = None;
+    let mut dns_routes_dirty = has_dns_routes;
+    let mut dns_routes_inflight = false;
+    let mut dns_routes_retry_at: u64 = 0;
+    let mut last_dns_signature: Option<Vec<DnsRoute>> = None;
+    let mut last_resolv_written: Option<Vec<(std::net::Ipv4Addr, String)>> = None;
 
     info!("mwan4 event loop running. Press Ctrl+C to terminate.");
 
@@ -981,12 +1105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     last_conntrack_fail = Some(detail);
                                 }
-                                // 失败的 flush 不算「本次 DOWN 已清」：重设旗标，静默期与限流过后会再送一次（清理幂等）。
-                                for monitor in monitors.iter_mut() {
-                                    if monitor.down_since.is_some() {
-                                        monitor.flushed_while_down = false;
-                                    }
-                                }
+                                // 仅重置本次失败批次里的 DOWN 网卡：避免把早已清理完的其他 DOWN 网卡反复拖回全表扫描。
+                                reset_failed_conntrack_markers(&mut monitors, &outcome.failed_ifaces);
                             } else {
                                 conntrack_fail_count = 0;
                                 last_conntrack_fail = None;
@@ -997,6 +1117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !outcome.ok {
                                 policies_dirty = true;
                                 policies_retry_at = tick_count + 6;
+                            }
+                        }
+                        NetlinkOp::DnsRoutes => {
+                            dns_routes_inflight = false;
+                            if !outcome.ok {
+                                dns_routes_dirty = true;
+                                dns_routes_retry_at = tick_count + 6;
                             }
                         }
                     }
@@ -1049,6 +1176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         probe_timeout,
                         monitor.preferred_target,
                         monitor.lqe.consecutive_timeouts > 0,
+                        monitor.probe_mode,
+                        &config.dns_probe_domain,
                     ));
                 }
                 let samples = futures_util::future::join_all(probe_futs).await;
@@ -1205,15 +1334,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let stats_now = Instant::now();
-                for monitor in monitors.iter_mut() {
-                    sample_interface_rates(monitor, stats_now);
-                }
+                sample_all_interface_rates(&mut monitors, stats_now);
 
-                // 动态权重（quality / load_aware，含容量比例）每次变更都会重下 ECMP 路由，故受限速约束。
+                // 动态权重（quality / aggregate / load_aware，含容量比例）每次变更都会重下 ECMP 路由，故受限速约束。
                 // 动态因子的唯一作用是把流量在成员之间挪动：只有一个成员时权重毫无意义
-                // （256 个 bucket 全指向同一个 nexthop），却会让预设路由被反复重下（实测单线每 2 秒一次）。
-                let dynamic_weights_on = (config.weight_mode == WeightMode::Quality
-                    || config.load_aware
+                // （240 个 bucket 全指向同一个 nexthop），却会让预设路由被反复重下（实测单线每 2 秒一次）。
+                let dynamic_weights_on = (matches!(
+                    config.weight_mode,
+                    WeightMode::Quality | WeightMode::Aggregate
+                ) || config.load_aware
                     || config.capacity_weights_on())
                     && monitors.len() >= 2;
                 // standard ECMP 下权重一变就重算整张 multipath hash（实测搬走 24%~39% 既有连线）却搬不动大流量。
@@ -1223,7 +1352,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && !dynamic_factors_on
                     && kernel_variant_known
                     && !dynamic_factor_gate_warned
-                    && (config.weight_mode == WeightMode::Quality || config.load_aware)
+                    && (matches!(
+                        config.weight_mode,
+                        WeightMode::Quality | WeightMode::Aggregate
+                    ) || config.load_aware)
                 {
                     dynamic_factor_gate_warned = true;
                     let remedy = if config.ecmp_mode == EcmpMode::Standard {
@@ -1664,6 +1796,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // 同步内置 DNS 转发器的健康上游清单（仅在 dns_listen_port > 0 且成功绑定时启用）。
+                if let Some(ref fwd) = dns_forwarder {
+                    let upstreams = build_dns_upstreams(&monitors);
+                    if last_dns_upstreams.as_ref() != Some(&upstreams) {
+                        let _ = fwd.upstream_tx.send(upstreams.clone());
+                        last_dns_upstreams = Some(upstreams);
+                    }
+                }
+
+                // 每 WAN 上游 DNS `/32` 出口绑定路由：仅在配置了 dns_servers 时启用，不碰本地 53 端口与第三方 DNS 配置。
+                if has_dns_routes {
+                    if tick_count % PROBE_PATH_REFRESH_TICKS == 0 {
+                        dns_routes_dirty = true;
+                    }
+                    let dns_wanted = build_dns_routes(&monitors);
+                    let dns_changed =
+                        last_dns_signature.as_deref() != Some(dns_wanted.as_slice());
+                    if (dns_changed || dns_routes_dirty)
+                        && !dns_routes_inflight
+                        && tick_count >= dns_routes_retry_at
+                    {
+                        debug!(
+                            "DNS host route sync queued: {} pinned server(s)",
+                            dns_wanted.len()
+                        );
+                        match netlink_tx.try_send(NetlinkCmd::SetDnsRoutes(dns_wanted.clone())) {
+                            Ok(()) => {
+                                dns_routes_inflight = true;
+                                dns_routes_dirty = false;
+                                last_dns_signature = Some(dns_wanted.clone());
+                            }
+                            Err(err) => {
+                                debug!("DNS host route update still queued; will retry next tick: {err}");
+                            }
+                        }
+                    }
+                    if let Some(ref resolv_path) = config.dns_resolv_file {
+                        let sig: Vec<(std::net::Ipv4Addr, String)> = dns_wanted
+                            .iter()
+                            .map(|r| (r.server, r.ifname.clone()))
+                            .collect();
+                        if last_resolv_written.as_ref() != Some(&sig) {
+                            match dns::write_resolv_file_atomic(resolv_path, &dns_wanted) {
+                                Ok(()) => {
+                                    debug!(
+                                        "Updated DNS resolv export at {resolv_path} ({} server(s))",
+                                        dns_wanted.len()
+                                    );
+                                    last_resolv_written = Some(sig);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to write dns_resolv_file '{resolv_path}': {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 路由下发之后才排程 conntrack 清理（worker 只扫一次全表）；DOWN 后等 25 秒确认不是抖动才清。
                 if config.flush_conntrack_on_down {
                     let now = Instant::now();
@@ -1698,7 +1888,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(_, m)| m.ifname.as_str())
                         .collect();
                     let route_desc = build_route_desc(&monitors, &active_names);
-                    write_status_file(&monitors, &route_desc, &config, effective_hash_v4);
+                    write_status_file(
+                        &monitors,
+                        &route_desc,
+                        &config,
+                        effective_hash_v4,
+                        dns_listen_display.as_deref(),
+                    );
                 }
 
                 if tick_count % 10 == 0 {
@@ -1711,20 +1907,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(fwd) = dns_forwarder {
+        fwd.shutdown().await;
+    }
+
     if config.remove_routes_on_exit {
         // 移除本程式下发的预设路由；窗口内整台路由器会失去出口，故预设为 false。
         if let Err(e) = netlink_tx.send(NetlinkCmd::ClearRoutes) {
             warn!("Failed to request default route cleanup: {e}");
         }
     } else {
-        // 预设路由保留，但探针路径一定要拆：残留的 `oif` 规则会指向已不存在的网关。
+        // 预设路由保留，但探针路径、策略规则、上游 DNS /32 与隧道 underlay /32 一律拆除，避免残留路由造成黑洞。
         info!("Leaving the mwan4 default route in place (remove_routes_on_exit = false)");
         // 策略规则一定要拆：它们指向即将被拆的探针表，留着会让流量黑洞而不是回退 ECMP。
         if let Err(e) = netlink_tx.send(NetlinkCmd::SetPolicies(Vec::new())) {
             warn!("Failed to request policy rule cleanup: {e}");
         }
+        if has_dns_routes {
+            if let Err(e) = netlink_tx.send(NetlinkCmd::SetDnsRoutes(Vec::new())) {
+                warn!("Failed to request DNS host route cleanup: {e}");
+            }
+        }
         if let Err(e) = netlink_tx.send(NetlinkCmd::SetProbePaths(Vec::new(), false)) {
             warn!("Failed to request probe path cleanup: {e}");
+        }
+        if let Err(e) = netlink_tx.send(NetlinkCmd::ClearUnderlayRoutes) {
+            warn!("Failed to request tunnel underlay route cleanup: {e}");
         }
     }
     drop(netlink_tx);
@@ -1765,6 +1973,8 @@ struct WanMonitor {
     down_bps_capacity: Option<f64>,
     up_bps_capacity: Option<f64>,
     targets: Vec<std::net::SocketAddr>,
+    probe_mode: ProbeMode,
+    dns_servers: Vec<DnsServer>,
     preferred_target: usize,
     /// 非空同时代表「不能拿这条线去当别条隧道的 underlay 出口」。
     underlay_targets: Vec<std::net::Ipv4Addr>,
@@ -1800,6 +2010,65 @@ impl WanMonitor {
             Err(_) => self.cached_ip = None,
         }
     }
+}
+
+/// Conntrack 清理失败时，仅把本次失败批次中处于 DOWN 的网卡重置为未清理，
+/// 避免将早已成功清完的其他 DOWN 网卡反复拖回全表扫描。
+fn reset_failed_conntrack_markers(monitors: &mut [WanMonitor], failed_ifaces: &[String]) {
+    for monitor in monitors.iter_mut() {
+        if monitor.down_since.is_some()
+            && (failed_ifaces.is_empty() || failed_ifaces.iter().any(|n| n == &monitor.ifname))
+        {
+            monitor.flushed_while_down = false;
+        }
+    }
+}
+
+fn build_dns_routes(monitors: &[WanMonitor]) -> Vec<DnsRoute> {
+    let candidates: Vec<dns::DnsRouteCandidate<'_>> = monitors
+        .iter()
+        .enumerate()
+        .map(|(slot, m)| dns::DnsRouteCandidate {
+            ifname: &m.ifname,
+            ifindex: m.ifindex,
+            gateway: m.gateway,
+            metric: m.metric,
+            slot,
+            up: m.lqe.state == LinkState::Up,
+            degraded: m.lqe.is_degraded(),
+            dns_servers: &m.dns_servers,
+        })
+        .collect();
+    dns::plan_dns_routes(&candidates)
+}
+
+/// 组装内置 DNS 转发器的当前健康上游 WAN 清单（按未降级 -> metric -> 配置顺序排序；
+/// 优先使用每条 WAN 的 `dns_servers`，未配置时回退到 `probe_targets`）。
+fn build_dns_upstreams(monitors: &[WanMonitor]) -> Vec<dns::DnsUpstreamWan> {
+    let mut out: Vec<dns::DnsUpstreamWan> = monitors
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.lqe.state == LinkState::Up && m.ifindex != 0)
+        .filter_map(|(slot, m)| {
+            let targets: Vec<std::net::SocketAddr> = if !m.dns_servers.is_empty() {
+                m.dns_servers.iter().map(|s| s.socket_addr()).collect()
+            } else {
+                m.targets.clone()
+            };
+            if targets.is_empty() {
+                return None;
+            }
+            Some(dns::DnsUpstreamWan {
+                ifname: m.ifname.clone(),
+                degraded: m.lqe.is_degraded(),
+                metric: m.metric,
+                slot,
+                targets,
+            })
+        })
+        .collect();
+    out.sort_by_key(|u| (u.degraded, u.metric, u.slot));
+    out
 }
 
 /// `last_conntrack_flush` / `flushed_while_down` 必须等真正入队成功才置位：被限流跳过的线若已置位，整段 DOWN 都不会再清。
@@ -1857,28 +2126,30 @@ fn flush_conntrack(
 
 /// active_names 必须由同一套 is_active 判据算出，否则介面显示与实际下发的路由不一致。
 fn build_route_desc(monitors: &[WanMonitor], active_names: &[&str]) -> String {
-    if active_names.len() > 1 {
-        format!("Multipath ECMP ({})", active_names.join(", "))
-    } else if active_names.len() == 1 {
-        let active_wan = active_names[0];
-        let min_cfg_metric = monitors.iter().map(|m| m.metric).min().unwrap_or(1);
-        let max_cfg_metric = monitors.iter().map(|m| m.metric).max().unwrap_or(1);
-        let my_metric = monitors
-            .iter()
-            .find(|m| m.ifname == active_wan)
-            .map_or(1, |m| m.metric);
-
-        if min_cfg_metric != max_cfg_metric {
-            if my_metric == min_cfg_metric {
-                format!("Primary Active ({active_wan})")
-            } else {
-                format!("Failover Active ({active_wan})")
-            }
-        } else {
-            format!("Single Active ({active_wan})")
+    match active_names.len().cmp(&1) {
+        std::cmp::Ordering::Greater => {
+            format!("Multipath ECMP ({})", active_names.join(", "))
         }
-    } else {
-        "All Links DOWN".to_string()
+        std::cmp::Ordering::Equal => {
+            let active_wan = active_names[0];
+            let min_cfg_metric = monitors.iter().map(|m| m.metric).min().unwrap_or(1);
+            let max_cfg_metric = monitors.iter().map(|m| m.metric).max().unwrap_or(1);
+            let my_metric = monitors
+                .iter()
+                .find(|m| m.ifname == active_wan)
+                .map_or(1, |m| m.metric);
+
+            if min_cfg_metric != max_cfg_metric {
+                if my_metric == min_cfg_metric {
+                    format!("Primary Active ({active_wan})")
+                } else {
+                    format!("Failover Active ({active_wan})")
+                }
+            } else {
+                format!("Single Active ({active_wan})")
+            }
+        }
+        std::cmp::Ordering::Less => "All Links DOWN".to_string(),
     }
 }
 
@@ -1901,6 +2172,9 @@ struct InterfaceStatus {
     consecutive_successes: usize,
     consecutive_timeouts: usize,
     targets: Vec<String>,
+    probe_mode: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns_servers: Vec<String>,
     ifindex: u32,
     last_error: Option<String>,
     local_condition: bool,
@@ -1911,6 +2185,13 @@ struct InterfaceStatus {
 }
 
 #[derive(serde::Serialize)]
+struct DnsStatus {
+    server: String,
+    interface: String,
+    active: bool,
+}
+
+#[derive(serde::Serialize)]
 struct DaemonStatus {
     updated_at: u64,
     stale_after_secs: u64,
@@ -1918,6 +2199,10 @@ struct DaemonStatus {
     interfaces: Vec<InterfaceStatus>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     policies: Vec<PolicyStatus>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns: Vec<DnsStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_listen: Option<String>,
     hash: HashStatus,
 }
 
@@ -2137,12 +2422,54 @@ fn apply_multipath_hash(
 
 /// standard 下权重一变就重算整张 multipath hash（实测搬走 24%~39% 既有连线），却搬不动大流量。
 fn dynamic_factors_allowed(config: &DaemonConfig, kernel_resilient: bool) -> bool {
-    let wants_factors = config.weight_mode == WeightMode::Quality || config.load_aware;
+    let wants_factors = matches!(
+        config.weight_mode,
+        WeightMode::Quality | WeightMode::Aggregate
+    ) || config.load_aware;
     !wants_factors || config.allow_dynamic_weights_on_standard || kernel_resilient
 }
 
 /// 权重刻度：整数权重全是 1 时下修会被夹成 1，放大后比例不变（只是刻度变细）。
 const DYNAMIC_WEIGHT_RESOLUTION: u32 = 4;
+/// 聚合分流模式权重刻度：提供更细的剩余带宽比例分辨率，让单/双数多 WAN 平滑逼近带宽聚合。
+const AGGREGATE_WEIGHT_RESOLUTION: u32 = 10;
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// 当容量比例存在小数（如 300M:200M = 1.5:1 或 500M:300M:200M = 2.5:1.5:1）时，
+/// 寻找最小整数倍率 `k ∈ 1..=10` 还原精确整数比（3:2、3:2:2、5:3:2），避免四舍五入带来 7%+ 分流偏斜。
+fn fractional_ratio_multiplier(all_bases: &[f64]) -> f64 {
+    let max_b = all_bases.iter().copied().fold(0.0_f64, f64::max);
+    if !max_b.is_finite() || max_b <= 0.0 {
+        return 1.0;
+    }
+    let has_fraction = all_bases
+        .iter()
+        .any(|b| b.is_finite() && (b - b.round()).abs() > 1e-3);
+    if !has_fraction {
+        return 1.0;
+    }
+    for k in 2..=10u32 {
+        let kf = f64::from(k);
+        if max_b * kf > config::MAX_WEIGHT as f64 {
+            break;
+        }
+        if all_bases
+            .iter()
+            .all(|b| !b.is_finite() || (b * kf - (b * kf).round()).abs() <= 1e-2)
+        {
+            return kf;
+        }
+    }
+    1.0
+}
 
 /// 取两方向最大值的利用率：全双工任一方吃满就该移走部分流量。
 fn load_utilization(m: &WanMonitor) -> Option<f64> {
@@ -2246,6 +2573,14 @@ fn pick_degrade_fallback(
         .map(|(slot, _)| slot)
 }
 
+/// 聚合分流余量因子：按剩余空闲带宽比例 `1 - util` 平滑调节权重，让新连接持续流向最空闲的 WAN。
+fn aggregate_headroom_factor(m: &WanMonitor, min_ratio: f64) -> f64 {
+    let Some(util) = load_utilization(m) else {
+        return 1.0;
+    };
+    (1.0 - util).clamp(min_ratio, 1.0)
+}
+
 /// 基准权重：任何线设了 max_mbps 就按最大频宽比例（否则用 weight）；最终 = clamp(round(base × 刻度 × 因子), 1, 255)。
 fn compute_dynamic_weights(
     monitors: &[WanMonitor],
@@ -2253,7 +2588,11 @@ fn compute_dynamic_weights(
     config: &DaemonConfig,
     allow_dynamic_factors: bool,
 ) -> Vec<u32> {
-    let quality_on = config.weight_mode == WeightMode::Quality && allow_dynamic_factors;
+    let aggregate_on = config.weight_mode == WeightMode::Aggregate && allow_dynamic_factors;
+    let quality_on = matches!(
+        config.weight_mode,
+        WeightMode::Quality | WeightMode::Aggregate
+    ) && allow_dynamic_factors;
     // 容量比例分流看监控物件是否带容量（loop 的启用判断才看 config，两者在 validate 下同步）。
     let bandwidth_on = monitors.iter().any(|m| m.down_bps_capacity.is_some());
     let min_ratio = config.dynamic_weight_min_ratio.clamp(0.05, 1.0);
@@ -2274,12 +2613,23 @@ fn compute_dynamic_weights(
             .filter(|c| c.is_finite() && *c > 0.0)
             .fold(f64::INFINITY, f64::min);
         if min_cap.is_finite() && min_cap > 0.0 {
-            for (slot, m) in monitors.iter().enumerate() {
-                if !active_flags[slot] {
-                    continue;
-                }
-                if let Some(cap) = m.down_bps_capacity.filter(|c| c.is_finite() && *c > 0.0) {
-                    bases[slot] = m.weight.max(1) as f64 * (cap / min_cap);
+            let mut all_bases: Vec<f64> = monitors
+                .iter()
+                .map(|m| {
+                    m.down_bps_capacity
+                        .filter(|c| c.is_finite() && *c > 0.0)
+                        .map_or(m.weight.max(1) as f64, |cap| {
+                            m.weight.max(1) as f64 * (cap / min_cap)
+                        })
+                })
+                .collect();
+            let ratio_mul = fractional_ratio_multiplier(&all_bases);
+            for b in &mut all_bases {
+                *b *= ratio_mul;
+            }
+            for (slot, b) in all_bases.into_iter().enumerate() {
+                if active_flags[slot] {
+                    bases[slot] = b;
                 }
             }
         }
@@ -2290,7 +2640,12 @@ fn compute_dynamic_weights(
             .iter()
             .enumerate()
             .any(|(slot, m)| active_flags[slot] && m.load_pressure_active);
-    let scale = if quality_on || any_pressure {
+    let resolution = if aggregate_on {
+        AGGREGATE_WEIGHT_RESOLUTION
+    } else {
+        DYNAMIC_WEIGHT_RESOLUTION
+    };
+    let scale = if quality_on || any_pressure || aggregate_on {
         let active_bases: Vec<f64> = bases
             .iter()
             .enumerate()
@@ -2300,7 +2655,7 @@ fn compute_dynamic_weights(
         let min_base = active_bases.iter().copied().fold(f64::INFINITY, f64::min);
         let max_base = active_bases.iter().copied().fold(0.0_f64, f64::max);
         if min_base.is_finite() && min_base > 0.0 && max_base > 0.0 {
-            let want = (DYNAMIC_WEIGHT_RESOLUTION as f64 / min_base).max(1.0);
+            let want = (resolution as f64 / min_base).max(1.0);
             // 放大后会把最大权重推过上限就干脆不放大：宁可解析度粗，也不要让比例被 255 夹歪。
             if max_base * want <= config::MAX_WEIGHT as f64 {
                 want
@@ -2322,7 +2677,7 @@ fn compute_dynamic_weights(
         .filter(|r| r.is_finite() && *r > 0.0)
         .fold(f64::INFINITY, f64::min);
 
-    monitors
+    let mut weights: Vec<u32> = monitors
         .iter()
         .enumerate()
         .map(|(slot, m)| {
@@ -2333,7 +2688,9 @@ fn compute_dynamic_weights(
             if quality_on {
                 factor *= quality_factor(m, best_rtt, min_ratio);
             }
-            if load_on {
+            if aggregate_on {
+                factor *= aggregate_headroom_factor(m, min_ratio);
+            } else if load_on {
                 factor *= load_factor(
                     m,
                     config.load_target_ratio,
@@ -2344,7 +2701,24 @@ fn compute_dynamic_weights(
             let w = bases[slot] * scale * factor;
             (w.round() as u32).clamp(1, config::MAX_WEIGHT)
         })
-        .collect()
+        .collect();
+
+    // 聚合模式下对所有活跃权重约分最大公约数（如 10:10:10 -> 1:1:1），减少无谓的路由重下。
+    if aggregate_on && active_count >= 2 {
+        let g = weights
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| active_flags[*slot])
+            .fold(0u32, |acc, (_, &w)| gcd_u32(acc, w));
+        if g > 1 {
+            for (slot, w) in weights.iter_mut().enumerate() {
+                if active_flags[slot] {
+                    *w = (*w / g).max(1);
+                }
+            }
+        }
+    }
+    weights
 }
 
 /// 目标 WAN 不健康时整条政策停用，让流量回退 ECMP 而不是黑洞在死线上。
@@ -2404,19 +2778,28 @@ fn build_policy_rules(config: &DaemonConfig, monitors: &[WanMonitor]) -> Vec<Pol
 /// EWMA 平滑系数（取样周期 = 探测周期）：滤掉单拍突发，又不会跟不上真实的流量转移。
 const LOAD_EWMA_ALPHA: f64 = 0.3;
 
-/// 来源是 /sys/class/net/<if>/statistics 的累计值，对转发流量正是该 WAN 的实际承载量。
-fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
-    let read = |kind: &str| -> Option<u64> {
-        std::fs::read_to_string(format!(
-            "/sys/class/net/{}/statistics/{kind}",
-            monitor.ifname
-        ))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-    };
-    let (Some(tx), Some(rx)) = (read("tx_bytes"), read("rx_bytes")) else {
-        return;
-    };
+/// 单次读取 `/proc/net/dev` 批量解析所有网卡的 `(rx_bytes, tx_bytes)`：
+/// 相比每条 WAN 打开 2 个 sysfs 文件，3~5 条 WAN 时系统调用降低 6~10 倍，保持最低 CPU 开销。
+fn parse_proc_net_dev(content: &str) -> std::collections::HashMap<&str, (u64, u64)> {
+    let mut map = std::collections::HashMap::new();
+    for line in content.lines().skip(2) {
+        let Some((iface, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let mut cols = rest.split_whitespace();
+        let Some(rx) = cols.next().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        // 第 9 列（skip 7 个字段）为 tx_bytes
+        let Some(tx) = cols.nth(7).and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        map.insert(iface.trim(), (rx, tx));
+    }
+    map
+}
+
+fn apply_rate_sample(monitor: &mut WanMonitor, rx: u64, tx: u64, now: Instant) {
     if let (Some(prev_tx), Some(prev_rx), Some(prev_at)) = (
         monitor.last_tx_bytes,
         monitor.last_rx_bytes,
@@ -2442,6 +2825,38 @@ fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
     monitor.last_tx_bytes = Some(tx);
     monitor.last_rx_bytes = Some(rx);
     monitor.last_stats_at = Some(now);
+}
+
+/// 批量采样所有 WAN 速率：优先单次读 `/proc/net/dev`，不可用时回退 `/sys/class/net`。
+fn sample_all_interface_rates(monitors: &mut [WanMonitor], now: Instant) {
+    if let Ok(table) = std::fs::read_to_string("/proc/net/dev") {
+        let stats = parse_proc_net_dev(&table);
+        for monitor in monitors.iter_mut() {
+            if let Some(&(rx, tx)) = stats.get(monitor.ifname.as_str()) {
+                apply_rate_sample(monitor, rx, tx, now);
+            }
+        }
+        return;
+    }
+    for monitor in monitors.iter_mut() {
+        sample_interface_rates(monitor, now);
+    }
+}
+
+/// 来源是 /sys/class/net/<if>/statistics 的累计值，对转发流量正是该 WAN 的实际承载量。
+fn sample_interface_rates(monitor: &mut WanMonitor, now: Instant) {
+    let read = |kind: &str| -> Option<u64> {
+        std::fs::read_to_string(format!(
+            "/sys/class/net/{}/statistics/{kind}",
+            monitor.ifname
+        ))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let (Some(tx), Some(rx)) = (read("tx_bytes"), read("rx_bytes")) else {
+        return;
+    };
+    apply_rate_sample(monitor, rx, tx, now);
 }
 
 /// `all` 与装置取大者；strict 时回程必须走同一张网卡，非活跃线因此需要主表 /32。
@@ -2504,6 +2919,7 @@ fn write_status_file(
     active_routes: &str,
     config: &DaemonConfig,
     hash: EffectiveHash,
+    dns_listen: Option<&str>,
 ) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2530,6 +2946,8 @@ fn write_status_file(
             consecutive_successes: m.lqe.consecutive_successes,
             consecutive_timeouts: m.lqe.consecutive_timeouts,
             targets: m.targets.iter().map(|t| t.to_string()).collect(),
+            probe_mode: m.probe_mode.as_str().to_string(),
+            dns_servers: m.dns_servers.iter().map(|ip| ip.to_string()).collect(),
             ifindex: m.ifindex,
             last_error: m.last_probe_error.clone(),
             local_condition: m.last_error_is_local || m.probe_path_missing,
@@ -2560,12 +2978,38 @@ fn write_status_file(
         })
         .collect();
 
+    let dns_routes = build_dns_routes(monitors);
+    let mut dns_statuses: Vec<DnsStatus> = Vec::new();
+    let mut seen_dns = std::collections::HashSet::new();
+    for m in monitors {
+        for server in &m.dns_servers {
+            if !seen_dns.insert(server.ip) {
+                continue;
+            }
+            if let Some(active) = dns_routes.iter().find(|r| r.server == server.ip) {
+                dns_statuses.push(DnsStatus {
+                    server: server.to_string(),
+                    interface: active.ifname.clone(),
+                    active: true,
+                });
+            } else {
+                dns_statuses.push(DnsStatus {
+                    server: server.to_string(),
+                    interface: m.ifname.clone(),
+                    active: false,
+                });
+            }
+        }
+    }
+
     let status = DaemonStatus {
         updated_at: now,
         stale_after_secs: STATUS_STALE_SECS,
         active_routes: active_routes.to_string(),
         interfaces: iface_statuses,
         policies,
+        dns: dns_statuses,
+        dns_listen: dns_listen.map(str::to_string),
         hash: HashStatus {
             policy: hash.policy,
             fields: hash.fields,
@@ -2806,6 +3250,8 @@ mod tests {
             down_bps_capacity: None,
             up_bps_capacity: None,
             targets: Vec::new(),
+            probe_mode: ProbeMode::Tcp,
+            dns_servers: Vec::new(),
             preferred_target: 0,
             underlay_targets: Vec::new(),
             cached_ip: None,
@@ -2905,6 +3351,28 @@ mod tests {
         assert!(
             !monitors[1].flushed_while_down,
             "flush-on-switch 不得把线路标成『DOWN 期间已清』"
+        );
+    }
+
+    #[test]
+    fn test_conntrack_failure_only_resets_failed_interfaces() {
+        let now = Instant::now();
+        let mut wan1 = monitor("wan1", Some(now));
+        let mut wan2 = monitor("wan2", Some(now));
+        wan1.down_since = Some(now);
+        wan1.flushed_while_down = true;
+        wan2.down_since = Some(now);
+        wan2.flushed_while_down = true;
+
+        let mut monitors = vec![wan1, wan2];
+        reset_failed_conntrack_markers(&mut monitors, &["wan2".to_string()]);
+        assert!(
+            monitors[0].flushed_while_down,
+            "早已清理成功的 wan1 不得因 wan2 清理失败而被反复重清"
+        );
+        assert!(
+            !monitors[1].flushed_while_down,
+            "本次失败批次里的 wan2 必须重置以便重试"
         );
     }
 
@@ -3103,6 +3571,82 @@ mod tests {
             &full[..2],
             "容量最小的线退出后，存活线的权重必须不变（比例本来就没变）"
         );
+    }
+
+    #[test]
+    fn test_odd_and_even_fractional_capacity_ratios_are_exact() {
+        let cfg = DaemonConfig::default();
+        let mk = |name: &str, mbps: f64| {
+            let mut m = monitor(name, None);
+            m.down_bps_capacity = Some(mbps * 1_000_000.0);
+            m
+        };
+
+        // 双数 2 线 300M:200M -> 精确 3:2（旧版四舍五入成 2:1，误差 6.7%）
+        let w2 = compute_dynamic_weights(
+            &[mk("wan1", 300.0), mk("wan2", 200.0)],
+            |_, _| true,
+            &cfg,
+            true,
+        );
+        assert_eq!(w2, vec![3, 2]);
+
+        // 单数 3 线 300M:200M:200M -> 精确 3:2:2（旧版成 2:1:1，误差 7.1%）
+        let w3 = compute_dynamic_weights(
+            &[mk("wan1", 300.0), mk("wan2", 200.0), mk("wan3", 200.0)],
+            |_, _| true,
+            &cfg,
+            true,
+        );
+        assert_eq!(w3, vec![3, 2, 2]);
+
+        // 单数 3 线 500M:300M:200M -> 精确 5:3:2（旧版成 3:2:1）
+        let w3b = compute_dynamic_weights(
+            &[mk("wan1", 500.0), mk("wan2", 300.0), mk("wan3", 200.0)],
+            |_, _| true,
+            &cfg,
+            true,
+        );
+        assert_eq!(w3b, vec![5, 3, 2]);
+    }
+
+    #[test]
+    fn test_aggregate_mode_spreads_by_residual_headroom_for_odd_wans() {
+        let mut cfg = DaemonConfig::default();
+        cfg.weight_mode = WeightMode::Aggregate;
+        cfg.dynamic_weight_min_ratio = 0.20;
+
+        let mk = |name: &str, used_mbps: f64| {
+            let mut m = monitor(name, None);
+            m.down_bps_capacity = Some(100_000_000.0);
+            m.up_bps_capacity = Some(100_000_000.0);
+            m.rx_bps_ewma = used_mbps * 1_000_000.0;
+            m.lqe.rtt_ewma_ms = Some(20.0);
+            m
+        };
+
+        // 3 条等带宽 WAN 均空闲 -> GCD 约分为最简 1:1:1
+        let idle = vec![mk("wan1", 0.0), mk("wan2", 0.0), mk("wan3", 0.0)];
+        assert_eq!(
+            compute_dynamic_weights(&idle, |_, _| true, &cfg, true),
+            vec![1, 1, 1]
+        );
+
+        // 3 条 WAN 分别占用 80% / 50% / 10% -> 余量比 20 : 50 : 90 -> 权重 2:5:9，新流优先填满最空闲线
+        let loaded = vec![mk("wan1", 80.0), mk("wan2", 50.0), mk("wan3", 10.0)];
+        let w = compute_dynamic_weights(&loaded, |_, _| true, &cfg, true);
+        assert_eq!(w, vec![2, 5, 9]);
+    }
+
+    #[test]
+    fn test_parse_proc_net_dev() {
+        let sample = "Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo: 12345    100    0    0    0     0          0         0    54321    100    0    0    0     0       0          0\n\
+  wan1: 987654321 5000  0    0    0     0          0         0 123456789 4000    0    0    0     0       0          0\n";
+        let m = parse_proc_net_dev(sample);
+        assert_eq!(m.get("lo"), Some(&(12345, 54321)));
+        assert_eq!(m.get("wan1"), Some(&(987654321, 123456789)));
     }
 
     #[test]

@@ -53,12 +53,15 @@
   ip route get 223.5.5.5 oif wan1                    # 应显示 via <gw>（有 via 才代表有路）
   ip route show table main | grep 'metric 42760'     # 只在必要时短暂出现的探针 /32
   ip route show table main | grep 'metric 42761'     # 隧道 underlay 对端的防自环 /32
+  ip route show table main | grep 'metric 42762'     # 每 WAN 专属上游 DNS 的出口绑定 /32
   ```
   **保留区段**（本程式专用，请勿他用）：路由表 `10000..10063`、规则优先序 `10000..10063`、
-  主表 metric `42760`（探针 /32）与 `42761`（隧道 underlay /32）。我们的规则都带来源标记（`FRA_PROTOCOL = 0x4D`），启动清扫**只删带这个
+  主表 metric `42760`（探针 /32）、`42761`（隧道 underlay /32）与 `42762`（上游 DNS /32）。我们的规则都带来源标记（`FRA_PROTOCOL = 0x4D`），启动清扫**只删带这个
   标记的规则**，不会动到第三方的规则；清扫也不再主动删保留表内的路由（没有规则指向它就是惰性的，
   而且我们重用该表时会直接 REPLACE）。
-- **探测协议**：以高效 TCP SYN 探测公共 DNS（预设为大陆地区的 `223.5.5.5:53`、`114.114.114.114:53`），周期预设为 500ms。TCP SYN 探针具备极高穿透力，不会被运营商 ICMP 限速或丢弃。
+- **探测协议（TCP SYN / UDP DNS 双模）**：
+  - 预设 `probe_mode: "tcp"`：以高效 TCP SYN 探测公共 DNS（预设为大陆地区的 `223.5.5.5:53`、`114.114.114.114:53`），周期预设为 500ms，穿透力强且不受运营商 ICMP 限速影响。
+  - 可选 `probe_mode: "dns"`（支持全局配置或单网卡覆写）：直接通过绑定网卡的临时 UDP 端口向 `probe_targets` 发送标准 RFC 1035 DNS A 记录查询（默认测试域名 `dns_probe_domain: "baidu.com"`），校验 Transaction ID、响应标志位与 RCODE（拒绝 `SERVFAIL` / `REFUSED` 等异常），可识别“TCP 端口假通或网关劫持但实际无法解析”的场景，且**绝不占用本地 53 端口，不影响任何第三方 DNS 软件**。
 - **多目标容灾（主目标 + 失败回退）**：支援单一网卡配置多个探测目标，健康时每个周期只探「上次探通的那个」（每条 WAN 每周期只产生 1 条短命 TCP 连线，conntrack／LuCI 连线列表不会被探针灌满）；只有它失败才探测其余目标，保留「单一 DNS 被墙或故障时自动切换目标」的容灾能力。
 - **上一拍失败时改为并行探测（r10）**：只要上一拍是失败的（`consecutive_timeouts > 0`），该线的**所有目标同时发出**（每个目标仍拿到完整的 `probe_timeout_ms`，没有任何目标被缩短；健康时依旧只发一条连线）。为什么：旧写法「先等主目标超时、再并发探其余目标」在全部目标都不回应时会让一个周期花掉 **2 × `probe_timeout_ms`**（预设 400ms → 800ms），比 `check_interval_ms`（预设 500ms）还长，而 `tokio::time::interval` 的 `MissedTickBehavior::Skip` 会把错过的拍**直接丢掉**，于是探测节奏被悄悄拉长成 800ms：
   - 连续 3 拍判 DOWN：**2.4 秒 → 1.5 秒**；
@@ -496,6 +499,45 @@ ECMP 只按 flow 哈希，即使权重按频宽设好，也可能因为 flow 分
 > 另外 `standard` ECMP 在权重变更时可能重算整张 multipath hash；
 > 预设 `auto`（resilient）不会——只有明确设 `standard` 才需要担心。
 > 全部线路都吃满时，权重比例不会变（没有地方可以转），不会制造无意义的路由变更。
+
+#### 6.7 非侵入式多 WAN 上游 DNS 支持（不干扰第三方 DNS 软件）
+
+在多 WAN 路由器上，用户通常会独立运行 **AdGuardHome、SmartDNS、MosDNS、OpenClash 或 dnsmasq**。为做到**零冲突、零侵入**，MWAN4 刻意**不监听本地 53 端口、不修改 `dnsmasq` 配置、默认不碰 `/etc/resolv.conf`**，而是从内核 FIB 路由层与探测层提供两项纯可选能力：
+
+1. **每 WAN 专属上游 DNS 出口绑定（`dns_servers`，支持 `IP` 或 `IP:Port`）**：
+   - 在任意 WAN 上填写 `dns_servers`（支持裸 IP 如 `"202.96.128.86"` 默认 53 端口，或自定义端口如 `"221.6.4.66:5353"`；默认空 = 不启用）。
+   - 该 WAN 健康（UP）时，MWAN4 在主表维护指向该 WAN 的 `/32` 主机路由（专属 metric `42762` + `RTPROT_MWAN4`，与 Flow Offload 100% 兼容）。第三方 DNS 软件无论怎么配置上游，发往运营商专属 DNS 的报文都会稳定从对应 WAN 发出，绝不会因 ECMP 哈希走错运营商线路而超时。
+   - 若多条 WAN 共享同一公共 DNS，优先分配给未降级且 metric 最小的存活 WAN；当所在 WAN 判 DOWN 时自动切换至其他存活 WAN 或撤除该 `/32` 路由；服务退出时一律拆除清理。
+2. **可选内置轻量级多线 UDP DNS 转发端口（`dns_listen_port`，默认 `0` 关闭）**：
+   - 默认为 `0`（不监听任何端口，绝不与端口 53 的第三方 DNS 冲突）。
+   - 若设为独立端口（如 `dns_listen_addr: "127.0.0.1"`、`dns_listen_port: 5354`），MWAN4 会在该端口轻量转发 UDP DNS 请求，自动按当前健康 WAN（`SO_BINDTODEVICE` 绑定网卡）轮询并故障切换到各 WAN 的 `dns_servers`（含自定义端口；未填时回退 `probe_targets`）。AdGuardHome / SmartDNS / MosDNS / dnsmasq 只需将 `127.0.0.1:5354` 加为上游即可无缝获得多线健康感知与故障切换。
+3. **可选的独立健康 DNS 列表导出（`dns_resolv_file`）**：
+   - 默认为 `null`（不写入任何文件）。
+   - 若显式配置独立路径（如 `"/tmp/mwan4_resolv.conf"`），MWAN4 会在健康 DNS 列表变化时原子写入该文件，绝不覆写系统默认 `/etc/resolv.conf`。
+4. **真实 UDP DNS 健康探测（`probe_mode: "dns"`）**：
+   - 使用临时端口向 `probe_targets`（支持任意 `IP:Port`）发送 RFC 1035 DNS 查询并校验应答，识别“TCP 53 假通但解析失败”的链路故障，同样对第三方 DNS 软件零影响。
+
+#### 6.8 原生 UCI 命令与单/双数多 WAN 聚合分流优化
+
+1. **原生 UCI 命令（`mwan4 uci ...`）与直接加载 UCI 文件**：
+   - `mwan4 -c /etc/config/mwan4` 与 `mwan4 --check-config /etc/config/mwan4` 可直接读取 OpenWrt UCI 配置（自动识别 JSON / UCI 格式，无需外部 `uci` 二进制）。
+   - 支持常用 OpenWrt UCI 语法：
+     ```sh
+     mwan4 uci show
+     mwan4 uci get global.weight_mode
+     mwan4 uci set global.weight_mode=aggregate
+     mwan4 uci set global.dns_listen_port=5354
+     mwan4 uci add_list wan1.dns_servers=202.96.128.86
+     mwan4 uci del_list wan1.dns_servers=202.96.128.86
+     mwan4 uci delete wan2.gateway
+     mwan4 uci validate        # / commit
+     mwan4 uci export-json
+     ```
+2. **单数（3/5 线）与双数（2/4/6/8 线）多 WAN 均衡与近带宽聚合分流**：
+   - **240 弹性桶零偏斜**：`resilient` 模式采用 `240` 个哈希桶（可被 2/3/4/5/6/8/10/12 整除），消除传统 256 桶在单数多 WAN 下的余数偏斜；同时设置 `resilient_idle_timer_secs`（默认 30 秒，取代内核 120 秒），保护活跃连接的同时让空闲桶更快再均衡。
+   - **小数带宽精确整数比**：如 `300M:200M` 自动还原为精确 `3:2`、`500M:300M:200M` 还原为 `5:3:2`（不再四舍五入产生 7% 偏斜）。
+   - **余量感知聚合分流（`weight_mode: "aggregate"`）**：综合各线剩余空闲带宽 `1 - util` 与链路品质（RTT/丢包），并自动约分 GCD，在多连接场景下（多线程下载、P2P、多终端、视频分段）持续把新流导向最空闲的健康 WAN，零 nftables/fwmark、100% 兼容 Flow Offload。
+   - **极低系统开销**：速率统计改为单次读取 `/proc/net/dev` 批量解析所有网卡，相比逐网卡读 sysfs 减少 4~10 倍系统调用。
 
 ## 专案结构
 

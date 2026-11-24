@@ -66,7 +66,7 @@ msgid "Consecutive probe timeouts before interface is marked DOWN (default: 3)"
 msgstr ""
 msgid "Recovery Success Count (Hysteresis)"
 msgstr ""
-msgid "Consecutive successful probes with <10% loss required before recovering to UP (default: 5)"
+msgid "Consecutive successful probes with normal RTT required before recovering to UP (default: 5)"
 msgstr ""
 msgid "Flush Conntrack on DOWN"
 msgstr ""
@@ -219,4 +219,124 @@ msgid "Aggregate"
 msgstr ""
 
 msgid "RTT Trend"
+msgstr ""
+
+msgid "DNS Pinning:"
+msgstr ""
+
+msgid "Health Probe Protocol"
+msgstr ""
+
+msgid "tcp uses lightweight TCP SYN handshakes; dns sends real UDP DNS queries (ephemeral port, never conflicts with AdGuardHome / SmartDNS / MosDNS / dnsmasq) to detect broken DNS or hijacked links."
+msgstr ""
+
+msgid "TCP SYN (default)"
+msgstr ""
+
+msgid "DNS Query (UDP)"
+msgstr ""
+
+msgid "DNS Probe Domain"
+msgstr ""
+
+msgid "Domain queried when Health Probe Protocol is set to DNS Query (default: baidu.com)."
+msgstr ""
+
+msgid "Packet Loss Threshold for DOWN"
+msgstr ""
+
+msgid "Sliding-window packet loss ratio (0.0 - 1.0) above which a link is marked DOWN (default: 0.5)."
+msgstr ""
+
+msgid "Maximum Allowed RTT (ms)"
+msgstr ""
+
+msgid "Smoothed RTT ceiling before consecutive violations mark the link DOWN (default: 1500 ms)."
+msgstr ""
+
+msgid "Degrade Exit Hysteresis"
+msgstr ""
+
+msgid "Degrade Enter Samples"
+msgstr ""
+
+msgid "Degrade Exit Samples"
+msgstr ""
+
+msgid "Degrade Minimum Out Samples"
+msgstr ""
+
+msgid "Load Offload Threshold"
+msgstr ""
+
+msgid "Load Recover Threshold"
+msgstr ""
+
+msgid "Healthy DNS Export File (Optional)"
+msgstr ""
+
+msgid "Leave empty to disable (recommended when using AdGuardHome / SmartDNS / MosDNS / dnsmasq). If set to an independent path like /tmp/mwan4_resolv.conf, mwan4 writes healthy per-WAN DNS servers there without touching /etc/resolv.conf."
+msgstr ""
+
+msgid "Remove Default Route on Exit"
+msgstr ""
+
+msgid "Keep disabled (default) to avoid brief internet loss during service restarts. Probe paths, policies, underlay and DNS host routes are always cleaned up."
+msgstr ""
+
+msgid "Gateway, ECMP weight, probe targets and optional per-WAN DNS pinning for each WAN interface."
+msgstr ""
+
+msgid "Leave empty or 0.0.0.0 for point-to-point / PPPoE / WireGuard interfaces."
+msgstr ""
+
+msgid "IPv6 Gateway"
+msgstr ""
+
+msgid "Probe Protocol Override"
+msgstr ""
+
+msgid "Inherit global setting"
+msgstr ""
+
+msgid "Pinned Upstream DNS (IPv4)"
+msgstr ""
+
+msgid "Optional ISP/upstream DNS IPs pinned to this WAN via kernel /32 routes while healthy. Works transparently under AdGuardHome, SmartDNS, MosDNS and dnsmasq without touching port 53."
+msgstr ""
+
+msgid "Tunnel Underlay Peers (IPv4)"
+msgstr ""
+
+msgid "For tunnel WANs (VXLAN/WireGuard): peer IPs pinned to a non-tunnel WAN to avoid ECMP self-loop."
+msgstr ""
+
+msgid "Degraded: sliding-window packet loss reached the degrade threshold, so this WAN is excluded from the default route. It is still probed and rejoins automatically once its loss drops."
+msgstr ""
+
+msgid "Router clock differs from this browser, so freshness cannot be judged. These values may be the last known state of a stopped daemon."
+msgstr ""
+
+msgid "DNS"
+msgstr ""
+
+msgid "DNS:"
+msgstr ""
+
+msgid "Expected IPv4 or IPv4:Port"
+msgstr ""
+
+msgid "DNS Forward Port (0 = Off)"
+msgstr ""
+
+msgid "DNS Listen Address"
+msgstr ""
+
+msgid "DNS Forward Timeout (ms)"
+msgstr ""
+
+msgid "Upstream DNS (IP[:Port])"
+msgstr ""
+
+msgid "Aggregate spreading (headroom-aware)"
 msgstr ""

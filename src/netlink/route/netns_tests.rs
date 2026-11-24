@@ -780,3 +780,185 @@ fn netns_policy_routing() {
 
     rm.cleanup_routes().expect("cleanup");
 }
+
+/// 真实核心验证：非侵入式每 WAN 上游 DNS `/32` 路由绑定、故障切换、外部删除自愈，
+/// 以及 `remove_routes_on_exit = false` 退出路径下保留预设路由但清干净 DNS 与 underlay `/32`。
+#[test]
+#[ignore = "needs unshare -Urn + CAP_NET_ADMIN; see module docs"]
+fn netns_dns_and_underlay_routes() {
+    if !netns_enabled() {
+        return;
+    }
+    let _d = Dummies::setup(&[("mwdns0", "10.30.0.2/24"), ("mwdns1", "10.31.0.2/24")]);
+    let mut rm = RouteManager::new(5200, EcmpMode::Standard).unwrap();
+
+    let dns_ct: Ipv4Addr = "202.96.128.86".parse().unwrap();
+    let dns_cu: Ipv4Addr = "221.6.4.66".parse().unwrap();
+    let peer_underlay: Ipv4Addr = "198.51.100.7".parse().unwrap();
+
+    // 1) 安装默认路由 + 隧道 underlay /32
+    let wans = vec![
+        veh("mwdns0", 10, vec![]),
+        veh("mwdns1", 10, vec![peer_underlay]),
+    ];
+    rm.apply_default_routes(&wans)
+        .expect("install default + underlay");
+    let r = routes();
+    assert!(
+        r.contains("198.51.100.7 dev mwdns0") && r.contains("metric 42761"),
+        "underlay /32 未安装到物理线:\n{r}"
+    );
+
+    // 2) 安装每 WAN 上游 DNS /32 出口绑定（metric 42762）
+    let dns_routes = vec![
+        DnsRoute {
+            server: dns_ct,
+            ifname: "mwdns0".into(),
+            ifindex: ifindex("mwdns0"),
+            gateway: None,
+        },
+        DnsRoute {
+            server: dns_cu,
+            ifname: "mwdns1".into(),
+            ifindex: ifindex("mwdns1"),
+            gateway: None,
+        },
+    ];
+    rm.sync_dns_routes(&dns_routes).expect("install dns routes");
+    let r = routes();
+    assert!(
+        r.contains("202.96.128.86 dev mwdns0") && r.contains("221.6.4.66 dev mwdns1"),
+        "DNS /32 未绑定到对应 WAN:\n{r}"
+    );
+    assert!(
+        r.contains("metric 42762"),
+        "应使用专属 DNS metric 42762:\n{r}"
+    );
+
+    // 3) 模拟外部误删 DNS /32 -> 下次 sync 必须通过内核转储发现并自愈
+    assert!(sh(&[
+        "ip",
+        "route",
+        "del",
+        "202.96.128.86/32",
+        "metric",
+        "42762"
+    ]));
+    assert!(
+        !routes().contains("202.96.128.86"),
+        "前置条件：外部删除应生效"
+    );
+    rm.sync_dns_routes(&dns_routes)
+        .expect("self-heal deleted dns route");
+    assert!(
+        routes().contains("202.96.128.86 dev mwdns0"),
+        "外部删除后 sync_dns_routes 应自愈重装:\n{}",
+        routes()
+    );
+
+    // 4) 故障切换：dns_ct 切到 mwdns1，dns_cu 撤除
+    let failover_dns = vec![DnsRoute {
+        server: dns_ct,
+        ifname: "mwdns1".into(),
+        ifindex: ifindex("mwdns1"),
+        gateway: None,
+    }];
+    rm.sync_dns_routes(&failover_dns)
+        .expect("failover dns route");
+    let r = routes();
+    assert!(
+        r.contains("202.96.128.86 dev mwdns1") && !r.contains("221.6.4.66"),
+        "DNS /32 故障切换未生效:\n{r}"
+    );
+
+    // 5) 模拟 remove_routes_on_exit = false 退出：保留默认路由，拆除 DNS /32 与 underlay /32
+    rm.sync_dns_routes(&[]).expect("clear dns routes");
+    rm.clear_underlay_routes().expect("clear underlay routes");
+    let r = routes();
+    assert!(
+        r.contains("metric 5200"),
+        "默认路由在 remove_routes_on_exit=false 时应保留:\n{r}"
+    );
+    assert!(
+        !r.contains("202.96.128.86") && !r.contains("198.51.100.7"),
+        "退出后不得残留 DNS /32 或 underlay /32:\n{r}"
+    );
+
+    rm.cleanup_routes().expect("final cleanup");
+}
+
+/// 真实核心验证：240 桶 + idle_timer 对单数（3 线）和双数（4 线）多 WAN 实现严格均分（80:80:80 与 60:60:60:60）。
+#[test]
+#[ignore = "needs unshare -Urn + CAP_NET_ADMIN; see module docs"]
+fn netns_odd_even_resilient_buckets() {
+    if !netns_enabled() {
+        return;
+    }
+    let _d = Dummies::setup(&[
+        ("mwo0", "10.40.0.2/24"),
+        ("mwo1", "10.41.0.2/24"),
+        ("mwo2", "10.42.0.2/24"),
+        ("mwo3", "10.43.0.2/24"),
+    ]);
+    let mut rm = RouteManager::new(5300, EcmpMode::Resilient)
+        .unwrap()
+        .with_resilient_idle_timer(25);
+
+    // 单数 3 WAN -> 每条精确 80 桶
+    let odd3 = vec![
+        veh("mwo0", 10, vec![]),
+        veh("mwo1", 10, vec![]),
+        veh("mwo2", 10, vec![]),
+    ];
+    rm.apply_default_routes(&odd3).expect("apply 3-WAN odd");
+    let nh = sh_out(&["ip", "nexthop", "show"]);
+    assert!(
+        nh.contains("buckets 240") && nh.contains("idle_timer 25"),
+        "应安装 240 桶与 idle_timer 25:\n{nh}"
+    );
+    let buckets3 = sh_out(&[
+        "ip",
+        "nexthop",
+        "bucket",
+        "show",
+        "id",
+        &NH_GROUP_ID_V4.to_string(),
+    ]);
+    let counts3: Vec<usize> = ["1", "2", "3"]
+        .iter()
+        .map(|id| buckets3.matches(&format!("nhid {id}")).count())
+        .collect();
+    assert_eq!(
+        counts3,
+        vec![80, 80, 80],
+        "3 线单数 WAN 应严格均分 80/80/80 桶"
+    );
+
+    // 双数 4 WAN -> 每条精确 60 桶
+    let even4 = vec![
+        veh("mwo0", 10, vec![]),
+        veh("mwo1", 10, vec![]),
+        veh("mwo2", 10, vec![]),
+        veh("mwo3", 10, vec![]),
+    ];
+    rm.apply_default_routes(&even4).expect("apply 4-WAN even");
+    let buckets4 = sh_out(&[
+        "ip",
+        "nexthop",
+        "bucket",
+        "show",
+        "id",
+        &NH_GROUP_ID_V4.to_string(),
+    ]);
+    let counts4: Vec<usize> = ["1", "2", "3", "4"]
+        .iter()
+        .map(|id| buckets4.matches(&format!("nhid {id}")).count())
+        .collect();
+    assert_eq!(
+        counts4,
+        vec![60, 60, 60, 60],
+        "4 线双数 WAN 应严格均分 60/60/60/60 桶"
+    );
+
+    rm.cleanup_routes().expect("cleanup");
+}

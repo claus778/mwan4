@@ -67,6 +67,8 @@ pub const NHA_RES_GROUP: u16 = 12;
 
 /// 巢状于 NHA_RES_GROUP 的 bucket 数（u16）；顶层 13 是 NHA_RES_BUCKET，误用会让核心回 EINVAL。
 pub const NHA_RES_GROUP_BUCKETS: u16 = 1;
+/// 巢状于 NHA_RES_GROUP 的空闲桶迁移时间（u32，单位 1/100 秒 / centiseconds）。
+pub const NHA_RES_GROUP_IDLE_TIMER: u16 = 2;
 
 /// SOL_NETLINK / NETLINK_EXT_ACK：开了核心才会在错误回应附上原因；libc 未必导出故自备。
 const SOL_NETLINK: libc::c_int = 270;
@@ -82,8 +84,9 @@ pub const NEXTHOP_GRP_TYPE_RES: u16 = 1;
 pub const NH_GROUP_ID_V4: u32 = 0xFFFF_FF00;
 pub const NH_GROUP_ID_V6: u32 = 0xFFFF_FF01;
 
-/// bucket 数上限：必须是 2 的幂、涵盖所有成员数，且建立后不得再变（REPLACE 不允许改）。
-const RES_BUCKETS_MAX: usize = 256;
+/// resilient 弹性哈希桶数量：选用 240（2/3/4/5/6/8/10/12 的公倍数）而非 256，
+/// 让单数（3、5 线）与双数（2、4、6、8 线）多 WAN 等权分流时均能整除、零余数偏斜，且建立后固定不变（REPLACE 不允许改）。
+const RES_BUCKETS_MAX: usize = 240;
 
 /// rtnh_hops 是 u8、语意为 weight-1；上限与 config::MAX_WEIGHT 一致。
 pub const MAX_NEXTHOP_WEIGHT: u32 = 255;
@@ -130,13 +133,17 @@ pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 /// 隧道 underlay /32 的 metric；与探针分开才能各自精准清扫。
 pub const UNDERLAY_ROUTE_METRIC: u32 = 42_761;
 
-/// 启动前清扫要删的 metric（探针 + underlay）：上次留下的 underlay 出口可能已失效。
-const STARTUP_SWEEP_METRICS: [(u32, &str); 2] = [
+/// 每 WAN 上游 DNS `/32` 出口绑定的 metric；与探针 / underlay 分开才能互不覆盖且各自精准清扫。
+pub const DNS_ROUTE_METRIC: u32 = 42_762;
+
+/// 启动前清扫要删的 metric（探针 + underlay + DNS）：上次留下的出口可能已失效。
+const STARTUP_SWEEP_METRICS: [(u32, &str); 3] = [
     (PROBE_MAIN_ROUTE_METRIC, "probe"),
     (UNDERLAY_ROUTE_METRIC, "underlay"),
+    (DNS_ROUTE_METRIC, "dns"),
 ];
 
-/// 执行期清扫只扫探针 /32：误删刚装好的 underlay /32 会因只信快取而永不重装。
+/// 执行期清扫只扫探针 /32：误删刚装好的 underlay / DNS /32 会破坏隧道防自环或上游 DNS 出口绑定。
 const RUNTIME_SWEEP_METRICS: [(u32, &str); 1] = [(PROBE_MAIN_ROUTE_METRIC, "probe")];
 
 // 编译期钉死以下不变式（改坏会编译失败，而不是上机才发现）。
@@ -155,12 +162,18 @@ const _: () = {
     assert!(UNDERLAY_ROUTE_METRIC != PROBE_MAIN_ROUTE_METRIC);
     assert!(UNDERLAY_ROUTE_METRIC > PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX);
     assert!(UNDERLAY_ROUTE_METRIC < 0xFFFF_FF00);
-    // 执行期清扫只能扫探针 /32：误删 underlay 会让隧道封装封包走 ECMP 自环
+    // DNS /32 用独立 metric：与探针及 underlay 分开，允许同一 IP 兼作探针目标与绑定 DNS
+    assert!(DNS_ROUTE_METRIC != PROBE_MAIN_ROUTE_METRIC);
+    assert!(DNS_ROUTE_METRIC != UNDERLAY_ROUTE_METRIC);
+    assert!(DNS_ROUTE_METRIC > PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX);
+    assert!(DNS_ROUTE_METRIC < 0xFFFF_FF00);
+    // 执行期清扫只能扫探针 /32：误删 underlay/dns 会破坏隧道防自环或 DNS 路由绑定
     assert!(RUNTIME_SWEEP_METRICS.len() == 1);
     assert!(RUNTIME_SWEEP_METRICS[0].0 == PROBE_MAIN_ROUTE_METRIC);
     assert!(RUNTIME_SWEEP_METRICS[0].0 != UNDERLAY_ROUTE_METRIC);
-    // 启动清扫两者都要扫（残留的 underlay /32 出口可能已经失效）
-    assert!(STARTUP_SWEEP_METRICS.len() == 2);
+    assert!(RUNTIME_SWEEP_METRICS[0].0 != DNS_ROUTE_METRIC);
+    // 启动清扫三者都要扫（残留的 underlay / dns /32 出口可能已经失效）
+    assert!(STARTUP_SWEEP_METRICS.len() == 3);
 };
 
 /// 等待核心 ACK 的最大轮询次数（配合 socket 上的 SO_RCVTIMEO 使用）
@@ -365,6 +378,15 @@ pub struct ProbePath {
     pub main_route_targets: Vec<Ipv4Addr>,
 }
 
+/// 一条每 WAN 上游 DNS 的主表 `/32` 出口绑定路由：让第三方 DNS 软件访问运营商 DNS 时固定走指定健康 WAN。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRoute {
+    pub server: Ipv4Addr,
+    pub ifname: String,
+    pub ifindex: u32,
+    pub gateway: Option<Ipv4Addr>,
+}
+
 /// 一条策略分流规则（已展开）：from/to 为 None 代表不限制；主回圈把 config.policies 展开成此形式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRule {
@@ -436,6 +458,8 @@ pub struct RouteManager {
     priority: u32,
     /// ECMP 行为：标准 multipath / 自动 / 强制 resilient nexthop group
     ecmp_mode: EcmpMode,
+    /// resilient 空闲桶迁移时间（秒），下发时换算为 centiseconds（×100）写入 NHA_RES_GROUP_IDLE_TIMER。
+    resilient_idle_timer_secs: u32,
     /// None = 尚未探测；Some(true/false) = 核心是否支援 resilient nexthop group
     resilient_supported: Option<bool>,
     /// (family, ifindex, gateway bytes) -> nexthop object id；ID 必须跨次呼叫稳定，核心才只重映射故障链路的 bucket。
@@ -447,6 +471,8 @@ pub struct RouteManager {
     probe_paths: std::collections::HashMap<String, ProbePath>,
     /// 已下发的隧道 underlay /32：对端位址 -> (ifindex, gateway)；用来差异比对，避免每轮重下。
     underlay_routes: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
+    /// 已下发的上游 DNS /32：DNS 服务器 IP -> (ifindex, gateway)；差异比对与内核缺失自愈用。
+    dns_routes: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
     /// 已下发的策略分流规则（差异比对与清理用）
     policy_rules: Vec<PolicyRule>,
     /// 上一次真正下发到核心的 nexthop 集合（含权重）。用来跳过「内容完全一样」的 FIB 重下：
@@ -523,6 +549,7 @@ impl RouteManager {
                 seq: 1,
                 priority,
                 ecmp_mode,
+                resilient_idle_timer_secs: 30,
                 resilient_supported: None,
                 nh_ids: std::collections::HashMap::new(),
                 next_nh_id: 1,
@@ -530,6 +557,7 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
+                dns_routes: std::collections::HashMap::new(),
                 policy_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
@@ -544,6 +572,7 @@ impl RouteManager {
                 seq: 1,
                 priority,
                 ecmp_mode,
+                resilient_idle_timer_secs: 30,
                 resilient_supported: None,
                 nh_ids: std::collections::HashMap::new(),
                 next_nh_id: 1,
@@ -551,6 +580,7 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
+                dns_routes: std::collections::HashMap::new(),
                 policy_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
@@ -558,6 +588,12 @@ impl RouteManager {
                 last_active_v6: Vec::new(),
             })
         }
+    }
+
+    /// 设定 resilient 空闲桶迁移时间（秒，默认 30）；数值越小空闲桶越快向空闲 WAN 迁移，活跃流不受影响。
+    pub fn with_resilient_idle_timer(mut self, secs: u32) -> Self {
+        self.resilient_idle_timer_secs = secs.clamp(1, 3600);
+        self
     }
 
     /// 调整 netlink socket 收发逾时（非 Linux 为 no-op）；查询用 manager 要短逾时，避免冻住 current_thread runtime。
@@ -781,36 +817,40 @@ impl RouteManager {
         // 显式带上 metric，确保 NLM_F_REPLACE / RTM_DELROUTE 能命中同一个路由 key
         Self::append_attr(&mut buffer, RTA_PRIORITY, &priority.to_ne_bytes());
 
-        if hops.len() == 1 {
-            let hop = &hops[0];
-            if let Some(gw) = &hop.gateway {
-                Self::append_attr(&mut buffer, RTA_GATEWAY, gw);
-            }
-            Self::append_attr(&mut buffer, RTA_OIF, &hop.ifindex.to_ne_bytes());
-        } else if hops.len() > 1 {
-            let mut mp_buffer: Vec<u8> = Vec::with_capacity(256);
-            for hop in hops {
-                let hop_start = mp_buffer.len();
-                // weight 必须落在 1..=255，否则 rtnh_hops 会静默截断
-                let weight = hop.weight.clamp(1, MAX_NEXTHOP_WEIGHT);
-                let rtnh = RtNextHop {
-                    rtnh_len: 0, // 待计算
-                    rtnh_flags: 0,
-                    rtnh_hops: (weight - 1) as u8,
-                    rtnh_ifindex: hop.ifindex as i32,
-                };
-                mp_buffer.extend_from_slice(&rtnh.to_bytes());
-
+        match hops.len().cmp(&1) {
+            std::cmp::Ordering::Equal => {
+                let hop = &hops[0];
                 if let Some(gw) = &hop.gateway {
-                    Self::append_attr(&mut mp_buffer, RTA_GATEWAY, gw);
+                    Self::append_attr(&mut buffer, RTA_GATEWAY, gw);
                 }
-
-                // 回填此 nexthop 的长度（核心要求 rtnh_len 为未对齐的实际长度）
-                let hop_len = mp_buffer.len() - hop_start;
-                mp_buffer.resize(hop_start + rta_align(hop_len), 0);
-                write_u16(&mut mp_buffer, hop_start, hop_len as u16);
+                Self::append_attr(&mut buffer, RTA_OIF, &hop.ifindex.to_ne_bytes());
             }
-            Self::append_attr(&mut buffer, RTA_MULTIPATH, &mp_buffer);
+            std::cmp::Ordering::Greater => {
+                let mut mp_buffer: Vec<u8> = Vec::with_capacity(256);
+                for hop in hops {
+                    let hop_start = mp_buffer.len();
+                    // weight 必须落在 1..=255，否则 rtnh_hops 会静默截断
+                    let weight = hop.weight.clamp(1, MAX_NEXTHOP_WEIGHT);
+                    let rtnh = RtNextHop {
+                        rtnh_len: 0, // 待计算
+                        rtnh_flags: 0,
+                        rtnh_hops: (weight - 1) as u8,
+                        rtnh_ifindex: hop.ifindex as i32,
+                    };
+                    mp_buffer.extend_from_slice(&rtnh.to_bytes());
+
+                    if let Some(gw) = &hop.gateway {
+                        Self::append_attr(&mut mp_buffer, RTA_GATEWAY, gw);
+                    }
+
+                    // 回填此 nexthop 的长度（核心要求 rtnh_len 为未对齐的实际长度）
+                    let hop_len = mp_buffer.len() - hop_start;
+                    mp_buffer.resize(hop_start + rta_align(hop_len), 0);
+                    write_u16(&mut mp_buffer, hop_start, hop_len as u16);
+                }
+                Self::append_attr(&mut buffer, RTA_MULTIPATH, &mp_buffer);
+            }
+            std::cmp::Ordering::Less => {}
         }
         let total_len = buffer.len() as u32;
         let nlhdr = NlMsgHdr {
@@ -850,12 +890,13 @@ impl RouteManager {
         buffer
     }
 
-    /// 组出 nexthop group 讯息：buckets = Some(n) 则附 NHA_RES_GROUP/NHA_RES_GROUP_BUCKETS + NHA_GROUP_TYPE=RES（resilient）。
+    /// 组出 nexthop group 讯息：buckets = Some(n) 则附 NHA_RES_GROUP(BUCKETS + IDLE_TIMER) + NHA_GROUP_TYPE=RES（resilient）。
     fn build_nexthop_group_msg(
         seq: u32,
         group_id: u32,
         members: &[(u32, u32)],
         buckets: Option<u16>,
+        idle_timer_secs: Option<u32>,
         msg_type: u16,
         flags: u16,
     ) -> Vec<u8> {
@@ -889,8 +930,12 @@ impl RouteManager {
         Self::append_attr(&mut buffer, NHA_GROUP, &grp);
 
         if let Some(bucket_count) = buckets {
-            let mut res: Vec<u8> = Vec::with_capacity(16);
+            let mut res: Vec<u8> = Vec::with_capacity(24);
             Self::append_attr(&mut res, NHA_RES_GROUP_BUCKETS, &bucket_count.to_ne_bytes());
+            if let Some(secs) = idle_timer_secs {
+                let cs = secs.saturating_mul(100);
+                Self::append_attr(&mut res, NHA_RES_GROUP_IDLE_TIMER, &cs.to_ne_bytes());
+            }
             Self::append_attr(&mut buffer, NHA_RES_GROUP | NLA_F_NESTED, &res);
         }
 
@@ -2171,6 +2216,143 @@ impl RouteManager {
         self.commit_msg(&msg, &format!("underlay route {target}/32 removal"))
     }
 
+    /// 退出时拆除所有本进程安装的隧道 underlay `/32`（即使 `remove_routes_on_exit = false` 也必须拆，避免黑洞到失效出口）。
+    pub fn clear_underlay_routes(&mut self) -> io::Result<()> {
+        self.sync_underlay_routes(&[])
+    }
+
+    /// 同步上游 DNS `/32` 出口绑定路由：不占本地 53 端口、不碰第三方 DNS 配置，仅在 FIB 层将各运营商 DNS 钉到对应健康 WAN。
+    pub fn sync_dns_routes(&mut self, wanted_routes: &[DnsRoute]) -> io::Result<()> {
+        let wanted: Vec<(Ipv4Addr, u32, Option<Vec<u8>>)> = wanted_routes
+            .iter()
+            .map(|r| {
+                (
+                    r.server,
+                    r.ifindex,
+                    r.gateway
+                        .filter(|g| !g.is_unspecified())
+                        .map(|g| g.octets().to_vec()),
+                )
+            })
+            .collect();
+
+        // 查询内核现存的 DNS /32 路由，防止被外部 flush 或链路重置后缓存失步。
+        let kernel_present: Option<std::collections::HashSet<Ipv4Addr>> =
+            match self.dump_host_routes_with_metric(DNS_ROUTE_METRIC) {
+                Ok(rows) => Some(
+                    rows.into_iter()
+                        .filter(|(table, _, _)| *table == u32::from(RT_TABLE_MAIN))
+                        .map(|(_, addr, _)| addr)
+                        .collect(),
+                ),
+                Err(e) => {
+                    debug!(
+                        "[RouteManager] Could not dump DNS host routes ({e}); \
+                         falling back to in-memory cache"
+                    );
+                    None
+                }
+            };
+
+        let mut first_err: Option<io::Error> = None;
+
+        let stale: Vec<Ipv4Addr> = self
+            .dns_routes
+            .keys()
+            .filter(|addr| !wanted.iter().any(|(t, _, _)| t == *addr))
+            .cloned()
+            .collect();
+        for addr in stale {
+            if kernel_present
+                .as_ref()
+                .is_some_and(|present| !present.contains(&addr))
+            {
+                debug!("[RouteManager] DNS host route {addr}/32 already gone from kernel");
+                self.dns_routes.remove(&addr);
+                continue;
+            }
+            if let Err(e) = self.delete_dns_route(addr) {
+                warn!("[RouteManager] Failed to remove DNS host route {addr}/32: {e}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            self.dns_routes.remove(&addr);
+        }
+
+        for (addr, ifindex, gateway) in
+            Self::plan_underlay_repairs(&wanted, &self.dns_routes, kernel_present.as_ref())
+        {
+            match self.install_dns_route(addr, ifindex, gateway.clone()) {
+                Ok(()) => {
+                    self.dns_routes.insert(addr, (ifindex, gateway));
+                }
+                Err(e) => {
+                    warn!(
+                        "[RouteManager] Failed to install DNS host route {addr}/32 (oif {ifindex}): {e}"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn install_dns_route(
+        &mut self,
+        server: Ipv4Addr,
+        ifindex: u32,
+        gateway: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        let hop = RouteNexthop {
+            ifindex,
+            gateway,
+            weight: 1,
+        };
+        self.seq += 1;
+        let seq = self.seq;
+        let octets = server.octets();
+        let msg = Self::build_route_msg_ex(
+            DNS_ROUTE_METRIC,
+            AF_INET,
+            RouteTarget {
+                table: None,
+                dst: Some((&octets, 32)),
+            },
+            std::slice::from_ref(&hop),
+            RTM_NEWROUTE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+            seq,
+        );
+        self.commit_msg(&msg, &format!("DNS route {server}/32 (oif {ifindex})"))
+    }
+
+    fn delete_dns_route(&mut self, server: Ipv4Addr) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let octets = server.octets();
+        let msg = Self::build_route_msg_ex(
+            DNS_ROUTE_METRIC,
+            AF_INET,
+            RouteTarget {
+                table: None,
+                dst: Some((&octets, 32)),
+            },
+            &[],
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            seq,
+        );
+        self.commit_msg(&msg, &format!("DNS route {server}/32 removal"))
+    }
+
     /// 更新 IPv4 预设路由（方式由 ecmp_mode 决定）；空阵列 = 所有 WAN 断线，主动删除预设路由。
     pub fn apply_default_routes(&mut self, active_wans: &[ActiveWanRoute]) -> io::Result<()> {
         Self::warn_out_of_range_weights(active_wans.iter().map(|w| (&w.ifname, w.weight)));
@@ -2737,6 +2919,7 @@ impl RouteManager {
             group_id,
             members,
             Some(buckets),
+            Some(self.resilient_idle_timer_secs),
             RTM_NEWNEXTHOP,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         );
@@ -2827,9 +3010,15 @@ impl RouteManager {
         let mut result = self.remove_installed_default_route(AF_INET);
         result = result.and(self.remove_installed_default_route(AF_INET6));
 
-        // underlay /32 也要拆：它们指向的闸道可能已失效，留着会让封装封包被黑洞到旧出口（优先于预设路由）。
+        // underlay /32 与 DNS /32 也要拆：它们指向的闸道可能已失效，留着会让封装或 DNS 封包被黑洞到旧出口。
         if let Err(e) = self.sync_underlay_routes(&[]) {
             warn!("[RouteManager] Failed to remove underlay routes on shutdown: {e}");
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+        if let Err(e) = self.sync_dns_routes(&[]) {
+            warn!("[RouteManager] Failed to remove DNS routes on shutdown: {e}");
             if result.is_ok() {
                 result = Err(e);
             }
@@ -3291,7 +3480,8 @@ mod tests {
             9,
             NH_GROUP_ID_V4,
             &members,
-            Some(16),
+            Some(240),
+            Some(30),
             RTM_NEWNEXTHOP,
             NLM_F_REQUEST,
         );
@@ -3322,9 +3512,13 @@ mod tests {
 
         // NHA_RES_GROUP 是巢状属性；曾误用顶层 NHA_RES_BUCKETS(13) 并以 u32 编码，核心回 EINVAL。
         let res = parse_attr_stream(&attrs[3].1, 0);
-        assert_eq!(attr_types(&res), vec![NHA_RES_GROUP_BUCKETS]);
+        assert_eq!(
+            attr_types(&res),
+            vec![NHA_RES_GROUP_BUCKETS, NHA_RES_GROUP_IDLE_TIMER]
+        );
         assert_eq!(res[0].1.len(), 2, "bucket 数必须是 u16，不是 u32");
-        assert_eq!(read_u16(&res[0].1, 0), Some(16));
+        assert_eq!(read_u16(&res[0].1, 0), Some(240));
+        assert_eq!(read_u32(&res[1].1, 0), Some(3000)); // 30s = 3000 centiseconds
     }
 
     #[test]
@@ -3334,6 +3528,7 @@ mod tests {
             1,
             77,
             &members,
+            None,
             None,
             RTM_NEWNEXTHOP,
             NLM_F_REQUEST,
@@ -3375,9 +3570,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resilient_buckets_are_fixed_power_of_two() {
-        // bucket 数固定用 RES_BUCKETS_MAX：核心 REPLACE 时不允许改变 bucket 数；须为 2 的幂且涵盖 config 的网卡上限。
-        const { assert!(RES_BUCKETS_MAX.is_power_of_two()) };
+    fn test_resilient_buckets_balance_odd_and_even_wans() {
+        // 240 桶可同时被单数(3/5)与双数(2/4/6/8/10/12)多 WAN 整除，消除余数桶偏斜；且涵盖 64 张网卡上限。
+        const { assert!(RES_BUCKETS_MAX % 2 == 0) };
+        const { assert!(RES_BUCKETS_MAX % 3 == 0) };
+        const { assert!(RES_BUCKETS_MAX % 4 == 0) };
+        const { assert!(RES_BUCKETS_MAX % 5 == 0) };
+        const { assert!(RES_BUCKETS_MAX % 6 == 0) };
+        const { assert!(RES_BUCKETS_MAX % 8 == 0) };
         const { assert!(RES_BUCKETS_MAX >= 64, "必须涵盖 config 的网卡数上限") };
         const { assert!(RES_BUCKETS_MAX < u16::MAX as usize) };
     }
@@ -3599,6 +3799,14 @@ mod tests {
         assert!(
             startup.contains(&UNDERLAY_ROUTE_METRIC),
             "启动前必须连残留的 underlay /32 一起清（出口可能已经失效）"
+        );
+        assert!(
+            startup.contains(&DNS_ROUTE_METRIC),
+            "启动前必须连残留的 DNS /32 一起清（出口可能已经失效）"
+        );
+        assert!(
+            !runtime.contains(&DNS_ROUTE_METRIC),
+            "执行期清扫不得误删上游 DNS /32 路由"
         );
     }
 

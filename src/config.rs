@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
+use std::str::FromStr;
 
 /// ECMP 权重上限：resilient 的 nexthop_grp.weight 在 Linux < 6.9 只允许 ≤ 254，设 256 会让 RTM_NEWNEXTHOP 回 EINVAL。
 pub const MAX_WEIGHT: u32 = 255;
@@ -106,11 +108,104 @@ impl HashField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    /// TCP SYN 握手探测（预设，兼容任何 TCP 端口，穿透力强）。
+    #[default]
+    Tcp,
+    /// 真实 UDP DNS 查询探测（发标准 A 记录查询并校验应答，识别 TCP 假通 / 劫持，不占本地 53 端口）。
+    Dns,
+}
+
+impl ProbeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Dns => "dns",
+        }
+    }
+}
+
+/// 每 WAN 上游 DNS 服务器地址：支持裸 IPv4（默认端口 53）或 `IP:Port`（如 `202.96.128.86` / `1.2.3.4:5353`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsServer {
+    pub ip: Ipv4Addr,
+    pub port: u16,
+}
+
+impl DnsServer {
+    pub const DEFAULT_PORT: u16 = 53;
+
+    #[cfg(test)]
+    pub fn new(ip: Ipv4Addr, port: u16) -> Self {
+        Self { ip, port }
+    }
+
+    pub fn socket_addr(self) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(self.ip, self.port))
+    }
+}
+
+impl fmt::Display for DnsServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port == Self::DEFAULT_PORT {
+            write!(f, "{}", self.ip)
+        } else {
+            write!(f, "{}:{}", self.ip, self.port)
+        }
+    }
+}
+
+impl FromStr for DnsServer {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let s = raw.trim();
+        if let Some((ip_str, port_str)) = s.rsplit_once(':') {
+            let ip: Ipv4Addr = ip_str
+                .parse()
+                .map_err(|_| format!("'{raw}' has an invalid IPv4 address"))?;
+            let port: u16 = port_str
+                .parse()
+                .map_err(|_| format!("'{raw}' has an invalid port"))?;
+            if port == 0 {
+                return Err(format!("'{raw}' port must be within 1 ~ 65535"));
+            }
+            Ok(Self { ip, port })
+        } else {
+            let ip: Ipv4Addr = s
+                .parse()
+                .map_err(|_| format!("'{raw}' is not a valid IPv4 or IPv4:Port"))?;
+            Ok(Self {
+                ip,
+                port: Self::DEFAULT_PORT,
+            })
+        }
+    }
+}
+
+impl Serialize for DnsServer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DnsServer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum WeightMode {
     #[default]
     Static,
     /// 依 LQE 实测品质动态调整权重（丢包/RTT 差的线少分流量；变更会重下 ECMP 路由）。
     Quality,
+    /// 余量感知聚合分流：综合剩余可用带宽与链路品质，按空闲余量动态倾斜多线权重（单/双数多 WAN 均适用），
+    /// 在最低资源占用下实现多连接近带宽聚合效果（100% 兼容 Flow Offload）。
+    Aggregate,
 }
 
 /// 一条来源/目的策略分流规则：以 `ip rule` 的 from/to + 该 WAN 独立路由表实现，不用 fwmark／nftables；目标 WAN DOWN 时规则暂时移除、回退 ECMP。
@@ -172,9 +267,16 @@ pub struct InterfaceConfig {
     /// 上行（WAN 出口）频宽上限（Mbps）；未设定时沿用 `max_mbps`（非对称线路才需要填）。
     #[serde(default)]
     pub up_mbps: Option<f64>,
-    /// 探测目标地址列表（TCP SYN 探测 IP:Port），如 ["223.5.5.5:53", ...]
+    /// 探测目标地址列表（TCP SYN 或 UDP DNS 探测 IP:Port），如 ["223.5.5.5:53", ...]
     #[serde(default = "default_probe_targets")]
     pub probe_targets: Vec<SocketAddr>,
+    /// 单接口探测模式覆写（选填；留空时继承全局 `probe_mode`）。
+    #[serde(default)]
+    pub probe_mode: Option<ProbeMode>,
+    /// 该 WAN 专属的上游 DNS 服务器清单（支持 `IP` 或 `IP:Port`，选填，预设空 = 不干预）：
+    /// 健康时在内核主表自动维护 `/32` 路由（metric 42762）固定走该 WAN 出口，同时也作为可选内置 DNS 转发器的上游地址。
+    #[serde(default)]
+    pub dns_servers: Vec<DnsServer>,
     /// 隧道型 WAN 的 underlay 对端位址（选填）：封装封包真正要去的地方必须经由**其他** WAN 抵达，否则有约 1/N 机率被塞回隧道自己形成自环。
     /// 设定后守护进程在 main 表为每个位址补一条 /32，固定走「非隧道、metric 最小」的那条 WAN。
     #[serde(default)]
@@ -261,6 +363,10 @@ pub struct DaemonConfig {
     /// standard 的任何成员/权重变动都会重算整张 multipath hash，实测连坐搬走 40%~43% 的既有 flow；`auto` 有 nexthop object 时用 resilient，否则退回 standard。
     #[serde(default)]
     pub ecmp_mode: EcmpMode,
+    /// resilient nexthop group 的空闲桶迁移时间（秒，预设 30，范围 1 ~ 3600）：
+    /// 内核默认 120 秒过慢，导致负载偏移/线路恢复后数分钟内新流仍挤旧线；30 秒既保护活跃长连接不断线，又让空闲桶更快再均衡。
+    #[serde(default = "default_resilient_idle_timer_secs")]
+    pub resilient_idle_timer_secs: u32,
     /// 优雅退出时是否移除本程式下发的预设路由（预设 **false**）：删掉唯一出口会在旧实例已退出、新实例未下发的窗口内把路由器打成离线。
     #[serde(default = "default_remove_routes_on_exit")]
     pub remove_routes_on_exit: bool,
@@ -290,6 +396,25 @@ pub struct DaemonConfig {
     /// standard 下权重一变就重算整张 hash，实测 1:1→1:10 搬走 39%、1:10→1:2 搬走 24% 的既有 flow，却搬不动已建立的大流量；改 `resilient`/`auto` 即可生效。
     #[serde(default)]
     pub allow_dynamic_weights_on_standard: bool,
+    /// 全局健康探测协议：`tcp`（预设，TCP SYN）或 `dns`（真实 UDP DNS 查询，防假通；不占用本地端口）。
+    #[serde(default)]
+    pub probe_mode: ProbeMode,
+    /// `probe_mode = "dns"` 时查询的测试域名（预设 `baidu.com`）。
+    #[serde(default = "default_dns_probe_domain")]
+    pub dns_probe_domain: String,
+    /// 可选内置轻量级多线 UDP DNS 转发器监听地址（预设 `127.0.0.1`）。仅在 `dns_listen_port > 0` 时启用。
+    #[serde(default = "default_dns_listen_addr")]
+    pub dns_listen_addr: String,
+    /// 可选内置轻量级多线 UDP DNS 转发器监听端口（预设 `0` = 关闭，绝不默认占用 53 端口影响第三方 DNS 软件；可设为如 `5354` 供 AdGuardHome / SmartDNS / MosDNS 作上游）。
+    #[serde(default)]
+    pub dns_listen_port: u16,
+    /// 内置 DNS 转发器单次上游查询超时（毫秒，预设 2000，范围 100 ~ 15000）。
+    #[serde(default = "default_dns_forward_timeout_ms")]
+    pub dns_forward_timeout_ms: u64,
+    /// 可选的独立 resolv 输出路径（预设 `null` = 不写入任何文件，绝不覆盖 `/etc/resolv.conf` 或干扰第三方 DNS 软件）；
+    /// 若显式填写如 `/tmp/mwan4_resolv.conf`，会在健康 WAN 的 `dns_servers` 变化时原子写入供第三方软件按需引用。
+    #[serde(default)]
+    pub dns_resolv_file: Option<String>,
     /// 来源/目的策略分流规则（选填）；匹配的转发流量走指定 WAN，目标 WAN DOWN 时回退 ECMP。
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
@@ -379,6 +504,22 @@ fn default_multipath_hash_policy() -> Option<MultipathHashPolicy> {
     Some(MultipathHashPolicy::L4)
 }
 
+fn default_dns_probe_domain() -> String {
+    "baidu.com".to_string()
+}
+
+fn default_dns_listen_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_dns_forward_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_resilient_idle_timer_secs() -> u32 {
+    30
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -401,6 +542,7 @@ impl Default for DaemonConfig {
             conntrack_flush_min_interval_ms: default_conntrack_flush_min_interval_ms(),
             route_priority: default_route_priority(),
             ecmp_mode: EcmpMode::default(),
+            resilient_idle_timer_secs: default_resilient_idle_timer_secs(),
             remove_routes_on_exit: default_remove_routes_on_exit(),
             multipath_hash_policy: default_multipath_hash_policy(),
             weight_mode: WeightMode::default(),
@@ -410,6 +552,12 @@ impl Default for DaemonConfig {
             load_target_ratio: default_load_target_ratio(),
             load_recover_ratio: default_load_recover_ratio(),
             allow_dynamic_weights_on_standard: false,
+            probe_mode: ProbeMode::default(),
+            dns_probe_domain: default_dns_probe_domain(),
+            dns_listen_addr: default_dns_listen_addr(),
+            dns_listen_port: 0,
+            dns_forward_timeout_ms: default_dns_forward_timeout_ms(),
+            dns_resolv_file: None,
             policies: Vec::new(),
             interfaces: vec![
                 InterfaceConfig {
@@ -421,6 +569,8 @@ impl Default for DaemonConfig {
                     max_mbps: None,
                     up_mbps: None,
                     probe_targets: default_probe_targets(),
+                    probe_mode: None,
+                    dns_servers: Vec::new(),
                     underlay_targets: Vec::new(),
                     extra: Default::default(),
                 },
@@ -433,6 +583,8 @@ impl Default for DaemonConfig {
                     max_mbps: None,
                     up_mbps: None,
                     probe_targets: default_probe_targets(),
+                    probe_mode: None,
+                    dns_servers: Vec::new(),
                     underlay_targets: Vec::new(),
                     extra: Default::default(),
                 },
@@ -443,9 +595,15 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// 自动识别 JSON 或 OpenWrt UCI 配置文件格式加载并校验。
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let config: DaemonConfig = serde_json::from_str(&content)?;
+        let config: DaemonConfig = if crate::uci::looks_like_json(&content) {
+            serde_json::from_str(&content)?
+        } else {
+            let doc = crate::uci::UciDocument::parse(&content)?;
+            doc.to_daemon_config()?
+        };
         config.validate()?;
         Ok(config)
     }
@@ -563,6 +721,41 @@ impl DaemonConfig {
             ));
         }
 
+        if !(1..=3600).contains(&self.resilient_idle_timer_secs) {
+            return Err(format!(
+                "resilient_idle_timer_secs {} out of range (1 ~ 3600)",
+                self.resilient_idle_timer_secs
+            ));
+        }
+        crate::dns::validate_dns_domain(&self.dns_probe_domain)?;
+        if self.dns_listen_addr.parse::<IpAddr>().is_err() {
+            return Err(format!(
+                "dns_listen_addr '{}' is not a valid IP address",
+                self.dns_listen_addr
+            ));
+        }
+        if !(100..=15_000).contains(&self.dns_forward_timeout_ms) {
+            return Err(format!(
+                "dns_forward_timeout_ms {} out of range (100 ~ 15000)",
+                self.dns_forward_timeout_ms
+            ));
+        }
+        if let Some(ref path) = self.dns_resolv_file {
+            if path.is_empty() || !path.starts_with('/') || path.contains('\0') {
+                return Err(format!(
+                    "dns_resolv_file '{path}' must be a valid absolute file path"
+                ));
+            }
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!(
+                    "dns_resolv_file '{path}' must not contain '..' path traversal"
+                ));
+            }
+        }
+
         let mut seen = std::collections::HashSet::new();
         for iface in &self.interfaces {
             if iface.name.is_empty() {
@@ -641,6 +834,24 @@ impl DaemonConfig {
                 if underlay.is_loopback() || underlay.is_multicast() || underlay.is_broadcast() {
                     return Err(format!(
                         "Interface {} underlay target {underlay} is not a usable unicast address",
+                        iface.name
+                    ));
+                }
+            }
+            for dns in &iface.dns_servers {
+                if dns.ip.is_unspecified()
+                    || dns.ip.is_loopback()
+                    || dns.ip.is_multicast()
+                    || dns.ip.is_broadcast()
+                {
+                    return Err(format!(
+                        "Interface {} dns_server {dns} is not a usable unicast IPv4 address",
+                        iface.name
+                    ));
+                }
+                if dns.port == 0 {
+                    return Err(format!(
+                        "Interface {} dns_server {dns} has port 0",
                         iface.name
                     ));
                 }
@@ -1312,5 +1523,90 @@ mod tests {
         );
         assert!(parse_ipv4_prefix("192.168.3.0").is_err());
         assert!(parse_ipv4_prefix("192.168.3.0/33").is_err());
+    }
+
+    #[test]
+    fn test_dns_config_defaults_and_validation() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.probe_mode, ProbeMode::Tcp);
+        assert_eq!(cfg.dns_probe_domain, "baidu.com");
+        assert_eq!(cfg.dns_resolv_file, None);
+        assert!(cfg.interfaces[0].dns_servers.is_empty());
+        assert_eq!(cfg.interfaces[0].probe_mode, None);
+        assert!(cfg.validate().is_ok());
+
+        // 兼容旧配置（不含新 DNS 字段）
+        let old: DaemonConfig =
+            serde_json::from_str(r#"{"interfaces":[{"name":"wan1"}]}"#).unwrap();
+        assert_eq!(old.probe_mode, ProbeMode::Tcp);
+        assert_eq!(old.dns_probe_domain, "baidu.com");
+        assert_eq!(old.dns_resolv_file, None);
+        assert!(old.validate().is_ok());
+
+        // 合法 DNS 探测、自定义端口与路由绑定配置
+        let ok: DaemonConfig = serde_json::from_str(
+            r#"{
+                "probe_mode": "dns",
+                "dns_probe_domain": "www.baidu.com",
+                "dns_listen_addr": "127.0.0.1",
+                "dns_listen_port": 5354,
+                "dns_forward_timeout_ms": 1500,
+                "dns_resolv_file": "/tmp/mwan4_resolv.conf",
+                "interfaces": [
+                    {"name": "wan1", "probe_mode": "tcp", "dns_servers": ["202.96.128.86"]},
+                    {"name": "wan2", "dns_servers": ["221.6.4.66:5353", "223.5.5.5"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.probe_mode, ProbeMode::Dns);
+        assert_eq!(ok.dns_listen_port, 5354);
+        assert_eq!(ok.interfaces[0].probe_mode, Some(ProbeMode::Tcp));
+        assert_eq!(ok.interfaces[0].dns_servers[0].port, 53);
+        assert_eq!(ok.interfaces[1].dns_servers[0].port, 5353);
+        assert_eq!(
+            ok.interfaces[1].dns_servers[0].to_string(),
+            "221.6.4.66:5353"
+        );
+        assert_eq!(ok.interfaces[1].dns_servers[1].to_string(), "223.5.5.5");
+
+        // 非法端口 0 与非法监听地址
+        assert!(
+            serde_json::from_str::<DaemonConfig>(
+                r#"{"interfaces":[{"name":"wan1","dns_servers":["223.5.5.5:0"]}]}"#
+            )
+            .is_err()
+        );
+        let mut bad_listen = DaemonConfig::default();
+        bad_listen.dns_listen_addr = "not-an-ip".into();
+        assert!(bad_listen.validate().is_err());
+        let mut bad_timeout = DaemonConfig::default();
+        bad_timeout.dns_forward_timeout_ms = 50;
+        assert!(bad_timeout.validate().is_err());
+
+        // 非法域名
+        let mut bad_domain = DaemonConfig::default();
+        bad_domain.dns_probe_domain = "-invalid..domain".into();
+        assert!(bad_domain.validate().is_err());
+
+        // 非法 resolv 路径（相对路径或路径穿越）
+        for bad_path in ["", "relative/resolv.conf", "/tmp/../etc/resolv.conf"] {
+            let mut bad = DaemonConfig::default();
+            bad.dns_resolv_file = Some(bad_path.into());
+            assert!(bad.validate().is_err(), "should reject path '{bad_path}'");
+        }
+
+        // 非法 DNS 服务器地址（0.0.0.0 / loopback / multicast / broadcast）
+        for bad_ip in [
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            let mut bad = DaemonConfig::default();
+            bad.interfaces[0].dns_servers = vec![DnsServer::new(bad_ip, 53)];
+            assert!(bad.validate().is_err(), "should reject dns {bad_ip}");
+        }
     }
 }

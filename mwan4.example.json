@@ -13,14 +13,24 @@
   "consecutive_fail_down": 3,
   "recovery_success_count": 5,
   "max_rtt_ms": 1500.0,
+  "rtt_fail_count": 3,
+  "_probe_mode_comment": "tcp / dns（UDP DNS 探测）",
+  "probe_mode": "tcp",
+  "dns_probe_domain": "baidu.com",
+  "_dns_listen_comment": "可选内置多线 UDP DNS 转发器：dns_listen_port=0 关闭，设如 5354 供第三方 DNS 软件作上游",
+  "dns_listen_addr": "127.0.0.1",
+  "dns_listen_port": 0,
+  "dns_forward_timeout_ms": 2000,
+  "dns_resolv_file": null,
   "flush_conntrack_on_down": true,
   "flush_conntrack_on_switch": true,
   "route_priority": 0,
   "remove_routes_on_exit": false,
   "ecmp_mode": "auto",
-  "_ecmp_mode_comment": "standard / auto / resilient；预设 auto（内核支援 nexthop object 就用 resilient，否则退回 standard）",
+  "resilient_idle_timer_secs": 30,
+  "_ecmp_mode_comment": "standard / auto / resilient；预设 auto（240 弹性桶均分单/双数多 WAN，空闲桶 30 秒再均衡）",
   "_multipath_hash_policy_comment": "l3 / l4 / inner；预设 l4（按连线分散）。l3 会让同一个目的 IP 的连线全挤一条 WAN；null = 不写入内核",
-  "_weight_mode_comment": "static（固定 weight）/ quality（依实测丢包与 RTT 动态调整）",
+  "_weight_mode_comment": "static（固定）/ quality（品质动态）/ aggregate（余量感知聚合分流，按空闲带宽+品质平滑分摊多连接）",
   "weight_mode": "static",
   "dynamic_weight_interval_ms": 10000,
   "dynamic_weight_min_ratio": 0.25,
@@ -57,7 +67,9 @@
       "probe_targets": [
         "223.5.5.5:53",
         "114.114.114.114:53"
-      ]
+      ],
+      "_dns_servers_comment": "选填：将该 WAN 专属运营商 DNS 钉到本出口（主表 /32 metric 42762），不影响第三方 DNS 软件；留空 = 不启用",
+      "dns_servers": []
     },
     {
       "name": "wan2",
@@ -69,7 +81,9 @@
       "probe_targets": [
         "223.5.5.5:53",
         "114.114.114.114:53"
-      ]
+      ],
+      "_dns_servers_comment": "选填：将该 WAN 专属运营商 DNS 钉到本出口（主表 /32 metric 42762），不影响第三方 DNS 软件；留空 = 不启用",
+      "dns_servers": []
     },
     {
       "_comment": "隧道型 WAN（VXLAN/WireGuard）填 underlay_targets，避免封装封包走 ECMP 自环",

@@ -38,7 +38,7 @@ is_decimal() {
 generate_json_config() {
 	mkdir -p "$CONF_DIR"
 
-	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok
+	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt rtt_fail_count route_priority ct_min_interval flush_ct flush_switch ecmp_mode resilient_idle_timer remove_routes dyn_standard_ok probe_mode dns_probe_domain dns_listen_addr dns_listen_port dns_forward_timeout dns_resolv_file
 	# 未设定即视为启用（与 LuCI 预设一致，也让忘记写 enabled 不会静默不启动）
 	config_get_bool enabled global enabled 1
 	[ "$enabled" -eq 1 ] || return 1
@@ -58,12 +58,25 @@ generate_json_config() {
 	config_get fail_down global consecutive_fail_down 3
 	config_get recovery global recovery_success_count 5
 	config_get max_rtt global max_rtt_ms 1500
+	config_get rtt_fail_count global rtt_fail_count 3
+	config_get route_priority global route_priority 0
+	config_get ct_min_interval global conntrack_flush_min_interval_ms 10000
 	config_get_bool flush_ct global flush_conntrack 1
 	# 成员进出时是否清 conntrack（仅 standard ECMP 生效；主备模式下只清新进成员）
 	config_get_bool flush_switch global flush_conntrack_on_switch 1
 	config_get ecmp_mode global ecmp_mode auto
+	config_get resilient_idle_timer global resilient_idle_timer_secs 30
 	# 退出时是否删预设路由。预设 0：删掉唯一预设路由会在重启窗口内让路由器失去出口，且启动失败时无法自行恢复
 	config_get_bool remove_routes global remove_routes_on_exit 0
+	# 健康探测协议（tcp = TCP SYN；dns = 真实 UDP DNS 查询，不占本地 53 端口）
+	config_get probe_mode global probe_mode tcp
+	config_get dns_probe_domain global dns_probe_domain baidu.com
+	# 可选内置轻量级多线 UDP DNS 转发端口（默认 0 = 关闭，绝不默认占用 53 端口）
+	config_get dns_listen_addr global dns_listen_addr 127.0.0.1
+	config_get dns_listen_port global dns_listen_port 0
+	config_get dns_forward_timeout global dns_forward_timeout_ms 2000
+	# 独立 resolv 输出路径（留空 = 不写任何文件，绝不干扰第三方 DNS 软件）
+	config_get dns_resolv_file global dns_resolv_file ""
 
 	local flush_str="false"
 	[ "$flush_ct" -eq 1 ] && flush_str="true"
@@ -84,7 +97,21 @@ generate_json_config() {
 		fi
 	done
 
-	for pair in "check_interval_ms:$check_interval" "probe_timeout_ms:$probe_timeout" "window_size:$window_size" "degrade_exit_samples:$degrade_exit" "consecutive_fail_down:$fail_down" "recovery_success_count:$recovery"; do
+	for pair in \
+		"check_interval_ms:$check_interval" \
+		"probe_timeout_ms:$probe_timeout" \
+		"window_size:$window_size" \
+		"degrade_exit_samples:$degrade_exit" \
+		"degrade_enter_samples:$degrade_enter" \
+		"degrade_min_out_samples:$degrade_min_out" \
+		"consecutive_fail_down:$fail_down" \
+		"recovery_success_count:$recovery" \
+		"rtt_fail_count:$rtt_fail_count" \
+		"route_priority:$route_priority" \
+		"conntrack_flush_min_interval_ms:$ct_min_interval" \
+		"dns_listen_port:$dns_listen_port" \
+		"dns_forward_timeout_ms:$dns_forward_timeout" \
+		"resilient_idle_timer_secs:$resilient_idle_timer"; do
 		field="${pair%%:*}"
 		value="${pair#*:}"
 		if ! is_uint "$value"; then
@@ -92,6 +119,26 @@ generate_json_config() {
 			return 1
 		fi
 	done
+
+	if [ "$dns_listen_port" -gt 65535 ]; then
+		logger -t mwan4 "Invalid dns_listen_port: '$dns_listen_port' (must be 0 ~ 65535)"
+		return 1
+	fi
+
+	local probe_mode_json
+	case "$probe_mode" in
+		tcp|dns) probe_mode_json="$probe_mode" ;;
+		*)
+			logger -t mwan4 "Invalid probe_mode: '$probe_mode' (expected tcp / dns)"
+			return 1
+			;;
+	esac
+	local dns_probe_domain_json dns_listen_addr_json dns_resolv_file_json="null"
+	dns_probe_domain_json="$(json_escape "$dns_probe_domain")"
+	dns_listen_addr_json="$(json_escape "$dns_listen_addr")"
+	if [ -n "$dns_resolv_file" ]; then
+		dns_resolv_file_json="\"$(json_escape "$dns_resolv_file")\""
+	fi
 
 	local ecmp_mode_json
 	case "$ecmp_mode" in
@@ -118,9 +165,9 @@ generate_json_config() {
 	local weight_mode weight_mode_json
 	config_get weight_mode global weight_mode static
 	case "$weight_mode" in
-		static|quality) weight_mode_json="$weight_mode" ;;
+		static|quality|aggregate) weight_mode_json="$weight_mode" ;;
 		*)
-			logger -t mwan4 "Invalid weight_mode: '$weight_mode' (expected static / quality)"
+			logger -t mwan4 "Invalid weight_mode: '$weight_mode' (expected static / quality / aggregate)"
 			return 1
 			;;
 	esac
@@ -242,7 +289,17 @@ generate_json_config() {
 	  "consecutive_fail_down": $fail_down,
 	  "recovery_success_count": $recovery,
 	  "max_rtt_ms": $max_rtt,
+	  "rtt_fail_count": $rtt_fail_count,
+	  "route_priority": $route_priority,
+	  "conntrack_flush_min_interval_ms": $ct_min_interval,
+	  "probe_mode": "$probe_mode_json",
+	  "dns_probe_domain": "$dns_probe_domain_json",
+	  "dns_listen_addr": "$dns_listen_addr_json",
+	  "dns_listen_port": $dns_listen_port,
+	  "dns_forward_timeout_ms": $dns_forward_timeout,
+	  "dns_resolv_file": $dns_resolv_file_json,
 	  "ecmp_mode": "$ecmp_mode_json",
+	  "resilient_idle_timer_secs": $resilient_idle_timer,
 	  "multipath_hash_policy": $hash_policy_json,
 	  "weight_mode": "$weight_mode_json",
 	  "dynamic_weight_interval_ms": $dyn_interval,
@@ -262,20 +319,33 @@ generate_json_config() {
 	local invalid_iface=0
 	handle_interface() {
 		local section="$1"
-		local if_enabled name gateway metric weight
+		local if_enabled name gateway gateway6 metric weight if_probe_mode
 		config_get_bool if_enabled "$section" enabled 1
 		[ "$if_enabled" -eq 1 ] || return 0
 
 		config_get name "$section" name "$section"
 		config_get gateway "$section" gateway ""
+		config_get gateway6 "$section" gateway6 ""
 		config_get metric "$section" metric 10
 		config_get weight "$section" weight 1
+		config_get if_probe_mode "$section" probe_mode ""
 
 		if ! is_uint "$metric" || ! is_uint "$weight"; then
 			logger -t mwan4 "section '$section': invalid metric/weight (metric='$metric', weight='$weight')"
 			invalid_iface=1
 			return 0
 		fi
+
+		local if_probe_mode_json="null"
+		case "$if_probe_mode" in
+			"") : ;;
+			tcp|dns) if_probe_mode_json="\"$if_probe_mode\"" ;;
+			*)
+				logger -t mwan4 "section '$section': invalid probe_mode '$if_probe_mode' (expected tcp / dns)"
+				invalid_iface=1
+				return 0
+				;;
+		esac
 
 		# 该线最大频宽（Mbps）；空 = null，进 JSON 前先验证；旧名 down_mbps 仍相容
 		local max_mbps up_mbps max_json up_json
@@ -301,11 +371,15 @@ generate_json_config() {
 			up_json="$up_mbps"
 		fi
 
-		local name_json gw_json
+		local name_json gw_json gw6_json
 		name_json="$(json_escape "$name")"
 		gw_json="null"
 		if [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ]; then
 			gw_json="\"$(json_escape "$gateway")\""
+		fi
+		gw6_json="null"
+		if [ -n "$gateway6" ] && [ "$gateway6" != "::" ]; then
+			gw6_json="\"$(json_escape "$gateway6")\""
 		fi
 
 		local target_json=""
@@ -358,12 +432,36 @@ generate_json_config() {
 				done
 			fi
 		fi
+		# 每 WAN 专属上游 DNS 服务器（选填）：健康时写主表 /32 固定出口，不占本地 53 端口，不影响第三方 DNS 软件
+		local dns_json=""
+		add_dns_server() {
+			[ -n "$1" ] || return 0
+			local escaped
+			escaped="$(json_escape "$1")"
+			if [ -n "$dns_json" ]; then
+				dns_json="$dns_json, \"$escaped\""
+			else
+				dns_json="\"$escaped\""
+			fi
+		}
+		config_list_foreach "$section" dns_servers add_dns_server
+		if [ -z "$dns_json" ]; then
+			local single_dns ds
+			config_get single_dns "$section" dns_servers ""
+			if [ -n "$single_dns" ]; then
+				for ds in $single_dns; do
+					add_dns_server "$ds"
+				done
+			fi
+		fi
+
 		detect_underlay_targets() {
 			local info
 			info="$(ip -d link show "$1" 2>/dev/null)" || return 0
 			case "$info" in
 			*vxlan*)
-				echo "$info" | sed -n 's/.*[[:space:]]remote[[:space:]]*\([0-9][0-9.]*\).*/\1/p'
+				# 只提取完整 IPv4 点分四段地址，避免把 IPv6 remote（如 2001:db8::1）截成 "2001" 导致启动校验失败
+				echo "$info" | sed -n 's/.*[[:space:]]remote[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]]\|$\).*/\1/p'
 				;;
 			*) : ;;
 			esac
@@ -385,11 +483,14 @@ generate_json_config() {
 		    {
 		      "name": "$name_json",
 		      "gateway": $gw_json,
+		      "gateway6": $gw6_json,
 		      "metric": $metric,
 		      "weight": $weight,
 		      "max_mbps": $max_json,
 		      "up_mbps": $up_json,
+		      "probe_mode": $if_probe_mode_json,
 		      "probe_targets": [ $target_json ],
+		      "dns_servers": [ $dns_json ],
 		      "underlay_targets": [ $underlay_json ]
 		    }
 		EOF

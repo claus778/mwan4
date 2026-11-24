@@ -14,6 +14,16 @@ config global 'global'
 	option consecutive_fail_down '3'
 	option recovery_success_count '5'
 	option max_rtt_ms '1500'
+	option rtt_fail_count '3'
+	# 探测协议：tcp（默认 TCP SYN）/ dns（真实 UDP DNS 查询，可识别假通，绝不占用本地 53 端口）
+	option probe_mode 'tcp'
+	option dns_probe_domain 'baidu.com'
+	# 内置多线 UDP DNS 转发端口（0 = 关闭，不占本地 53 端口；可设独立端口如 5354 供第三方 DNS 作上游）
+	option dns_listen_addr '127.0.0.1'
+	option dns_listen_port '0'
+	option dns_forward_timeout_ms '2000'
+	# 可选：将健康 WAN 的 dns_servers 导出到独立文件（留空 = 不写入）
+	# option dns_resolv_file '/tmp/mwan4_resolv.conf'
 	option flush_conntrack '1'
 	# 存活成员进出时是否清 conntrack（仅 standard ECMP 生效，主备模式只清新进成员）
 	option flush_conntrack_on_switch '1'
@@ -22,6 +32,7 @@ config global 'global'
 	# standard: 单一 multipath 路由，成员/权重一变就重算整张 hash，实测连坐搬走 40%~43% 既有连线（换出口=换 NAT=断线），故非预设
 	# resilient: 内核 nexthop group（Linux 5.14+），只重映射故障成员 bucket（默认延后 120 秒）；auto（预设）优先 resilient，否则退回 standard
 	option ecmp_mode 'auto'
+	option resilient_idle_timer_secs '30'
 	# 多路径哈希策略（预设 l4）：l3 只哈希 IP → 同目的 IP 的连线全挤一条 WAN；l4 加端口 → 24 条连线变 12/12；inner 仅对封装流量有用
 	# 实测 fib_multipath_hash_fields 写 1/7/8/9/31/32 都被内核忽略，真正有效的只有此 policy；空值 = 不碰内核设定（沿用系统预设）
 	option multipath_hash_policy 'l4'
@@ -44,6 +55,8 @@ config interface 'wan1'
 	option metric '10'
 	option weight '1'
 	# 该线最大频宽（Mbps）：设定后 ECMP 基准权重 ∝ 最大频宽，也作 LAN 下载容量；up_mbps 为 LAN 上传方向（未填沿用 max）
+	# 专属上游 DNS（选填）：健康时自动写主表 /32 固定走该 WAN 出口，防止第三方 DNS 软件走错运营商线路；留空 = 不干预
+	# list dns_servers '202.96.128.86'
 	list probe_targets '223.5.5.5:53'
 	list probe_targets '114.114.114.114:53'
 

@@ -1,3 +1,5 @@
+use crate::config::ProbeMode;
+use crate::dns::{DnsResponseStatus, build_dns_query, next_txid, parse_dns_response, rcode_name};
 use log::debug;
 use std::io;
 use std::net::SocketAddr;
@@ -63,7 +65,9 @@ fn create_bound_tcp_socket(iface: &str, target: &SocketAddr) -> io::Result<socke
 
     #[cfg(target_os = "linux")]
     {
-        socket.bind_device(Some(iface.as_bytes()))?;
+        if !iface.is_empty() {
+            socket.bind_device(Some(iface.as_bytes()))?;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -71,6 +75,194 @@ fn create_bound_tcp_socket(iface: &str, target: &SocketAddr) -> io::Result<socke
     }
 
     Ok(socket)
+}
+
+/// 建立绑定到特定网卡的非阻塞 UDP 套接字（供 DNS 协议探测使用，使用随机临时端口，绝不占用本地 53 端口）。
+fn create_bound_udp_socket(iface: &str, target: &SocketAddr) -> io::Result<socket2::Socket> {
+    let domain = if target.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if !iface.is_empty() {
+            socket.bind_device(Some(iface.as_bytes()))?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = iface;
+    }
+
+    Ok(socket)
+}
+
+/// 真实 UDP DNS 查询探测：发标准 A 记录查询包并校验响应报头与 RCODE，可识别“TCP 端口假通但无法解析”的链路故障。
+pub async fn probe_single_dns_target(
+    iface: &str,
+    target: SocketAddr,
+    domain: &str,
+    timeout: Duration,
+) -> ProbeSample {
+    let start = Instant::now();
+    let txid = next_txid();
+    let query = match build_dns_query(txid, domain) {
+        Ok(pkt) => pkt,
+        Err(e) => {
+            return ProbeSample {
+                success: false,
+                rtt: Duration::ZERO,
+                target,
+                error_msg: Some(format!("Invalid DNS probe domain: {e}")),
+                error_kind: Some(ProbeErrorKind::Local),
+            };
+        }
+    };
+
+    let socket = match create_bound_udp_socket(iface, &target) {
+        Ok(s) => s,
+        Err(e) => {
+            return ProbeSample {
+                success: false,
+                rtt: timeout,
+                target,
+                error_msg: Some(format!("Create UDP socket failed: {e}")),
+                error_kind: Some(ProbeErrorKind::Local),
+            };
+        }
+    };
+
+    if let Err(e) = socket.connect(&target.into()) {
+        return ProbeSample {
+            success: false,
+            rtt: start.elapsed(),
+            target,
+            error_msg: Some(format!("UDP connect failed: {e}")),
+            error_kind: Some(classify_io_error(&e)),
+        };
+    }
+
+    let std_udp: std::net::UdpSocket = socket.into();
+    let udp = match tokio::net::UdpSocket::from_std(std_udp) {
+        Ok(s) => s,
+        Err(e) => {
+            return ProbeSample {
+                success: false,
+                rtt: start.elapsed(),
+                target,
+                error_msg: Some(format!("Tokio UDP from_std failed: {e}")),
+                error_kind: Some(ProbeErrorKind::Local),
+            };
+        }
+    };
+
+    if let Err(e) = udp.send(&query).await {
+        return ProbeSample {
+            success: false,
+            rtt: start.elapsed(),
+            target,
+            error_msg: Some(format!("DNS send failed: {e}")),
+            error_kind: Some(classify_io_error(&e)),
+        };
+    }
+
+    let deadline = start + timeout;
+    let mut buf = [0u8; 512];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return ProbeSample {
+                success: false,
+                rtt: timeout,
+                target,
+                error_msg: Some(format!(
+                    "DNS timeout (no reply within {}ms)",
+                    timeout.as_millis()
+                )),
+                error_kind: Some(ProbeErrorKind::Timeout),
+            };
+        };
+
+        match tokio::time::timeout(remaining, udp.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                let elapsed = start.elapsed();
+                match parse_dns_response(&buf[..n], txid) {
+                    DnsResponseStatus::Valid { .. } => {
+                        return ProbeSample {
+                            success: true,
+                            rtt: elapsed,
+                            target,
+                            error_msg: None,
+                            error_kind: None,
+                        };
+                    }
+                    DnsResponseStatus::WrongTransactionId => {
+                        debug!("[{iface}] Ignoring DNS packet with mismatched txid from {target}");
+                        continue;
+                    }
+                    DnsResponseStatus::ServerError { rcode } => {
+                        return ProbeSample {
+                            success: false,
+                            rtt: elapsed,
+                            target,
+                            error_msg: Some(format!(
+                                "DNS server error: {} (rcode={rcode})",
+                                rcode_name(rcode)
+                            )),
+                            error_kind: Some(ProbeErrorKind::Other),
+                        };
+                    }
+                    DnsResponseStatus::Malformed(reason) => {
+                        return ProbeSample {
+                            success: false,
+                            rtt: elapsed,
+                            target,
+                            error_msg: Some(format!("Malformed DNS reply: {reason}")),
+                            error_kind: Some(ProbeErrorKind::Other),
+                        };
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                return ProbeSample {
+                    success: false,
+                    rtt: start.elapsed(),
+                    target,
+                    error_msg: Some(format!("DNS recv error: {e}")),
+                    error_kind: Some(classify_io_error(&e)),
+                };
+            }
+            Err(_) => {
+                return ProbeSample {
+                    success: false,
+                    rtt: timeout,
+                    target,
+                    error_msg: Some(format!(
+                        "DNS timeout (no reply within {}ms)",
+                        timeout.as_millis()
+                    )),
+                    error_kind: Some(ProbeErrorKind::Timeout),
+                };
+            }
+        }
+    }
+}
+
+async fn probe_one(
+    iface: &str,
+    target: SocketAddr,
+    timeout: Duration,
+    mode: ProbeMode,
+    dns_domain: &str,
+) -> ProbeSample {
+    match mode {
+        ProbeMode::Tcp => probe_single_target(iface, target, timeout).await,
+        ProbeMode::Dns => probe_single_dns_target(iface, target, dns_domain, timeout).await,
+    }
 }
 
 pub async fn probe_single_target(
@@ -238,6 +430,8 @@ pub async fn probe_interface(
     timeout: Duration,
     preferred: usize,
     primary_suspect: bool,
+    mode: ProbeMode,
+    dns_domain: &str,
 ) -> ProbeSample {
     if targets.is_empty() {
         return ProbeSample {
@@ -250,7 +444,7 @@ pub async fn probe_interface(
     }
 
     if targets.len() == 1 {
-        return probe_single_target(iface, targets[0], timeout).await;
+        return probe_one(iface, targets[0], timeout, mode, dns_domain).await;
     }
 
     let primary_idx = if preferred < targets.len() {
@@ -263,27 +457,39 @@ pub async fn probe_interface(
     if primary_suspect {
         let futures: Vec<_> = targets
             .iter()
-            .map(|&target| Box::pin(probe_single_target(iface, target, timeout)))
+            .map(|&target| Box::pin(probe_one(iface, target, timeout, mode, dns_domain)))
             .collect();
         let samples = futures_util::future::join_all(futures).await;
         let sample = pick_sample(samples, primary_idx);
         if sample.success {
             debug!(
-                "[{}] Probe success to {} with RTT {:?} (hedged round)",
-                iface, sample.target, sample.rtt
+                "[{}] Probe success ({}) to {} with RTT {:?} (hedged round)",
+                iface,
+                mode.as_str(),
+                sample.target,
+                sample.rtt
             );
         } else if let Some(err) = &sample.error_msg {
-            debug!("[{}] Probe all failed to {}: {}", iface, sample.target, err);
+            debug!(
+                "[{}] Probe all failed ({}) to {}: {}",
+                iface,
+                mode.as_str(),
+                sample.target,
+                err
+            );
         }
         return sample;
     }
 
     // 第一阶段：只探主目标（健康时每周期的唯一探针）。
-    let primary = probe_single_target(iface, targets[primary_idx], timeout).await;
+    let primary = probe_one(iface, targets[primary_idx], timeout, mode, dns_domain).await;
     if primary.success {
         debug!(
-            "[{}] Probe success to {} with RTT {:?}",
-            iface, primary.target, primary.rtt
+            "[{}] Probe success ({}) to {} with RTT {:?}",
+            iface,
+            mode.as_str(),
+            primary.target,
+            primary.rtt
         );
         return primary;
     }
@@ -302,7 +508,7 @@ pub async fn probe_interface(
         .iter()
         .enumerate()
         .filter(|(idx, _)| *idx != primary_idx)
-        .map(|(_, &target)| Box::pin(probe_single_target(iface, target, timeout)))
+        .map(|(_, &target)| Box::pin(probe_one(iface, target, timeout, mode, dns_domain)))
         .collect();
 
     while !futures.is_empty() {
@@ -392,5 +598,63 @@ mod tests {
 
         let picked = pick_sample(vec![fail(53, ProbeErrorKind::Local)], 7);
         assert_eq!(picked.target, target(53));
+    }
+
+    #[tokio::test]
+    async fn test_dns_probe_roundtrip_and_rcode_validation() {
+        // 1) 正常响应（先丢一个错 txid 包，再回合法 NOERROR 响应）
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert!(n >= 12);
+            let txid = u16::from_be_bytes([buf[0], buf[1]]);
+            // 先发一个错误 txid 的迟到包，探针应忽略并继续等待
+            let mut wrong = [0u8; 12];
+            wrong[0..2].copy_from_slice(&txid.wrapping_add(1).to_be_bytes());
+            wrong[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            server.send_to(&wrong, peer).await.unwrap();
+            // 再发匹配的 NOERROR 响应
+            let mut ok_resp = [0u8; 12];
+            ok_resp[0..2].copy_from_slice(&txid.to_be_bytes());
+            ok_resp[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            server.send_to(&ok_resp, peer).await.unwrap();
+        });
+        let sample =
+            probe_single_dns_target("", addr, "baidu.com", Duration::from_millis(500)).await;
+        srv.await.unwrap();
+        assert!(sample.success, "合法 NOERROR 响应应判定成功: {sample:?}");
+
+        // 2) SERVFAIL 应判定失败（识别上游 DNS 故障）
+        let server2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = server2.local_addr().unwrap();
+        let srv2 = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, peer) = server2.recv_from(&mut buf).await.unwrap();
+            let mut fail_resp = [0u8; 12];
+            fail_resp[0..2].copy_from_slice(&buf[0..2]);
+            fail_resp[2..4].copy_from_slice(&0x8182u16.to_be_bytes()); // SERVFAIL
+            server2.send_to(&fail_resp, peer).await.unwrap();
+        });
+        let sample2 =
+            probe_single_dns_target("", addr2, "baidu.com", Duration::from_millis(500)).await;
+        srv2.await.unwrap();
+        assert!(!sample2.success);
+        assert!(
+            sample2
+                .error_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("SERVFAIL")
+        );
+
+        // 3) 无应答超时
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr3 = silent.local_addr().unwrap();
+        let sample3 =
+            probe_single_dns_target("", addr3, "baidu.com", Duration::from_millis(80)).await;
+        assert!(!sample3.success);
+        assert_eq!(sample3.error_kind, Some(ProbeErrorKind::Timeout));
     }
 }

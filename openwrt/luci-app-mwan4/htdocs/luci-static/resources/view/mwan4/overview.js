@@ -267,6 +267,32 @@ function policyText(statusData) {
 	}).join(', ');
 }
 
+function dnsText(statusData) {
+	var parts = [];
+	if (statusData && statusData.dns_listen)
+		parts.push(statusData.dns_listen);
+	var list = (statusData && statusData.dns) ? statusData.dns : [];
+	for (var i = 0; i < list.length; i++) {
+		var d = list[i];
+		parts.push(d.server + '\u2192' + d.interface + (d.active ? '' : _(' (inactive)')));
+	}
+	return parts.length ? parts.join(', ') : null;
+}
+
+function validateDnsServer(section_id, value) {
+	if (!value) return true;
+	var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?::(\d{1,5}))?$/.exec(value.trim());
+	if (!m) return _('Expected IPv4 or IPv4:Port');
+	for (var i = 1; i <= 4; i++) {
+		if (parseInt(m[i], 10) > 255) return _('Expected IPv4 or IPv4:Port');
+	}
+	if (m[5] !== undefined) {
+		var p = parseInt(m[5], 10);
+		if (p < 1 || p > 65535) return _('Expected IPv4 or IPv4:Port');
+	}
+	return true;
+}
+
 /* 核心「实际生效」的哈希粒度（读回值）：l3_only 就是「同一个目的 IP 的连线
    全挤一条 WAN」，也就是视频 CDN 卡顿最常见的成因。 */
 function hashInfo(statusData) {
@@ -360,6 +386,7 @@ return view.extend({
 		var hi = hashInfo(statusData);
 		var ws = wanSummary(statusData);
 		var pt = policyText(statusData);
+		var dt = dnsText(statusData);
 
 		return E('div', { 'id': 'mwan4_header_container' }, [
 			E('div', { 'class': 'mwan4-header' }, [
@@ -396,6 +423,16 @@ return view.extend({
 						E('span', { 'class': 'mwan4-meta-key' }, _('Policy Routing:')),
 						E('span', { 'class': 'mwan4-badge' }, [
 							E('span', { 'data-role': 'policy-text' }, pt || '')
+						])
+					]),
+					E('span', {
+						'class': 'mwan4-meta-item',
+						'data-role': 'dns-item',
+						'style': dt ? '' : 'display: none'
+					}, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('DNS:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							E('span', { 'data-role': 'dns-text' }, dt || '')
 						])
 					]),
 					E('span', { 'class': 'mwan4-meta-item' }, [
@@ -587,6 +624,10 @@ return view.extend({
 			var policyItem = pick(header, 'policy-item');
 			if (policyItem) policyItem.style.display = pt ? '' : 'none';
 			setText(pick(header, 'policy-text'), pt || '');
+			var dt = dnsText(statusData);
+			var dnsItem = pick(header, 'dns-item');
+			if (dnsItem) dnsItem.style.display = dt ? '' : 'none';
+			setText(pick(header, 'dns-text'), dt || '');
 			var hi = hashInfo(statusData);
 			setText(pick(header, 'hash-text'), hi.text);
 			setCls(pick(header, 'hash-dot'), 'mwan4-dot ' + hi.level);
@@ -995,9 +1036,12 @@ return view.extend({
 				text-align: center;
 			}
 
-			/* ---- WAN Interfaces 表格 ---- */
+			/* ---- WAN Interfaces / Policy 表格 ---- */
+			.mwan4-view .cbi-section-node {
+				overflow-x: auto;
+			}
 			.mwan4-view table.cbi-section-table {
-				table-layout: fixed;
+				table-layout: auto;
 				width: 100%;
 			}
 			.mwan4-view table.cbi-section-table th,
@@ -1007,14 +1051,6 @@ return view.extend({
 				line-height: 1.35 !important;
 				vertical-align: middle !important;
 			}
-			/* 8 列：Name | Enable | Interface | Gateway | Metric | Weight | Targets | actions */
-			.mwan4-view table.cbi-section-table th:nth-child(1) { width: 12%; }
-			.mwan4-view table.cbi-section-table th:nth-child(2) { width: 6%; }
-			.mwan4-view table.cbi-section-table th:nth-child(3) { width: 13%; }
-			.mwan4-view table.cbi-section-table th:nth-child(4) { width: 14%; }
-			.mwan4-view table.cbi-section-table th:nth-child(5) { width: 9%; }
-			.mwan4-view table.cbi-section-table th:nth-child(6) { width: 9%; }
-			.mwan4-view table.cbi-section-table th:nth-child(7) { width: 25%; }
 			.mwan4-view table.cbi-section-table tr.cbi-section-table-descr th {
 				font-size: 11px !important;
 				font-weight: 400 !important;
@@ -1098,98 +1134,131 @@ return view.extend({
 		// 与 LuCI 全域预设一致的 5 秒轮询（daemon 每秒写一次状态档）
 		poll.add(this.pollFn, 5);
 
-		m = new form.Map('mwan4', _('MWAN4 Configuration'),
-			_('Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon.'));
+		m = new form.Map('mwan4', _('MWAN4 Configuration'));
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Global Settings'));
 		s.tab('basic', _('Basic'));
+		s.tab('dns', _('DNS'));
 		s.tab('advanced', _('Advanced'));
 
 		o = s.taboption('basic', form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
 		o.default = o.enabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'),
-			_('Probe interval per interface (default: 500 ms)'));
+		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'));
+		o.value('auto', _('Automatic (resilient when supported)'));
+		o.value('standard', _('Standard ECMP (multipath route)'));
+		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
+		o.default = 'auto';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'));
 		o.datatype = 'uinteger';
 		o.default = '500';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'),
-			_('Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)'));
+		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'));
 		o.datatype = 'uinteger';
 		o.default = '400';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'window_size', _('Sliding Window Size'),
-			_('Number of probe samples to calculate loss rate and smoothed RTT (default: 10)'));
-		o.datatype = 'uinteger';
-		o.default = '10';
-		o.rmempty = false;
-
-		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'),
-			_('Consecutive probe timeouts before interface is marked DOWN (default: 3)'));
+		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'));
 		o.datatype = 'uinteger';
 		o.default = '3';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'),
-			_('Consecutive successful probes with <10% loss required before recovering to UP (default: 5)'));
+		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'));
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'),
-			_('standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+).'));
-		o.value('standard', _('Standard ECMP (multipath route)'));
-		o.value('auto', _('Automatic (resilient when supported)'));
-		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
-		o.default = 'auto';
+		o = s.taboption('dns', form.ListValue, 'probe_mode', _('Health Probe Protocol'));
+		o.value('tcp', _('TCP SYN (default)'));
+		o.value('dns', _('DNS Query (UDP)'));
+		o.default = 'tcp';
+		o.rmempty = false;
+
+		o = s.taboption('dns', form.Value, 'dns_probe_domain', _('DNS Probe Domain'));
+		o.default = 'baidu.com';
+		o.placeholder = 'baidu.com';
+		o.depends('probe_mode', 'dns');
+
+		o = s.taboption('dns', form.Value, 'dns_listen_port', _('DNS Forward Port (0 = Off)'));
+		o.datatype = 'range(0,65535)';
+		o.default = '0';
+		o.placeholder = '5354';
+		o.rmempty = false;
+
+		o = s.taboption('dns', form.Value, 'dns_listen_addr', _('DNS Listen Address'));
+		o.datatype = 'ipaddr';
+		o.default = '127.0.0.1';
+		o.placeholder = '127.0.0.1';
+
+		o = s.taboption('dns', form.Value, 'dns_forward_timeout_ms', _('DNS Forward Timeout (ms)'));
+		o.datatype = 'range(100,15000)';
+		o.default = '2000';
+
+		o = s.taboption('dns', form.Value, 'dns_resolv_file', _('Healthy DNS Export File (Optional)'));
+		o.placeholder = '/tmp/mwan4_resolv.conf';
+		o.rmempty = true;
+
+		o = s.taboption('advanced', form.Value, 'window_size', _('Sliding Window Size'));
+		o.datatype = 'uinteger';
+		o.default = '10';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.Value, 'loss_threshold_down', _('Packet Loss Threshold for DOWN'));
+		o.default = '0.5';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.Value, 'max_rtt_ms', _('Maximum Allowed RTT (ms)'));
+		o.default = '1500';
 		o.rmempty = false;
 
 		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
 		o.default = '0.2';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.ListValue, 'weight_mode', _('ECMP Weight Mode'));
-		o.value('static', _('Static (configured weights)'));
-		o.value('quality', _('Quality-aware (dynamic)'));
-		o.default = 'static';
-		o.rmempty = false;
-
-		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms',
-			_('Dynamic Weight Update Interval (ms)'),
-			_('Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route.'));
-		o.datatype = 'uinteger';
-		o.default = '10000';
-		o.depends('weight_mode', 'quality');
-		o.depends('load_aware', '1');
-
-		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Traffic Shifting'));
-		o.default = o.disabled;
-
-		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'),
-			_('Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start.'));
+		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'));
 		o.value('l4', _('L4 (addresses + ports, the default)'));
 		o.value('l3', _('L3 (addresses only)'));
 		o.value('inner', _('L3 + tunnel inner headers'));
 		o.default = 'l4';
 		o.rmempty = false;
 
+		o = s.taboption('advanced', form.ListValue, 'weight_mode', _('ECMP Weight Mode'));
+		o.value('static', _('Static (configured weights)'));
+		o.value('quality', _('Quality-aware (dynamic)'));
+		o.value('aggregate', _('Aggregate spreading (headroom-aware)'));
+		o.default = 'static';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Traffic Shifting'));
+		o.default = o.disabled;
+
+		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms',
+			_('Dynamic Weight Update Interval (ms)'));
+		o.datatype = 'uinteger';
+		o.default = '10000';
+		o.depends('weight_mode', 'quality');
+		o.depends('weight_mode', 'aggregate');
+		o.depends('load_aware', '1');
+
 		o = s.taboption('advanced', form.Flag, 'allow_dynamic_weights_on_standard',
 			_('Allow Dynamic Weights on Standard ECMP'));
 		o.default = o.disabled;
 		o.depends('ecmp_mode', 'standard');
 
-		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'),
-			_('Flush TCP/UDP connections on an interface when it goes down.'));
+		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'));
 		o.default = o.enabled;
 
 		o = s.taboption('advanced', form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Active Set Change'));
 		o.default = o.enabled;
 
-		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'),
-			_('Gateway, ECMP weight and probe targets for each WAN interface.'));
+		o = s.taboption('advanced', form.Flag, 'remove_routes_on_exit', _('Remove Default Route on Exit'));
+		o.default = o.disabled;
+
+		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'));
 		s.addremove = true;
 		s.anonymous = false;
 
@@ -1213,33 +1282,53 @@ return view.extend({
 
 		o = s.option(form.Value, 'gateway', _('Gateway IP'));
 		o.datatype = 'ip4addr';
-		o.rmempty = false;
+		o.placeholder = '0.0.0.0';
+		o.rmempty = true;
 		o.editable = true;
 
-		o = s.option(form.Value, 'metric', _('Metric (Priority)'),
-			_('Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover.'));
+		o = s.option(form.Value, 'gateway6', _('IPv6 Gateway'));
+		o.datatype = 'ip6addr';
+		o.rmempty = true;
+		o.modalonly = true;
+
+		o = s.option(form.Value, 'metric', _('Metric (Priority)'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.editable = true;
 
-		o = s.option(form.Value, 'weight', _('ECMP Weight'),
-			_('ECMP weight for interfaces with the same metric.'));
+		o = s.option(form.Value, 'weight', _('ECMP Weight'));
 		o.datatype = 'uinteger';
 		o.default = '1';
 		o.editable = true;
 
-		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'),
-			_('Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled.'));
+		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'));
 		o.datatype = 'ufloat';
 		o.editable = true;
 
 		o = s.option(form.Value, 'up_mbps', _('Up Capacity (Mbps)'));
 		o.datatype = 'ufloat';
-		o.editable = true;
+		o.modalonly = true;
+
+		o = s.option(form.ListValue, 'probe_mode', _('Probe Protocol Override'));
+		o.value('', _('Inherit global setting'));
+		o.value('tcp', _('TCP SYN (default)'));
+		o.value('dns', _('DNS Query (UDP)'));
+		o.rmempty = true;
+		o.modalonly = true;
 
 		o = s.option(form.DynamicList, 'probe_targets', _('Probe Targets (IP:Port)'));
 		o.datatype = 'ipaddrport(1)';
 		o.default = ['223.5.5.5:53', '114.114.114.114:53'];
+
+		o = s.option(form.DynamicList, 'dns_servers', _('Upstream DNS (IP[:Port])'));
+		o.placeholder = '202.96.128.86';
+		o.validate = validateDnsServer;
+		o.rmempty = true;
+
+		o = s.option(form.DynamicList, 'underlay_targets', _('Tunnel Underlay Peers (IPv4)'));
+		o.datatype = 'ip4addr';
+		o.rmempty = true;
+		o.modalonly = true;
 
 		s = m.section(form.GridSection, 'policy', _('Policy Routing (Source / Destination)'));
 		s.addremove = true;
@@ -1250,9 +1339,9 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 
-		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'),
-			_('IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source.'));
+		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'));
 		o.datatype = 'cidr4';
+		o.placeholder = '192.168.3.0/24';
 		o.editable = true;
 
 		o = s.option(form.DynamicList, 'destination', _('Destination Prefixes (CIDR)'));
@@ -1263,7 +1352,8 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 		uci.sections('mwan4', 'interface').forEach(function(sec) {
-			if (sec.name) o.value(sec.name, sec.name);
+			var wanName = sec.name || sec['.name'];
+			if (wanName) o.value(wanName, wanName);
 		});
 
 		o = s.option(form.Value, 'priority', _('Rule Priority'));
