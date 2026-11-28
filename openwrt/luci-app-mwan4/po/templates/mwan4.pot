@@ -1,342 +1,284 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
 msgid "MWAN4 Load Balancing"
 msgstr ""
-msgid "Basic"
-msgstr ""
-msgid "Advanced"
-msgstr ""
-msgid "Unknown"
-msgstr ""
-msgid "Running"
-msgstr ""
-msgid "Stopped"
-msgstr ""
-msgid "MWAN4 Multi-WAN Failover & Health Monitor"
-msgstr ""
-msgid "Daemon:"
-msgstr ""
-msgid "Kernel Default Route:"
-msgstr ""
-msgid "No metrics available. Check that the MWAN4 service is running."
-msgstr ""
-msgid "Online (UP)"
-msgstr ""
-msgid "Offline (DOWN)"
-msgstr ""
-msgid "(No IP)"
-msgstr ""
-msgid "Realtime RTT"
-msgstr ""
-msgid "Jitter"
-msgstr ""
-msgid "Gateway"
-msgstr ""
-msgid "ECMP Weight"
-msgstr ""
-msgid "Sliding Window Packet Loss"
-msgstr ""
-msgid "Consecutive Successes: "
-msgstr ""
-msgid "Consecutive Timeouts: "
-msgstr ""
+
 msgid "MWAN4 Configuration"
 msgstr ""
-msgid "Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon."
-msgstr ""
+
 msgid "Global Settings"
 msgstr ""
-msgid "Enable MWAN4 Daemon"
-msgstr ""
-msgid "Probe Interval (ms)"
-msgstr ""
-msgid "Probe interval per interface (default: 500 ms)"
-msgstr ""
-msgid "Probe Timeout (ms)"
-msgstr ""
-msgid "Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)"
-msgstr ""
-msgid "Sliding Window Size"
-msgstr ""
-msgid "Number of probe samples to calculate loss rate and smoothed RTT (default: 10)"
-msgstr ""
-msgid "Consecutive Failures for DOWN"
-msgstr ""
-msgid "Consecutive probe timeouts before interface is marked DOWN (default: 3)"
-msgstr ""
-msgid "Recovery Success Count (Hysteresis)"
-msgstr ""
-msgid "Consecutive successful probes with normal RTT required before recovering to UP (default: 5)"
-msgstr ""
-msgid "Flush Conntrack on DOWN"
-msgstr ""
-msgid "Flush TCP/UDP connections on an interface when it goes down."
-msgstr ""
-msgid "WAN Interfaces"
-msgstr ""
-msgid "Gateway, ECMP weight and probe targets for each WAN interface."
-msgstr ""
-msgid "Enable"
-msgstr ""
-msgid "Interface Name"
-msgstr ""
-msgid "Gateway IP"
-msgstr ""
-msgid "Probe Targets (IP:Port)"
-msgstr ""
-msgid "Multi-WAN Routing Mode"
-msgstr ""
-msgid "standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+)."
-msgstr ""
-msgid "Standard ECMP (multipath route)"
-msgstr ""
-msgid "Automatic (resilient when supported)"
-msgstr ""
-msgid "Resilient nexthop group (require kernel support)"
-msgstr ""
-msgid "MWAN4 configuration saved and applied."
-msgstr ""
-msgid "Priority / Weight"
-msgstr ""
-msgid "Metric (Priority)"
-msgstr ""
-msgid "Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover."
-msgstr ""
-msgid "ECMP weight for interfaces with the same metric."
-msgstr ""
-msgid "Throughput (TX / RX)"
-msgstr ""
-msgid " (inactive)"
-msgstr ""
-msgid "Policy Routing:"
-msgstr ""
-msgid "Multipath Hash Policy"
-msgstr ""
-msgid "Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start."
-msgstr ""
-msgid "L3 (addresses only)"
-msgstr ""
-msgid "L4 (addresses + ports, the default)"
-msgstr ""
-msgid "L3 + tunnel inner headers"
-msgstr ""
-msgid "ECMP Weight Mode"
-msgstr ""
-msgid "quality adjusts each active WAN weight from measured loss and RTT (rate-limited, may rehash flows); static keeps the configured weights."
-msgstr ""
-msgid "Static (configured weights)"
-msgstr ""
-msgid "Quality-aware (dynamic)"
-msgstr ""
-msgid "Dynamic Weight Update Interval (ms)"
-msgstr ""
-msgid "Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route."
-msgstr ""
-msgid "Load-aware Traffic Shifting"
-msgstr ""
-msgid "When a WAN utilisation (measured tx/rx against its max_mbps/up_mbps) exceeds the target ratio, lower its ECMP weight so part of the flows move to the idle WANs. Rate-limited by the update interval above; every interface then needs max_mbps."
-msgstr ""
-msgid "Utilisation at or above which a WAN starts shedding weight (default: 0.80 = 80%). Must be greater than the recover ratio."
-msgstr ""
-msgid "Utilisation at or below which a throttled WAN fully regains its configured weight (default: 0.60). The gap to the offload threshold is hysteresis against weight oscillation."
-msgstr ""
-msgid "Max Bandwidth (Mbps)"
-msgstr ""
-msgid "Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled."
-msgstr ""
-msgid "Up Capacity (Mbps)"
-msgstr ""
-msgid "Upload (LAN upload) capacity for asymmetric lines. Leave empty to reuse the max bandwidth."
-msgstr ""
-msgid "offloaded"
-msgstr ""
-msgid "Policy Routing (Source / Destination)"
-msgstr ""
-msgid "Send traffic matching a source (and optionally destination) prefix through a specific WAN using fib rules. Non-matching traffic keeps using ECMP. Rules are removed automatically while the target WAN is down, so traffic falls back to ECMP."
-msgstr ""
-msgid "Rule Name"
-msgstr ""
-msgid "Unique name used in logs and status."
-msgstr ""
-msgid "Source Prefixes (CIDR)"
-msgstr ""
-msgid "IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source."
-msgstr ""
-msgid "Destination Prefixes (CIDR)"
-msgstr ""
-msgid "Optional IPv4 destination prefixes. Leave empty to match any destination."
-msgstr ""
-msgid "Target WAN"
-msgstr ""
-msgid "Traffic matching this rule is routed through this WAN while it is healthy."
-msgstr ""
-msgid "Rule Priority"
-msgstr ""
-msgid "Optional fib-rule priority (9000-9063); lower matches first. Either set it on every rule or on none."
-msgstr ""
-msgid "Degrade Loss Threshold"
-msgstr ""
-msgid "Flush Conntrack on Active Set Change"
-msgstr ""
-msgid "Last probe error: "
-msgstr ""
-msgid "Local problem (packets never left the device): "
-msgstr ""
-msgid "No status file"
-msgstr ""
-msgid "No status file yet: the daemon has not written one (or it just started)."
-msgstr ""
-msgid "Not trustworthy (clock skew)"
-msgstr ""
-msgid "Online (UP, degraded - not carrying traffic)"
-msgstr ""
-msgid "Status File:"
-msgstr ""
-msgid "Status is stale: the daemon may have stopped. This is the last known state."
-msgstr ""
-msgid "Stopped (status is stale)"
-msgstr ""
-msgid "ago"
-msgstr ""
-msgid "clock skew"
-msgstr ""
-msgid "missing"
-msgstr ""
-msgid "Hash Granularity:"
-msgstr ""
-msgid "L3 only: one WAN per destination IP"
-msgstr ""
-msgid "l4: per-connection spreading"
-msgstr ""
 
-msgid "WAN Status:"
-msgstr ""
-
-msgid "Allow Dynamic Weights on Standard ECMP"
-msgstr ""
-
-msgid "Aggregate"
-msgstr ""
-
-msgid "RTT Trend"
-msgstr ""
-
-msgid "DNS Pinning:"
-msgstr ""
-
-msgid "Health Probe Protocol"
-msgstr ""
-
-msgid "tcp uses lightweight TCP SYN handshakes; dns sends real UDP DNS queries (ephemeral port, never conflicts with AdGuardHome / SmartDNS / MosDNS / dnsmasq) to detect broken DNS or hijacked links."
-msgstr ""
-
-msgid "TCP SYN (default)"
-msgstr ""
-
-msgid "DNS Query (UDP)"
-msgstr ""
-
-msgid "DNS Probe Domain"
-msgstr ""
-
-msgid "Domain queried when Health Probe Protocol is set to DNS Query (default: baidu.com)."
-msgstr ""
-
-msgid "Packet Loss Threshold for DOWN"
-msgstr ""
-
-msgid "Sliding-window packet loss ratio (0.0 - 1.0) above which a link is marked DOWN (default: 0.5)."
-msgstr ""
-
-msgid "Maximum Allowed RTT (ms)"
-msgstr ""
-
-msgid "Smoothed RTT ceiling before consecutive violations mark the link DOWN (default: 1500 ms)."
-msgstr ""
-
-msgid "Degrade Exit Hysteresis"
-msgstr ""
-
-msgid "Degrade Enter Samples"
-msgstr ""
-
-msgid "Degrade Exit Samples"
-msgstr ""
-
-msgid "Degrade Minimum Out Samples"
-msgstr ""
-
-msgid "Load Offload Threshold"
-msgstr ""
-
-msgid "Load Recover Threshold"
-msgstr ""
-
-msgid "Healthy DNS Export File (Optional)"
-msgstr ""
-
-msgid "Leave empty to disable (recommended when using AdGuardHome / SmartDNS / MosDNS / dnsmasq). If set to an independent path like /tmp/mwan4_resolv.conf, mwan4 writes healthy per-WAN DNS servers there without touching /etc/resolv.conf."
-msgstr ""
-
-msgid "Remove Default Route on Exit"
-msgstr ""
-
-msgid "Keep disabled (default) to avoid brief internet loss during service restarts. Probe paths, policies, underlay and DNS host routes are always cleaned up."
-msgstr ""
-
-msgid "Gateway, ECMP weight, probe targets and optional per-WAN DNS pinning for each WAN interface."
-msgstr ""
-
-msgid "Leave empty or 0.0.0.0 for point-to-point / PPPoE / WireGuard interfaces."
-msgstr ""
-
-msgid "IPv6 Gateway"
-msgstr ""
-
-msgid "Probe Protocol Override"
-msgstr ""
-
-msgid "Inherit global setting"
-msgstr ""
-
-msgid "Pinned Upstream DNS (IPv4)"
-msgstr ""
-
-msgid "Optional ISP/upstream DNS IPs pinned to this WAN via kernel /32 routes while healthy. Works transparently under AdGuardHome, SmartDNS, MosDNS and dnsmasq without touching port 53."
-msgstr ""
-
-msgid "Tunnel Underlay Peers (IPv4)"
-msgstr ""
-
-msgid "For tunnel WANs (VXLAN/WireGuard): peer IPs pinned to a non-tunnel WAN to avoid ECMP self-loop."
-msgstr ""
-
-msgid "Degraded: sliding-window packet loss reached the degrade threshold, so this WAN is excluded from the default route. It is still probed and rejoins automatically once its loss drops."
-msgstr ""
-
-msgid "Router clock differs from this browser, so freshness cannot be judged. These values may be the last known state of a stopped daemon."
+msgid "Basic"
 msgstr ""
 
 msgid "DNS"
 msgstr ""
 
-msgid "DNS:"
+msgid "Advanced"
+msgstr ""
+
+msgid "Running"
+msgstr ""
+
+msgid "Stopped"
+msgstr ""
+
+msgid "No Status"
+msgstr ""
+
+msgid "Clock Skew"
+msgstr ""
+
+msgid "Unknown"
+msgstr ""
+
+msgid "Online"
+msgstr ""
+
+msgid "Offline"
+msgstr ""
+
+msgid "Degraded"
+msgstr ""
+
+msgid "(No IP)"
+msgstr ""
+
+msgid "ago"
+msgstr ""
+
+msgid "Policy"
+msgstr ""
+
+msgid " (inactive)"
+msgstr ""
+
+msgid "L3 Hash"
+msgstr ""
+
+msgid "L4 Hash"
+msgstr ""
+
+msgid "Online WANs"
+msgstr ""
+
+msgid "Downlink"
+msgstr ""
+
+msgid "Uplink"
+msgstr ""
+
+msgid "Active Route"
+msgstr ""
+
+msgid "RTT"
+msgstr ""
+
+msgid "Jitter"
+msgstr ""
+
+msgid "Gateway"
+msgstr ""
+
+msgid "Weight"
+msgstr ""
+
+msgid "Loss"
+msgstr ""
+
+msgid "OK"
+msgstr ""
+
+msgid "Timeout"
+msgstr ""
+
+msgid "offloaded"
+msgstr ""
+
+msgid "Status expired: daemon may have stopped."
+msgstr ""
+
+msgid "Clock skew detected: status freshness cannot be verified."
+msgstr ""
+
+msgid "Waiting for daemon status..."
+msgstr ""
+
+msgid "Local error: "
+msgstr ""
+
+msgid "Probe error: "
+msgstr ""
+
+msgid "Degraded: excluded from ECMP until packet loss recovers."
+msgstr ""
+
+msgid "No metrics available. Check that the MWAN4 service is running."
+msgstr ""
+
+msgid "Enable Service"
+msgstr ""
+
+msgid "Routing Mode"
+msgstr ""
+
+msgid "Auto"
+msgstr ""
+
+msgid "Standard ECMP"
+msgstr ""
+
+msgid "Resilient Nexthop"
+msgstr ""
+
+msgid "Weight Mode"
+msgstr ""
+
+msgid "Static"
+msgstr ""
+
+msgid "Quality-aware"
+msgstr ""
+
+msgid "Smart Aggregate"
+msgstr ""
+
+msgid "Probe Interval (ms)"
+msgstr ""
+
+msgid "Probe Timeout (ms)"
+msgstr ""
+
+msgid "Failure Threshold"
+msgstr ""
+
+msgid "Recovery Threshold"
+msgstr ""
+
+msgid "Probe Protocol"
+msgstr ""
+
+msgid "TCP SYN"
+msgstr ""
+
+msgid "DNS Query"
+msgstr ""
+
+msgid "Probe Domain"
+msgstr ""
+
+msgid "Forward Port"
+msgstr ""
+
+msgid "Listen Address"
+msgstr ""
+
+msgid "Forward Timeout (ms)"
+msgstr ""
+
+msgid "DNS Export File"
+msgstr ""
+
+msgid "Window Size"
+msgstr ""
+
+msgid "DOWN Loss Threshold"
+msgstr ""
+
+msgid "Max RTT (ms)"
+msgstr ""
+
+msgid "Degrade Loss Threshold"
+msgstr ""
+
+msgid "Resilient Idle Timer (s)"
+msgstr ""
+
+msgid "Resilient Rebalance Timer (s)"
+msgstr ""
+
+msgid "Hash Policy"
+msgstr ""
+
+msgid "L4 (Per-Connection)"
+msgstr ""
+
+msgid "L3 (Per-IP)"
+msgstr ""
+
+msgid "Inner (Tunnel)"
+msgstr ""
+
+msgid "Load-aware Shifting"
+msgstr ""
+
+msgid "Weight Update Interval (ms)"
+msgstr ""
+
+msgid "Dynamic Weights on Standard ECMP"
+msgstr ""
+
+msgid "Flush Conntrack on DOWN"
+msgstr ""
+
+msgid "Flush Conntrack on Switch"
+msgstr ""
+
+msgid "Remove Routes on Exit"
+msgstr ""
+
+msgid "WAN Interfaces"
+msgstr ""
+
+msgid "Enable"
+msgstr ""
+
+msgid "Interface"
+msgstr ""
+
+msgid "IPv6 Gateway"
+msgstr ""
+
+msgid "Priority"
+msgstr ""
+
+msgid "Bandwidth (Mbps)"
+msgstr ""
+
+msgid "Uplink (Mbps)"
+msgstr ""
+
+msgid "Global Default"
+msgstr ""
+
+msgid "Probe Targets"
+msgstr ""
+
+msgid "Upstream DNS"
+msgstr ""
+
+msgid "Tunnel Peers"
+msgstr ""
+
+msgid "Policy Routing"
+msgstr ""
+
+msgid "Name"
+msgstr ""
+
+msgid "Source CIDR"
+msgstr ""
+
+msgid "Destination CIDR"
+msgstr ""
+
+msgid "Target WAN"
 msgstr ""
 
 msgid "Expected IPv4 or IPv4:Port"
 msgstr ""
 
-msgid "DNS Forward Port (0 = Off)"
-msgstr ""
-
-msgid "DNS Listen Address"
-msgstr ""
-
-msgid "DNS Forward Timeout (ms)"
-msgstr ""
-
-msgid "Upstream DNS (IP[:Port])"
-msgstr ""
-
-msgid "Aggregate spreading (headroom-aware)"
+msgid "MWAN4 configuration saved and applied."
 msgstr ""

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 mod config;
 mod dns;
+mod kmod;
 mod lqe;
 mod netlink;
 mod prober;
@@ -17,9 +18,9 @@ use config::{
 use lqe::{LinkQualityEstimator, LinkState};
 use netlink::conntrack::ConntrackManager;
 use netlink::route::{
-    AF_INET, ActiveWanRoute, ActiveWanRouteV6, DnsRoute, InstalledVariant,
-    POLICY_RULE_PRIORITY_BASE, PROBE_RULE_PRIORITY_BASE, PROBE_TABLE_BASE, PolicyRule, ProbePath,
-    RouteManager,
+    AF_INET, ActiveWanRoute, ActiveWanRouteV6, DnsRoute, FWMARK_RULE_PRIORITY_BASE, FwmarkRule,
+    InstalledVariant, POLICY_RULE_PRIORITY_BASE, PROBE_RULE_PRIORITY_BASE, PROBE_TABLE_BASE,
+    PolicyRule, ProbePath, RouteManager,
 };
 use netlink::util::if_nametoindex;
 
@@ -135,6 +136,8 @@ enum NetlinkCmd {
     SetProbePaths(Vec<ProbePath>, bool),
     FlushConntrack(Vec<ConntrackTarget>),
     SetPolicies(Vec<PolicyRule>),
+    /// 内核态调度模块（kmod-mwan4-sched）配套的 fwmark -> table 规则。
+    SetFwmarkRules(Vec<FwmarkRule>),
     /// 每 WAN 专属上游 DNS `/32` 出口绑定路由（空清单 = 全部移除）。
     SetDnsRoutes(Vec<DnsRoute>),
     /// 退出但保留预设路由时，仍须拆除隧道 underlay `/32`，避免旧闸道失效造成封装封包黑洞。
@@ -154,6 +157,7 @@ enum NetlinkOp {
     ProbePaths,
     Conntrack,
     Policies,
+    FwmarkRules,
     DnsRoutes,
 }
 
@@ -224,6 +228,7 @@ fn spawn_netlink_worker(
                 let mut probe_paths: Option<(Vec<ProbePath>, bool)> = None;
                 let mut flush: Vec<ConntrackTarget> = Vec::new();
                 let mut policies: Option<Vec<PolicyRule>> = None;
+                let mut fwmark_rules: Option<Vec<FwmarkRule>> = None;
                 let mut dns_routes: Option<Vec<DnsRoute>> = None;
                 let mut clear_underlay = false;
                 let mut clear_routes = false;
@@ -247,6 +252,7 @@ fn spawn_netlink_worker(
                             }
                         }
                         NetlinkCmd::SetPolicies(rules) => policies = Some(rules),
+                        NetlinkCmd::SetFwmarkRules(rules) => fwmark_rules = Some(rules),
                         NetlinkCmd::SetDnsRoutes(routes) => dns_routes = Some(routes),
                         NetlinkCmd::ClearUnderlayRoutes => clear_underlay = true,
                         NetlinkCmd::ClearRoutes => clear_routes = true,
@@ -305,6 +311,16 @@ fn spawn_netlink_worker(
                         }
                     };
                     let _ = result_tx.send(NetlinkOutcome::new(NetlinkOp::Policies, ok, detail));
+                }
+                if let Some(rules) = fwmark_rules {
+                    let (ok, detail) = match route_mgr.set_fwmark_rules(&rules) {
+                        Ok(()) => (true, None),
+                        Err(e) => {
+                            debug!("Fwmark rule update failed: {e}");
+                            (false, Some(e.to_string()))
+                        }
+                    };
+                    let _ = result_tx.send(NetlinkOutcome::new(NetlinkOp::FwmarkRules, ok, detail));
                 }
                 if let Some(routes) = dns_routes {
                     let (ok, detail) = match route_mgr.sync_dns_routes(&routes) {
@@ -510,8 +526,9 @@ fn refresh_interface_state(monitors: &mut [WanMonitor], reason: &str) -> bool {
 fn refresh_affected_interfaces(
     monitors: &mut [WanMonitor],
     events: &[netlink::link::LinkEvent],
-) -> bool {
-    let mut changed = false;
+) -> (bool, bool) {
+    let mut ifindex_changed = false;
+    let mut link_or_addr_touched = false;
     for monitor in monitors.iter_mut() {
         let mut touched = false;
         let mut reindex = false;
@@ -520,6 +537,10 @@ fn refresh_affected_interfaces(
                 netlink::link::LinkEvent::Link {
                     ifname: Some(name), ..
                 } if name == &monitor.ifname => {
+                    touched = true;
+                    reindex = true;
+                }
+                netlink::link::LinkEvent::Link { ifindex, .. } if *ifindex == monitor.ifindex => {
                     touched = true;
                     reindex = true;
                 }
@@ -532,20 +553,21 @@ fn refresh_affected_interfaces(
         if !touched {
             continue;
         }
+        link_or_addr_touched = true;
         if reindex {
-            changed |= refresh_ifindex(monitor, "kernel link event");
+            ifindex_changed |= refresh_ifindex(monitor, "kernel link event");
         }
         monitor.refresh_cached_ip();
     }
-    changed
+    (ifindex_changed, link_or_addr_touched)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn refresh_affected_interfaces(
     _monitors: &mut [WanMonitor],
     _events: &[netlink::link::LinkEvent],
-) -> bool {
-    false
+) -> (bool, bool) {
+    (false, false)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -643,17 +665,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             info!(
-                "No config file specified, checking /etc/mwan4/mwan4.json, {} or defaults...",
+                "No config file specified, checking {}, /etc/mwan4/mwan4.json or defaults...",
                 uci::DEFAULT_UCI_PATH
             );
-            if std::path::Path::new("/etc/mwan4/mwan4.json").exists() {
-                DaemonConfig::load_from_file("/etc/mwan4/mwan4.json").unwrap_or_else(|e| {
-                    error!("Failed to load /etc/mwan4/mwan4.json: {e}");
-                    process::exit(1);
-                })
-            } else if std::path::Path::new(uci::DEFAULT_UCI_PATH).exists() {
+            if std::path::Path::new(uci::DEFAULT_UCI_PATH).exists() {
                 DaemonConfig::load_from_file(uci::DEFAULT_UCI_PATH).unwrap_or_else(|e| {
                     error!("Failed to load {}: {e}", uci::DEFAULT_UCI_PATH);
+                    process::exit(1);
+                })
+            } else if std::path::Path::new("/etc/mwan4/mwan4.json").exists() {
+                DaemonConfig::load_from_file("/etc/mwan4/mwan4.json").unwrap_or_else(|e| {
+                    error!("Failed to load /etc/mwan4/mwan4.json: {e}");
                     process::exit(1);
                 })
             } else {
@@ -701,7 +723,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 用明确错误讯息 + exit(1) 取代 expect()：panic=abort 下 panic 只会留下一行堆叠。
     let route_mgr = match RouteManager::new(config.route_priority, config.ecmp_mode) {
-        Ok(m) => m.with_resilient_idle_timer(config.resilient_idle_timer_secs),
+        Ok(m) => m
+            .with_resilient_idle_timer(config.resilient_idle_timer_secs)
+            .with_resilient_unbalanced_timer(config.resilient_unbalanced_timer_secs),
         Err(e) => {
             error!("Failed to initialize Netlink Route socket: {e} (is CAP_NET_ADMIN granted?)");
             release_pid_file();
@@ -719,9 +743,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(n) => info!("Cleaned up {n} leftover mwan4 host route(s) on startup"),
         Err(e) => warn!("Failed to clean up leftover mwan4 host routes: {e}"),
     }
-    // 策略规则的保留区段也先清：上次的规则可能指向已不存在的表／网关。
+    // 策略规则与 fwmark 规则的保留区段也先清：上次的规则可能指向已不存在的表／网关。
     if let Err(e) = route_mgr.sweep_policy_rules() {
         warn!("Failed to sweep stale policy rules on startup: {e}");
+    }
+    if let Err(e) = route_mgr.sweep_fwmark_rules() {
+        warn!("Failed to sweep stale fwmark rules on startup: {e}");
+    }
+    let kmod_present = kmod::is_available();
+    if kmod_present {
+        info!(
+            "Detected kernel scheduler module ({}): per-flow fwmark scheduling enabled",
+            kmod::PROC_PATH
+        );
     }
     // 只用于「问内核路径」的查询 socket，与 worker 的写入 socket 分开。
     let mut query_mgr = match RouteManager::new(config.route_priority, config.ecmp_mode) {
@@ -780,6 +814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         monitors.push(WanMonitor {
             ifname: iface_cfg.name.clone(),
             ifindex,
+            configured_gateway: iface_cfg.gateway,
             gateway: iface_cfg.gateway,
             gateway6: iface_cfg.gateway6,
             metric: iface_cfg.metric,
@@ -803,6 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             probe_mode: iface_cfg.probe_mode.unwrap_or(config.probe_mode),
             dns_servers: iface_cfg.dns_servers.clone(),
             preferred_target: 0,
+            configured_underlay_targets: iface_cfg.underlay_targets.clone(),
             underlay_targets: iface_cfg.underlay_targets.clone(),
             cached_ip: crate::netlink::util::get_interface_ipv4(&iface_cfg.name).ok(),
             last_known_ip: crate::netlink::util::get_interface_ipv4(&iface_cfg.name).ok(),
@@ -818,6 +854,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lqe: LinkQualityEstimator::new(iface_cfg.name.clone(), &config),
         });
     }
+
+    refresh_dynamic_link_params(&mut monitors, &mut query_mgr);
 
     let has_dns_routes = monitors.iter().any(|m| !m.dns_servers.is_empty());
     if has_dns_routes {
@@ -941,6 +979,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tick_count: u64 = 0;
     // None = 尚未下发过任何路由，避免开机第一次探测就删掉别人（netifd）的预设路由。
     let mut last_active_ifindexes: Option<Vec<u32>> = None;
+    let mut last_active_slots: Vec<bool> = vec![false; monitors.len()];
     // v6 更新入队失败时暂存重试，否则 need_apply 变回 false 后会永久丢失。
     let mut v6_pending: Option<Vec<ActiveWanRouteV6>> = None;
     let mut probe_paths_dirty = true;
@@ -969,6 +1008,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut policies_inflight = false;
     let mut policies_retry_at: u64 = 0;
     let mut last_policy_signature: Option<Vec<PolicyRule>> = None;
+    let mut fwmark_dirty = kmod_present;
+    let mut fwmark_inflight = false;
+    let mut fwmark_retry_at: u64 = 0;
+    let mut last_fwmark_signature: Option<Vec<FwmarkRule>> = None;
+    let mut last_kmod_payload: Option<String> = None;
     let mut dns_routes_dirty = has_dns_routes;
     let mut dns_routes_inflight = false;
     let mut dns_routes_retry_at: u64 = 0;
@@ -998,15 +1042,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug!("Kernel link/address events for ifindex {ifindexes:?}");
                 }
                 // 接收缓冲溢位（ENOBUFS）= 中间有事件遗失，做一次全量 resync。
-                let ifindex_changed = if events
+                let resync = events
                     .iter()
-                    .any(|e| matches!(e, netlink::link::LinkEvent::Resync))
-                {
+                    .any(|e| matches!(e, netlink::link::LinkEvent::Resync));
+                let default_route_changed = events.iter().any(|e| {
+                    matches!(e, netlink::link::LinkEvent::DefaultRouteChanged { .. })
+                });
+                let (ifindex_changed, link_touched) = if resync {
                     warn!("Netlink event buffer overflowed (ENOBUFS); resynchronizing interface state");
-                    refresh_interface_state(&mut monitors, "netlink overflow")
+                    (refresh_interface_state(&mut monitors, "netlink overflow"), true)
                 } else {
                     refresh_affected_interfaces(&mut monitors, &events)
                 };
+                if resync || default_route_changed || link_touched {
+                    let params_changed = refresh_dynamic_link_params(&mut monitors, &mut query_mgr);
+                    if params_changed || default_route_changed {
+                        v4_apply_dirty = true;
+                        probe_paths_dirty = true;
+                        dns_routes_dirty = true;
+                    }
+                }
                 if ifindex_changed {
                     probe_paths_dirty = true;
                 }
@@ -1117,6 +1172,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !outcome.ok {
                                 policies_dirty = true;
                                 policies_retry_at = tick_count + 6;
+                            }
+                        }
+                        NetlinkOp::FwmarkRules => {
+                            fwmark_inflight = false;
+                            if !outcome.ok {
+                                fwmark_dirty = true;
+                                fwmark_retry_at = tick_count + 6;
                             }
                         }
                         NetlinkOp::DnsRoutes => {
@@ -1552,27 +1614,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             v4_apply_dirty = false;
                             weights_dirty = false;
 
-                            // 清理名单只含「新进入存活集合」的成员；连坐其他存活成员会按 WAN IP 清掉一直健康那条线的全部连线（实测 RST）。
-                            let flush_on_switch =
-                                config.flush_conntrack_on_switch && !kernel_resilient;
-                            if !set_unchanged && flush_on_switch && last_active_ifindexes.is_some() {
-                                let prev: Vec<u32> =
-                                    last_active_ifindexes.clone().unwrap_or_default();
+                            // 清理名单仅包含「刚刚退出活跃集合」的成员：
+                            // 在 resilient nexthop group 与 standard ECMP 下，离开 ECMP 的 WAN 其既有 NAT/masquerade
+                            // conntrack 记录会继续把回包/后续发包导向错误出口并触发 uRPF 丢包造成断流；
+                            // 只清理退出成员的旧 IP，不波及仍在健康承载的 WAN。
+                            if !set_unchanged
+                                && config.flush_conntrack_on_switch
+                                && !kernel_resilient
+                                && last_active_ifindexes.is_some()
+                            {
                                 flush_pending.extend(
                                     monitors
                                         .iter()
                                         .enumerate()
                                         .filter(|(slot, m)| {
-                                            is_active(*slot, m)
-                                                && !prev.contains(&m.ifindex)
-                                                // 刚从 DOWN 回来的线仍在 25 秒静默期内，flush-on-switch 不该绕过这份保护清它。
-                                                && !m.last_down_at.is_some_and(|t| {
-                                                    t.elapsed() < CONNTRACK_FLUSH_DOWN_QUIET
-                                                })
+                                            let was_active =
+                                                last_active_slots.get(*slot).copied().unwrap_or(false);
+                                            was_active && !is_active(*slot, m)
                                         })
                                         .map(|(idx, _)| (idx, false)),
                                 );
                             }
+                            last_active_slots = monitors
+                                .iter()
+                                .enumerate()
+                                .map(|(slot, m)| is_active(slot, m))
+                                .collect();
                             last_active_ifindexes = Some(new_set);
 
                             if has_ipv6 {
@@ -1608,6 +1675,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // 探针路径让探针完全不依赖主表预设路由（「停线→恢复」不再自锁）。
                 if tick_count % PROBE_PATH_REFRESH_TICKS == 0 {
+                    if refresh_dynamic_link_params(&mut monitors, &mut query_mgr) {
+                        v4_apply_dirty = true;
+                        dns_routes_dirty = true;
+                    }
                     probe_paths_dirty = true;
                 }
                 if probe_paths_dirty && !probe_paths_inflight && tick_count >= probe_paths_retry_at {
@@ -1796,6 +1867,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // 若加载了内核态精细分流模块（kmod-mwan4-sched），同步 fwmark 规则与活跃 WAN 调度表。
+                if kmod_present {
+                    if tick_count % PROBE_PATH_REFRESH_TICKS == 0 {
+                        fwmark_dirty = true;
+                    }
+                    let fwmark_wanted: Vec<FwmarkRule> = monitors
+                        .iter()
+                        .enumerate()
+                        .filter(|(slot, m)| is_active(*slot, m))
+                        .map(|(slot, m)| FwmarkRule {
+                            ifname: m.ifname.clone(),
+                            table: PROBE_TABLE_BASE + slot as u32,
+                            priority: FWMARK_RULE_PRIORITY_BASE + slot as u32,
+                            fwmark: kmod::fwmark_for_slot(slot),
+                            fwmask: kmod::FWMARK_MASK,
+                        })
+                        .collect();
+                    let fwmark_changed =
+                        last_fwmark_signature.as_deref() != Some(fwmark_wanted.as_slice());
+                    if (fwmark_changed || fwmark_dirty)
+                        && !fwmark_inflight
+                        && tick_count >= fwmark_retry_at
+                    {
+                        match netlink_tx
+                            .try_send(NetlinkCmd::SetFwmarkRules(fwmark_wanted.clone()))
+                        {
+                            Ok(()) => {
+                                fwmark_inflight = true;
+                                fwmark_dirty = false;
+                                last_fwmark_signature = Some(fwmark_wanted);
+                            }
+                            Err(err) => {
+                                debug!(
+                                    "Fwmark rule update still queued; will retry next tick: {err}"
+                                );
+                            }
+                        }
+                    }
+
+                    if tick_count % 2 == 0 || state_changed || fwmark_changed {
+                        let kmod_wans: Vec<kmod::KmodWanSpec> = monitors
+                            .iter()
+                            .enumerate()
+                            .filter(|(slot, m)| is_active(*slot, m))
+                            .map(|(slot, m)| kmod::KmodWanSpec {
+                                name: m.ifname.clone(),
+                                ifindex: m.ifindex,
+                                fwmark: kmod::fwmark_for_slot(slot),
+                                weight: m.effective_weight.max(1),
+                                down_kbps: m
+                                    .down_bps_capacity
+                                    .map(|b| (b / 1000.0).round() as u64)
+                                    .unwrap_or(0),
+                                up_kbps: m
+                                    .up_bps_capacity
+                                    .map(|b| (b / 1000.0).round() as u64)
+                                    .unwrap_or(0),
+                                rtt_us: m
+                                    .lqe
+                                    .rtt_ewma_ms
+                                    .map(|ms| (ms * 1000.0).round() as u32)
+                                    .unwrap_or(0),
+                                loss_pm: (m.lqe.loss_rate() * 1000.0).round() as u32,
+                                degraded: m.lqe.is_degraded(),
+                            })
+                            .collect();
+                        let kmod_mode = if kmod_wans.len() >= 2 {
+                            match config.weight_mode {
+                                WeightMode::Quality => kmod::KMOD_MODE_LATENCY,
+                                WeightMode::Static | WeightMode::Aggregate => {
+                                    kmod::KMOD_MODE_BALANCED
+                                }
+                            }
+                        } else {
+                            kmod::KMOD_MODE_OFF
+                        };
+                        let payload = kmod::format_payload(kmod_mode, true, &kmod_wans);
+                        if last_kmod_payload.as_deref() != Some(payload.as_str()) {
+                            match kmod::sync_kernel_scheduler(kmod_mode, true, &kmod_wans) {
+                                Ok(()) => {
+                                    last_kmod_payload = Some(payload);
+                                }
+                                Err(e) => {
+                                    debug!("Failed to update {}: {e}", kmod::PROC_PATH);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 同步内置 DNS 转发器的健康上游清单（仅在 dns_listen_port > 0 且成功绑定时启用）。
                 if let Some(ref fwd) = dns_forwarder {
                     let upstreams = build_dns_upstreams(&monitors);
@@ -1854,7 +2015,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 路由下发之后才排程 conntrack 清理（worker 只扫一次全表）；DOWN 后等 25 秒确认不是抖动才清。
+                // 路由下发之后才排程 conntrack 清理（worker 只扫一次全表）；
+                // 物理掉载波/接口消失/本机无路由时立即清理，纯探针超时则等待 25 秒静默期确认不是抖动。
                 if config.flush_conntrack_on_down {
                     let now = Instant::now();
                     for (idx, monitor) in monitors.iter().enumerate() {
@@ -1862,7 +2024,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         if let Some(since) = monitor.down_since {
-                            if now.duration_since(since) >= CONNTRACK_FLUSH_DOWN_QUIET {
+                            let link_physically_gone = monitor.ifindex == 0
+                                || !interface_oper_usable(&monitor.ifname)
+                                || monitor.last_error_is_local;
+                            if link_physically_gone
+                                || now.duration_since(since) >= CONNTRACK_FLUSH_DOWN_QUIET
+                            {
                                 // ⚠️ 这里只收集、不先标记 flushed_while_down：限流跳过的线若已标记，整段 DOWN 都不会再尝试清理。
                                 flush_pending.push((idx, true));
                             }
@@ -1907,6 +2074,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if kmod_present {
+        if let Err(e) = kmod::disable_kernel_scheduler() {
+            warn!("Failed to disable kernel scheduler on shutdown: {e}");
+        }
+    }
+
     if let Some(fwd) = dns_forwarder {
         fwd.shutdown().await;
     }
@@ -1917,11 +2090,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("Failed to request default route cleanup: {e}");
         }
     } else {
-        // 预设路由保留，但探针路径、策略规则、上游 DNS /32 与隧道 underlay /32 一律拆除，避免残留路由造成黑洞。
+        // 预设路由保留，但探针路径、策略规则、fwmark 规则、上游 DNS /32 与隧道 underlay /32 一律拆除，避免残留路由造成黑洞。
         info!("Leaving the mwan4 default route in place (remove_routes_on_exit = false)");
-        // 策略规则一定要拆：它们指向即将被拆的探针表，留着会让流量黑洞而不是回退 ECMP。
+        // 策略规则与 fwmark 规则一定要拆：它们指向即将被拆的探针表，留着会让流量黑洞而不是回退 ECMP。
         if let Err(e) = netlink_tx.send(NetlinkCmd::SetPolicies(Vec::new())) {
             warn!("Failed to request policy rule cleanup: {e}");
+        }
+        if kmod_present {
+            if let Err(e) = netlink_tx.send(NetlinkCmd::SetFwmarkRules(Vec::new())) {
+                warn!("Failed to request fwmark rule cleanup: {e}");
+            }
         }
         if has_dns_routes {
             if let Err(e) = netlink_tx.send(NetlinkCmd::SetDnsRoutes(Vec::new())) {
@@ -1953,6 +2131,8 @@ const CONNTRACK_FLUSH_DOWN_QUIET: Duration = Duration::from_secs(25);
 struct WanMonitor {
     ifname: String,
     ifindex: u32,
+    /// 用户显式配置的固定网关；None 时非 P2P 接口会从主表外部默认路由自动同步网关。
+    configured_gateway: Option<std::net::Ipv4Addr>,
     gateway: Option<std::net::Ipv4Addr>,
     gateway6: Option<std::net::Ipv6Addr>,
     metric: u32,
@@ -1976,6 +2156,8 @@ struct WanMonitor {
     probe_mode: ProbeMode,
     dns_servers: Vec<DnsServer>,
     preferred_target: usize,
+    /// 用户显式配置的 underlay 对端列表；为空时对 VXLAN 接口自动通过 Netlink 解析 IFLA_VXLAN_REMOTE。
+    configured_underlay_targets: Vec<std::net::Ipv4Addr>,
     /// 非空同时代表「不能拿这条线去当别条隧道的 underlay 出口」。
     underlay_targets: Vec<std::net::Ipv4Addr>,
     /// 每次写状态档都做 socket + ioctl 太昂贵，故快取。
@@ -2010,6 +2192,74 @@ impl WanMonitor {
             Err(_) => self.cached_ip = None,
         }
     }
+}
+
+/// 为未显式配置网关的非 P2P WAN（DHCP/以太网）同步主表外部默认路由网关，
+/// 并为未显式配置 underlay_targets 的 VXLAN 接口通过 Netlink 自动探测对端 IP。
+fn refresh_dynamic_link_params(
+    monitors: &mut [WanMonitor],
+    query_mgr: &mut Option<RouteManager>,
+) -> bool {
+    let mut changed = false;
+    let need_gw_lookup = monitors
+        .iter()
+        .any(|m| m.configured_gateway.is_none() && m.ifindex != 0);
+    let ext_gws = if need_gw_lookup {
+        query_mgr
+            .as_mut()
+            .and_then(|q| q.dump_external_gateways().ok())
+    } else {
+        None
+    };
+
+    for m in monitors.iter_mut() {
+        if m.configured_gateway.is_none() {
+            let new_gw = if m.ifindex == 0 {
+                None
+            } else if crate::netlink::util::is_interface_point_to_point(&m.ifname) {
+                None
+            } else if let Some(ref map) = ext_gws {
+                match map.get(&m.ifindex).copied() {
+                    Some(gw) => Some(gw),
+                    None if !interface_oper_usable(&m.ifname) => None,
+                    None => m.gateway,
+                }
+            } else {
+                m.gateway
+            };
+            if new_gw != m.gateway {
+                if let Some(gw) = new_gw {
+                    info!(
+                        "[{}] Auto-detected gateway {gw} from kernel main table",
+                        m.ifname
+                    );
+                } else if let Some(old) = m.gateway {
+                    debug!("[{}] Cleared auto-detected gateway {old}", m.ifname);
+                }
+                m.gateway = new_gw;
+                changed = true;
+            }
+        }
+
+        if m.configured_underlay_targets.is_empty() && m.ifindex != 0 {
+            let want: Vec<std::net::Ipv4Addr> =
+                crate::netlink::util::get_vxlan_remote_ipv4(&m.ifname)
+                    .into_iter()
+                    .collect();
+            if want != m.underlay_targets {
+                if let Some(remote) = want.first() {
+                    info!(
+                        "[{}] Auto-detected VXLAN underlay remote {remote}",
+                        m.ifname
+                    );
+                }
+                m.underlay_targets = want;
+                changed = true;
+            }
+        }
+    }
+
+    changed
 }
 
 /// Conntrack 清理失败时，仅把本次失败批次中处于 DOWN 的网卡重置为未清理，
@@ -2225,22 +2475,23 @@ struct PolicyStatus {
     destination: Vec<String>,
 }
 
-/// `fib_multipath_hash_fields` 位元定义（内核 UAPI，数值以 Linux 6.18 实测确认）。
+/// `fib_multipath_hash_fields` 位元定义（OpenWrt 25+ / Linux 6.12+ 内核 UAPI）。
 const HASH_FIELDS_L3: u32 =
     HashField::SrcIp.bit() | HashField::DstIp.bit() | HashField::IpProto.bit();
 const HASH_FIELDS_L4: u32 = HASH_FIELDS_L3 | HashField::SrcPort.bit() | HashField::DstPort.bit();
 
 fn hash_fields_desc(mask: u32) -> String {
-    const ALL: [HashField; 11] = [
+    const ALL: [HashField; 12] = [
         HashField::SrcIp,
         HashField::DstIp,
         HashField::IpProto,
+        HashField::FlowLabel,
         HashField::SrcPort,
         HashField::DstPort,
         HashField::InnerSrcIp,
         HashField::InnerDstIp,
         HashField::InnerIpProto,
-        HashField::FlowLabel,
+        HashField::InnerFlowLabel,
         HashField::InnerSrcPort,
         HashField::InnerDstPort,
     ];
@@ -2404,9 +2655,9 @@ fn apply_multipath_hash(
                 }
                 HashFieldsAction::CannotExpress => warn!(
                     "The '{}' hash policy is not bit-for-bit expressible by \
-                     fib_multipath_hash_fields (currently {current}), and measured on Linux \
-                     7.1.8 the policy is what actually selects the hash keys: \
-                     non-encapsulated traffic in 'inner' mode behaves exactly like 'l3' \
+                     fib_multipath_hash_fields (currently {current}), and on Linux 6.12+ \
+                     the policy is what actually selects the hash keys: \
+                     non-encapsulated traffic in 'inner' mode behaves like 'l3' \
                      (connections to the same destination IP stay on one WAN). Use 'l4' unless \
                      you really need the inner-header behaviour.",
                     policy.as_str()
@@ -3054,12 +3305,12 @@ mod tests {
         assert_eq!(hash_fields_action(L3, 0), HashFieldsAction::PolicyGoverns);
         assert_eq!(hash_fields_action(L4, 0), HashFieldsAction::PolicyGoverns);
 
-        assert_eq!(hash_fields_action(L4, 7), HashFieldsAction::Extend(31));
-        assert_eq!(hash_fields_action(L4, 31), HashFieldsAction::Covered);
+        assert_eq!(hash_fields_action(L4, 7), HashFieldsAction::Extend(55));
+        assert_eq!(hash_fields_action(L4, 55), HashFieldsAction::Covered);
         assert_eq!(hash_fields_action(L4, 63), HashFieldsAction::Covered);
-        assert_eq!(hash_fields_action(L4, 8), HashFieldsAction::Extend(31));
+        assert_eq!(hash_fields_action(L4, 8), HashFieldsAction::Extend(63));
         assert_eq!(hash_fields_action(L3, 7), HashFieldsAction::Covered);
-        assert_eq!(hash_fields_action(L3, 31), HashFieldsAction::Covered);
+        assert_eq!(hash_fields_action(L3, 55), HashFieldsAction::Covered);
         assert_eq!(hash_fields_action(L3, 2), HashFieldsAction::Extend(7));
         assert_eq!(
             hash_fields_action(Inner, 7),
@@ -3077,17 +3328,17 @@ mod tests {
         assert_eq!(hash_fields_desc(7), "7 (src_ip+dst_ip+ip_proto)");
         assert_eq!(
             hash_fields_desc(HASH_FIELDS_L4),
-            "31 (src_ip+dst_ip+ip_proto+src_port+dst_port)"
+            "55 (src_ip+dst_ip+ip_proto+src_port+dst_port)"
         );
         assert_eq!(
             hash_fields_desc(
                 HASH_FIELDS_L4 | HashField::InnerSrcPort.bit() | HashField::InnerDstPort.bit()
             ),
-            "1567 (src_ip+dst_ip+ip_proto+src_port+dst_port+inner_src_port+inner_dst_port)"
+            "3127 (src_ip+dst_ip+ip_proto+src_port+dst_port+inner_src_port+inner_dst_port)"
         );
         assert_eq!(
             hash_fields_desc(HashField::FlowLabel.bit()),
-            "256 (flow_label)"
+            "8 (flow_label)"
         );
         assert_eq!(hash_fields_desc(1 << 20), "1048576 ((unknown bits))");
     }
@@ -3104,14 +3355,14 @@ mod tests {
         assert!(
             EffectiveHash {
                 policy: Some(0),
-                fields: Some(31),
+                fields: Some(55),
             }
             .l3_only()
         );
         assert!(
             !EffectiveHash {
                 policy: Some(1),
-                fields: Some(31),
+                fields: Some(55),
             }
             .l3_only()
         );
@@ -3233,6 +3484,7 @@ mod tests {
         WanMonitor {
             ifname: name.to_string(),
             ifindex: 1,
+            configured_gateway: None,
             gateway: None,
             gateway6: None,
             metric: 10,
@@ -3253,6 +3505,7 @@ mod tests {
             probe_mode: ProbeMode::Tcp,
             dns_servers: Vec::new(),
             preferred_target: 0,
+            configured_underlay_targets: Vec::new(),
             underlay_targets: Vec::new(),
             cached_ip: None,
             last_known_ip: None,

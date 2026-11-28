@@ -410,7 +410,8 @@ mod tests {
 
     #[test]
     fn test_down_on_consecutive_timeouts() {
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
         lqe.update(&sample(true, 20));
         assert_eq!(lqe.state, LinkState::Up);
@@ -426,7 +427,9 @@ mod tests {
 
     #[test]
     fn test_hysteresis_recovery_5_consecutive_successes() {
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
+        cfg.recovery_success_count = 5;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
         lqe.update(&sample(true, 20));
 
@@ -557,7 +560,9 @@ mod tests {
     #[test]
     fn test_recovery_is_not_gated_by_window_loss() {
         // FIX-4：恢复判据不含窗口丢包率（3 次超时后第 5 次成功即恢复，窗口仍 37.5% 失败）。
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
+        cfg.recovery_success_count = 5;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
         lqe.update(&sample(true, 20));
@@ -579,7 +584,9 @@ mod tests {
     #[test]
     fn test_recovery_counter_resets_on_failure() {
         // 连续成功累积途中出现一次失败即归零（不是窗口内累加）。
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
+        cfg.recovery_success_count = 5;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
         lqe.update(&sample(false, 600));
@@ -604,6 +611,7 @@ mod tests {
     #[test]
     fn test_recovery_success_count_is_configurable() {
         let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
         cfg.recovery_success_count = 3;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
@@ -633,7 +641,8 @@ mod tests {
         let mut cfg = DaemonConfig::default();
         cfg.consecutive_fail_down = 3;
         cfg.recovery_success_count = 5;
-        // 聚焦「恢复后不立刻降级」；enter_samples 设 1 才能用 2 次超时走到降级。
+        // 聚焦「恢复后不立刻降级」；开启降级且 enter_samples 设 1 才能用 2 次超时走到降级。
+        cfg.degrade_loss_threshold = 0.20;
         cfg.degrade_enter_samples = 1;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
@@ -666,7 +675,8 @@ mod tests {
 
     #[test]
     fn test_degrade_requires_a_full_window() {
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.degrade_loss_threshold = 0.20;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
         for _ in 0..9 {
@@ -740,9 +750,10 @@ mod tests {
         assert_eq!(lqe.state, LinkState::Down, "全丢包仍由既有的 DOWN 判据处理");
     }
 
-    /// 退出/迟滞测试用设定：enter_samples=1、min_out=0（走最短进入路径）。
+    /// 退出/迟滞测试用设定：开启降级 0.20、enter_samples=1、min_out=0（走最短进入路径）。
     fn cfg_degrade_exit_focused() -> DaemonConfig {
         let mut cfg = DaemonConfig::default();
+        cfg.degrade_loss_threshold = 0.20;
         cfg.degrade_enter_samples = 1;
         cfg.degrade_min_out_samples = 0;
         cfg
@@ -901,7 +912,8 @@ mod tests {
     #[test]
     fn test_degrade_entry_requires_sustained_loss() {
         // 回归（实机 2026-09）：单一窗口刚好 20% 曾立刻移出 ECMP；改为须连续 enter_samples 拍超标。
-        let cfg = DaemonConfig::default(); // enter = 20 samples, window = 10
+        let mut cfg = DaemonConfig::default(); // enter = 20 samples, window = 10
+        cfg.degrade_loss_threshold = 0.20;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
         for _ in 0..10 {
@@ -933,6 +945,7 @@ mod tests {
     #[test]
     fn test_degrade_enter_samples_one_degrades_immediately() {
         let mut cfg = DaemonConfig::default();
+        cfg.degrade_loss_threshold = 0.20;
         cfg.degrade_enter_samples = 1;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
 
@@ -949,6 +962,7 @@ mod tests {
     fn test_degrade_min_out_samples_delays_reentry() {
         // 回归（实机 2026-09）：移出→5 秒后回来→又被移出，每次循环都重映射 flow；min_out 让它多待一会。
         let mut cfg = DaemonConfig::default();
+        cfg.degrade_loss_threshold = 0.20;
         cfg.degrade_enter_samples = 1;
         cfg.degrade_exit_samples = 1; // 达标 1 拍即可退出（把焦点放在最短离开时间）
         cfg.degrade_min_out_samples = 20;
@@ -995,7 +1009,8 @@ mod tests {
 
     #[test]
     fn test_state_reason_reports_triggering_condition() {
-        let cfg = DaemonConfig::default();
+        let mut cfg = DaemonConfig::default();
+        cfg.consecutive_fail_down = 3;
         let mut lqe = LinkQualityEstimator::new("wan1".into(), &cfg);
         assert_eq!(lqe.state_reason(), None);
 

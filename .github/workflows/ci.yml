@@ -142,16 +142,22 @@ jobs:
           test -f dist/SHA256SUMS
           test -f dist/mwan4-x86_64-bundle.tar.gz
           ls -l dist/packages dist/SHA256SUMS
-      - name: IPK control still validates (python)
+      - name: APK packaging validation (python)
         run: |
           python - <<'PY'
           import glob, io, tarfile
-          ipk = sorted(glob.glob("dist/packages/mwan4_*_x86_64.ipk"))[-1]
-          with tarfile.open(ipk, "r:gz") as t:
-              name = [n for n in t.getnames() if n.startswith("control.tar")][0]
-              ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile(name).read()), mode="r:gz")
-              assert "conffiles" in ctrl.getnames(), "IPK must declare conffiles"
-          print("OK", ipk)
+          apk = sorted(glob.glob("dist/packages/mwan4_*_x86_64.apk"))[-1]
+          luci_apk = sorted(glob.glob("dist/packages/luci-app-mwan4_*_noarch.apk"))[-1]
+          assert not glob.glob("dist/packages/*.ipk"), "OpenWrt 25+ build must not emit .ipk"
+          with open(luci_apk, "rb") as f:
+              data = f.read()
+          marker = data.find(b"\x1f\x8b\x08", data.find(b"\x1f\x8b\x08", 1) + 1)
+          assert marker != -1
+          with tarfile.open(fileobj=io.BytesIO(data[marker:]), mode="r:gz") as dt:
+              names = dt.getnames()
+              assert "usr/lib/lua/luci/i18n/mwan4.zh_Hans.lmo" in names
+              assert "usr/lib/lua/luci/i18n/mwan4.zh-cn.lmo" not in names
+          print("OK", apk, luci_apk)
           PY
 
   # ── 真实核心 netns 整合测试（advisory）────────────────────────────────

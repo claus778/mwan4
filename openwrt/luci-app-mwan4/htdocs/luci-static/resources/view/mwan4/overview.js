@@ -6,14 +6,8 @@
 'require form';
 'require poll';
 
-/* 容忍的时钟偏差（秒）。浏览器与路由器各自 NTP，差十几秒是常态，
-   只有差距大到无法用时差解释时才说「不可判断」。 */
 var CLOCK_SKEW_TOLERANCE_SECS = 300;
-
-/* 上一次看到的 updated_at：只要它还在变大，daemon 就是活的（不受时差影响）。 */
 var lastSeenUpdatedAt = null;
-
-/* 每张卡片的 RTT/丢包趋势：轮询时累积，只存在于本页（重新载入即清空）。 */
 var TREND_LEN = 60;
 var trendHistory = {};
 
@@ -23,12 +17,11 @@ function history2bars(iface) {
 	for (var i = 0; i < h.length; i++)
 		if (h[i].rtt > max) max = h[i].rtt;
 
-	// 时间由左向右，最新一笔在最右侧的已填格；还没累积到的格子留白。
 	var out = [];
 	for (var n = 0; n < TREND_LEN; n++) {
 		var s = h[n];
 		if (!s || !s.up || s.rtt === null) {
-			out.push({ pct: 0, level: s ? 'bad' : 'empty', label: s ? _('Offline (DOWN)') : '' });
+			out.push({ pct: s ? 18 : 0, level: s ? 'bad' : 'empty', label: s ? _('Offline') : '' });
 			continue;
 		}
 		var level = rttLevel(s.rtt);
@@ -36,9 +29,9 @@ function history2bars(iface) {
 		if (l === 'bad') level = 'bad';
 		else if (l === 'warn' && level === 'ok') level = 'warn';
 		out.push({
-			pct: Math.max(8, Math.min(100, s.rtt / max * 100)),
+			pct: Math.max(10, Math.min(100, s.rtt / max * 100)),
 			level: level,
-			label: s.rtt.toFixed(1) + ' ms / ' + s.loss.toFixed(1) + '%'
+			label: s.rtt.toFixed(1) + ' ms · ' + s.loss.toFixed(1) + '%'
 		});
 	}
 	return out;
@@ -75,8 +68,6 @@ function readStatusJson() {
 	});
 }
 
-/* 核心设备名清单：daemon 用 SO_BINDTODEVICE / if_nametoindex 都需要核心设备名，
-   而 UCI 的 network 逻辑名（wan/wanb…）经常不同名；桥接属于 LAN 侧，一律排除。 */
 function listNetdevs() {
 	return fs.list('/sys/class/net').then(function(list) {
 		return (list || []).filter(function(name) {
@@ -87,8 +78,6 @@ function listNetdevs() {
 	});
 }
 
-/* 状态档新鲜度：'fresh' | 'stale' | 'skew' | 'missing'。
-   daemon 被杀掉后，最后一次快照不能继续被当成即时状态显示。 */
 function freshnessOf(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return 'missing';
@@ -126,6 +115,12 @@ function lossLevel(pct) {
 	return 'ok';
 }
 
+function loadLevel(pct) {
+	if (pct >= 85) return 'bad';
+	if (pct >= 65) return 'warn';
+	return 'ok';
+}
+
 function runLevel(fresh) {
 	if (fresh === 'fresh') return 'ok';
 	if (fresh === 'stale') return 'bad';
@@ -134,34 +129,34 @@ function runLevel(fresh) {
 
 function runText(fresh) {
 	if (fresh === 'fresh') return _('Running');
-	if (fresh === 'stale') return _('Stopped (status is stale)');
-	if (fresh === 'missing') return _('No status file');
-	return _('Not trustworthy (clock skew)');
+	if (fresh === 'stale') return _('Stopped');
+	if (fresh === 'missing') return _('No Status');
+	return _('Clock Skew');
+}
+
+function stateLevel(iface) {
+	if (iface.state !== 'UP') return 'bad';
+	return iface.degraded ? 'warn' : 'ok';
 }
 
 function stateText(iface) {
-	if (iface.state !== 'UP') return _('Offline (DOWN)');
-	return iface.degraded
-		? _('Online (UP, degraded - not carrying traffic)')
-		: _('Online (UP)');
+	if (iface.state !== 'UP') return _('Offline');
+	return iface.degraded ? _('Degraded') : _('Online');
 }
 
 function cardAlert(iface, fresh) {
 	if (fresh === 'stale')
-		return _('Status is stale: the daemon may have stopped. This is the last known state.');
+		return _('Status expired: daemon may have stopped.');
 	if (fresh === 'skew')
-		return _('Router clock differs from this browser, so freshness cannot be judged. ' +
-			'These values may be the last known state of a stopped daemon.');
+		return _('Clock skew detected: status freshness cannot be verified.');
 	if (fresh === 'missing')
-		return _('No status file yet: the daemon has not written one (or it just started).');
+		return _('Waiting for daemon status...');
 	if (iface.local_condition && iface.last_error)
-		return _('Local problem (packets never left the device): ') + iface.last_error;
+		return _('Local error: ') + iface.last_error;
 	if (iface.last_error)
-		return _('Last probe error: ') + iface.last_error;
+		return _('Probe error: ') + iface.last_error;
 	if (iface.degraded)
-		return _('Degraded: sliding-window packet loss reached the degrade threshold, so this WAN ' +
-			'is excluded from the default route. It is still probed and rejoins automatically ' +
-			'once its loss drops.');
+		return _('Degraded: excluded from ECMP until packet loss recovers.');
 	return '';
 }
 
@@ -180,16 +175,16 @@ function cardClass(iface, fresh) {
 
 function statusAgeText(statusData) {
 	if (!statusData || !statusData.updated_at)
-		return _('missing');
+		return '--';
 	var age = Date.now() / 1000 - statusData.updated_at;
 	if (age < -CLOCK_SKEW_TOLERANCE_SECS)
-		return _('clock skew');
+		return _('Clock Skew');
 	if (age < 60)
-		return Math.max(0, Math.round(age)) + ' s ' + _('ago');
+		return Math.max(0, Math.round(age)) + 's ' + _('ago');
 	var minutes = Math.floor(age / 60);
 	if (minutes < 60)
-		return minutes + ' min ' + _('ago');
-	return Math.floor(minutes / 60) + ' h ' + _('ago');
+		return minutes + 'm ' + _('ago');
+	return Math.floor(minutes / 60) + 'h ' + _('ago');
 }
 
 function routeInfo(statusData) {
@@ -202,10 +197,10 @@ function routeInfo(statusData) {
 	} else if (text.indexOf('DOWN') !== -1) {
 		level = 'bad';
 	}
-	return { level: level, text: text };
+	var shortText = text.replace(/^Multipath\s+/, '');
+	return { level: level, text: shortText, title: text };
 }
 
-/* 承载线概况：全 UP 且无降级 = ok；有降级 = warn；有任何一条 DOWN = bad。 */
 function wanSummary(statusData) {
 	var list = (statusData && statusData.interfaces) ? statusData.interfaces : [];
 	var up = 0, degraded = 0;
@@ -234,10 +229,10 @@ function jitterText(iface) { return iface.state === 'UP' ? iface.jitter_ms.toFix
 function lossText(iface) { return (iface.loss_rate || 0).toFixed(1) + '%'; }
 
 function pwText(iface) {
-	var w = 'W:' + iface.weight;
+	var w = String(iface.weight);
 	if (iface.effective_weight !== undefined && iface.effective_weight !== iface.weight)
-		w = 'W:' + iface.weight + ' \u2192 ' + iface.effective_weight;
-	return (iface.metric ? ('P:' + iface.metric + ' / ') : '') + w;
+		w = iface.weight + ' \u2192 ' + iface.effective_weight;
+	return iface.metric ? (w + '  (P:' + iface.metric + ')') : w;
 }
 
 function formatRate(bps) {
@@ -248,14 +243,11 @@ function formatRate(bps) {
 	return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
 }
 
-function rateText(iface) {
-	if (iface.state !== 'UP') return '\u2191 --  \u2193 --';
-	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
-	if (iface.load_pct !== undefined && iface.load_pct !== null) {
-		text += '  (' + iface.load_pct.toFixed(0) + '%';
-		if (iface.offloaded) text += ', ' + _('offloaded');
-		text += ')';
-	}
+function loadBadgeText(iface) {
+	if (iface.state !== 'UP' || iface.load_pct === undefined || iface.load_pct === null)
+		return '';
+	var text = iface.load_pct.toFixed(0) + '%';
+	if (iface.offloaded) text += ' · ' + _('offloaded');
 	return text;
 }
 
@@ -293,25 +285,21 @@ function validateDnsServer(section_id, value) {
 	return true;
 }
 
-/* 核心「实际生效」的哈希粒度（读回值）：l3_only 就是「同一个目的 IP 的连线
-   全挤一条 WAN」，也就是视频 CDN 卡顿最常见的成因。 */
 function hashInfo(statusData) {
 	var h = statusData && statusData.hash;
-	if (!h) return { level: 'muted', text: _('Unknown') };
+	if (!h) return { level: 'muted', text: _('Unknown'), title: '' };
 	var policy = (h.policy === null || h.policy === undefined) ? 'n/a' : h.policy;
 	var detail = 'policy=' + policy + ' fields=' + (h.fields_desc || 'n/a');
 	return {
 		level: h.l3_only ? 'warn' : 'ok',
-		text: (h.l3_only
-			? _('L3 only: one WAN per destination IP')
-			: _('l4: per-connection spreading')) + ' (' + detail + ')'
+		text: h.l3_only ? _('L3 Hash') : _('L4 Hash'),
+		title: detail
 	};
 }
 
-function succText(iface) { return _('Consecutive Successes: ') + iface.consecutive_successes; }
-function toText(iface) { return _('Consecutive Timeouts: ') + iface.consecutive_timeouts; }
+function succText(iface) { return _('OK') + ' ' + iface.consecutive_successes; }
+function toText(iface) { return _('Timeout') + ' ' + iface.consecutive_timeouts; }
 
-/* 只在值真的变了才写 DOM，轮询才不会打断文字选取。 */
 function setText(el, txt) {
 	if (el && el.textContent !== txt) el.textContent = txt;
 }
@@ -321,13 +309,13 @@ function setCls(el, cls) {
 function setW(el, w) {
 	if (el && el.style.width !== w) el.style.width = w;
 }
+function setTitle(el, t) {
+	if (el && el.title !== t) el.title = t;
+}
 function pick(root, role) {
 	return root ? root.querySelector('[data-role="' + role + '"]') : null;
 }
 
-/* LuCI 的描述列比标题列少一格，主题又可能只给标题/资料列加 ::before 假格，
-   两边都会让提示文字左移。量到实际位置后补空格子，直到第一格对齐；
-   form 还没挂上时 rect 全为 0，用 rAF 重试。 */
 function alignDescrRows(root, tries) {
 	var tables = root.querySelectorAll('table.cbi-section-table');
 	var pending = false;
@@ -387,75 +375,69 @@ return view.extend({
 		var ws = wanSummary(statusData);
 		var pt = policyText(statusData);
 		var dt = dnsText(statusData);
+		var rLevel = runLevel(fresh);
 
 		return E('div', { 'id': 'mwan4_header_container' }, [
 			E('div', { 'class': 'mwan4-header' }, [
 				E('div', { 'class': 'mwan4-brand' }, [
 					E('span', { 'class': 'mwan4-title' }, _('MWAN4 Load Balancing')),
-					E('span', { 'class': 'mwan4-sub' }, _('MWAN4 Multi-WAN Failover & Health Monitor'))
+					E('span', { 'class': 'mwan4-pill mwan4-pill-' + rLevel, 'data-role': 'run-pill' }, [
+						dot(rLevel, 'run-dot'),
+						E('span', { 'data-role': 'run-text' }, runText(fresh))
+					])
 				]),
 				E('div', { 'class': 'mwan4-meta' }, [
-					E('span', { 'class': 'mwan4-meta-item' }, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('Daemon:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							dot(runLevel(fresh), 'run-dot'),
-							E('span', { 'data-role': 'run-text' }, runText(fresh))
-						])
-					]),
-					E('span', { 'class': 'mwan4-meta-item' }, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('Kernel Default Route:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							dot(ri.level, 'route-dot'),
-							E('span', { 'data-role': 'route-text' }, ri.text)
-						])
-					]),
-					E('span', { 'class': 'mwan4-meta-item' }, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('Status File:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							E('span', { 'data-role': 'age-text' }, statusAgeText(statusData))
-						])
+					E('span', {
+						'class': 'mwan4-pill mwan4-pill-' + hi.level,
+						'data-role': 'hash-pill',
+						'title': hi.title
+					}, [
+						dot(hi.level, 'hash-dot'),
+						E('span', { 'data-role': 'hash-text' }, hi.text)
 					]),
 					E('span', {
-						'class': 'mwan4-meta-item',
+						'class': 'mwan4-pill',
 						'data-role': 'policy-item',
 						'style': pt ? '' : 'display: none'
 					}, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('Policy Routing:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							E('span', { 'data-role': 'policy-text' }, pt || '')
-						])
+						E('span', { 'class': 'mwan4-pill-key' }, _('Policy')),
+						E('span', { 'data-role': 'policy-text' }, pt || '')
 					]),
 					E('span', {
-						'class': 'mwan4-meta-item',
+						'class': 'mwan4-pill',
 						'data-role': 'dns-item',
 						'style': dt ? '' : 'display: none'
 					}, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('DNS:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							E('span', { 'data-role': 'dns-text' }, dt || '')
-						])
+						E('span', { 'class': 'mwan4-pill-key' }, _('DNS')),
+						E('span', { 'data-role': 'dns-text' }, dt || '')
 					]),
-					E('span', { 'class': 'mwan4-meta-item' }, [
-						E('span', { 'class': 'mwan4-meta-key' }, _('Hash Granularity:')),
-						E('span', { 'class': 'mwan4-badge' }, [
-							dot(hi.level, 'hash-dot'),
-							E('span', { 'data-role': 'hash-text' }, hi.text)
-						])
-					])
+					E('span', { 'class': 'mwan4-age', 'data-role': 'age-text' }, statusAgeText(statusData))
 				])
 			]),
 			E('div', { 'class': 'mwan4-summary' }, [
 				E('div', { 'class': 'mwan4-tile' }, [
-					E('span', { 'class': 'mwan4-tile-key' }, _('WAN Status:')),
+					E('span', { 'class': 'mwan4-tile-key' }, _('Online WANs')),
 					E('span', { 'class': 'mwan4-tile-val' }, [
 						dot(ws.level, 'wan-dot'),
 						E('span', { 'data-role': 'wan-text' }, ws.text)
 					])
 				]),
 				E('div', { 'class': 'mwan4-tile' }, [
-					E('span', { 'class': 'mwan4-tile-key' }, _('Aggregate')),
-					E('span', { 'class': 'mwan4-tile-val mwan4-mono', 'data-role': 'agg-text' },
-						'\u2191 ' + formatRate(ws.tx) + '  \u2193 ' + formatRate(ws.rx))
+					E('span', { 'class': 'mwan4-tile-key' }, _('Downlink')),
+					E('span', { 'class': 'mwan4-tile-val mwan4-mono', 'data-role': 'agg-rx' },
+						'\u2193 ' + formatRate(ws.rx))
+				]),
+				E('div', { 'class': 'mwan4-tile' }, [
+					E('span', { 'class': 'mwan4-tile-key' }, _('Uplink')),
+					E('span', { 'class': 'mwan4-tile-val mwan4-mono', 'data-role': 'agg-tx' },
+						'\u2191 ' + formatRate(ws.tx))
+				]),
+				E('div', { 'class': 'mwan4-tile mwan4-tile-route' }, [
+					E('span', { 'class': 'mwan4-tile-key' }, _('Active Route')),
+					E('span', { 'class': 'mwan4-tile-val mwan4-tile-val-sm', 'title': ri.title, 'data-role': 'route-wrap' }, [
+						dot(ri.level, 'route-dot'),
+						E('span', { 'data-role': 'route-text' }, ri.text)
+					])
 				])
 			])
 		]);
@@ -463,9 +445,14 @@ return view.extend({
 
 	renderCard: function(iface, fresh) {
 		var up = iface.state === 'UP';
+		var sLevel = stateLevel(iface);
 		var loss = iface.loss_rate || 0;
+		var lLevel = lossLevel(loss);
 		var trust = fresh || 'fresh';
 		var alert = cardAlert(iface, trust);
+		var hasLoad = up && iface.load_pct !== undefined && iface.load_pct !== null;
+		var loadPct = hasLoad ? Math.min(100, Math.max(0, iface.load_pct)) : 0;
+		var ldLevel = loadLevel(loadPct);
 
 		return E('div', {
 			'class': cardClass(iface, trust),
@@ -474,10 +461,10 @@ return view.extend({
 			E('div', { 'class': 'mwan4-card-head' }, [
 				E('div', { 'class': 'mwan4-card-id' }, [
 					E('span', { 'class': 'mwan4-card-title' }, iface.name),
-					E('span', { 'class': 'mwan4-card-ip' }, iface.ip ? iface.ip : _('(No IP)'))
+					E('span', { 'class': 'mwan4-card-ip', 'data-role': 'ip' }, iface.ip ? iface.ip : _('(No IP)'))
 				]),
-				E('span', { 'class': 'mwan4-badge mwan4-badge-state' }, [
-					dot(up ? (iface.degraded ? 'warn' : 'ok') : 'bad', 'state-dot'),
+				E('span', { 'class': 'mwan4-pill mwan4-pill-' + sLevel, 'data-role': 'state-pill' }, [
+					dot(sLevel, 'state-dot'),
 					E('span', { 'data-role': 'state-text' }, stateText(iface))
 				])
 			]),
@@ -488,7 +475,7 @@ return view.extend({
 			}, alert),
 			E('div', { 'class': 'mwan4-stats-grid' }, [
 				E('div', { 'class': 'mwan4-stat-item' }, [
-					E('span', { 'class': 'mwan4-stat-label' }, _('Realtime RTT')),
+					E('span', { 'class': 'mwan4-stat-label' }, _('RTT')),
 					E('span', { 'class': 'mwan4-stat-val' }, [
 						dot(up ? rttLevel(iface.rtt_ms) : 'muted', 'rtt-dot'),
 						E('span', { 'data-role': 'rtt' }, rttText(iface))
@@ -507,41 +494,58 @@ return view.extend({
 					])
 				]),
 				E('div', { 'class': 'mwan4-stat-item' }, [
-					E('span', { 'class': 'mwan4-stat-label' }, _('Priority / Weight')),
+					E('span', { 'class': 'mwan4-stat-label' }, _('Weight')),
 					E('span', { 'class': 'mwan4-stat-val' }, [
 						E('span', { 'data-role': 'pw' }, pwText(iface))
 					])
-				]),
-				E('div', { 'class': 'mwan4-stat-item mwan4-stat-wide' }, [
-					E('span', { 'class': 'mwan4-stat-label' }, _('Throughput (TX / RX)')),
-					E('span', { 'class': 'mwan4-stat-val mwan4-mono' }, [
-						E('span', { 'data-role': 'rate' }, rateText(iface))
-					])
 				])
 			]),
-			E('div', { 'class': 'mwan4-trend-wrap' }, [
-				E('span', { 'class': 'mwan4-trend-label' }, _('RTT Trend')),
-				trendEl(iface)
-			]),
-			E('div', { 'class': 'mwan4-loss-section' }, [
-				E('div', { 'class': 'mwan4-loss-header' }, [
-					E('span', {}, _('Sliding Window Packet Loss')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						dot(lossLevel(loss), 'loss-dot'),
-						E('b', { 'data-role': 'loss' }, lossText(iface))
-					])
+			E('div', { 'class': 'mwan4-rate-box' }, [
+				E('div', { 'class': 'mwan4-rate-row' }, [
+					E('span', { 'class': 'mwan4-rate-pair mwan4-mono' }, [
+						E('span', { 'data-role': 'rate-rx' }, '\u2193 ' + (up ? formatRate(iface.rx_bps) : '--')),
+						E('span', { 'class': 'mwan4-rate-sep' }, '/'),
+						E('span', { 'data-role': 'rate-tx' }, '\u2191 ' + (up ? formatRate(iface.tx_bps) : '--'))
+					]),
+					E('span', {
+						'class': 'mwan4-load-tag ' + (iface.offloaded ? 'warn' : ''),
+						'data-role': 'load-badge',
+						'style': hasLoad ? '' : 'display: none'
+					}, loadBadgeText(iface))
 				]),
-				E('div', { 'class': 'mwan4-meter' }, [
+				E('div', {
+					'class': 'mwan4-meter mwan4-meter-load',
+					'data-role': 'load-wrap',
+					'style': hasLoad ? '' : 'display: none'
+				}, [
 					E('i', {
-						'class': 'mwan4-meter-fill ' + lossLevel(loss),
-						'data-role': 'meter',
-						'style': 'width: ' + Math.min(100, Math.max(0, loss)) + '%;'
+						'class': 'mwan4-meter-fill ' + ldLevel,
+						'data-role': 'load-fill',
+						'style': 'width: ' + loadPct + '%;'
 					})
 				])
 			]),
+			E('div', { 'class': 'mwan4-trend-wrap' }, [
+				trendEl(iface)
+			]),
 			E('div', { 'class': 'mwan4-card-footer' }, [
-				E('span', { 'class': 'mwan4-chip', 'data-role': 'succ' }, succText(iface)),
-				E('span', { 'class': 'mwan4-chip', 'data-role': 'to' }, toText(iface))
+				E('div', { 'class': 'mwan4-loss-inline' }, [
+					E('span', { 'class': 'mwan4-loss-label' }, _('Loss')),
+					dot(lLevel, 'loss-dot'),
+					E('b', { 'class': 'mwan4-loss-val', 'data-role': 'loss' }, lossText(iface)),
+					E('div', { 'class': 'mwan4-meter mwan4-meter-sm' }, [
+						E('i', {
+							'class': 'mwan4-meter-fill ' + lLevel,
+							'data-role': 'meter',
+							'style': 'width: ' + Math.min(100, Math.max(0, loss)) + '%;'
+						})
+					])
+				]),
+				E('div', { 'class': 'mwan4-counters' }, [
+					E('span', { 'data-role': 'succ' }, succText(iface)),
+					E('span', { 'class': 'mwan4-counters-sep' }, '·'),
+					E('span', { 'data-role': 'to' }, toText(iface))
+				])
 			])
 		]);
 	},
@@ -570,11 +574,16 @@ return view.extend({
 
 	updateCard: function(card, iface, fresh) {
 		var up = iface.state === 'UP';
+		var sLevel = stateLevel(iface);
 		var loss = iface.loss_rate || 0;
 		var lLevel = lossLevel(loss);
+		var hasLoad = up && iface.load_pct !== undefined && iface.load_pct !== null;
+		var loadPct = hasLoad ? Math.min(100, Math.max(0, iface.load_pct)) : 0;
 
+		setText(pick(card, 'ip'), iface.ip ? iface.ip : _('(No IP)'));
 		setText(pick(card, 'state-text'), stateText(iface));
-		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + (up ? (iface.degraded ? 'warn' : 'ok') : 'bad'));
+		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + sLevel);
+		setCls(pick(card, 'state-pill'), 'mwan4-pill mwan4-pill-' + sLevel);
 
 		var alert = cardAlert(iface, fresh);
 		var alertEl = pick(card, 'alert');
@@ -591,6 +600,20 @@ return view.extend({
 		setText(pick(card, 'gw'), iface.gateway);
 		setText(pick(card, 'pw'), pwText(iface));
 
+		setText(pick(card, 'rate-rx'), '\u2193 ' + (up ? formatRate(iface.rx_bps) : '--'));
+		setText(pick(card, 'rate-tx'), '\u2191 ' + (up ? formatRate(iface.tx_bps) : '--'));
+
+		var loadBadge = pick(card, 'load-badge');
+		if (loadBadge) {
+			setText(loadBadge, loadBadgeText(iface));
+			setCls(loadBadge, 'mwan4-load-tag ' + (iface.offloaded ? 'warn' : ''));
+			loadBadge.style.display = hasLoad ? '' : 'none';
+		}
+		var loadWrap = pick(card, 'load-wrap');
+		if (loadWrap) loadWrap.style.display = hasLoad ? '' : 'none';
+		setCls(pick(card, 'load-fill'), 'mwan4-meter-fill ' + loadLevel(loadPct));
+		setW(pick(card, 'load-fill'), loadPct + '%');
+
 		var trend = pick(card, 'trend');
 		if (trend) updateTrend(trend, iface);
 
@@ -601,36 +624,46 @@ return view.extend({
 
 		setText(pick(card, 'succ'), succText(iface));
 		setText(pick(card, 'to'), toText(iface));
-		setText(pick(card, 'rate'), rateText(iface));
 	},
 
 	applyStatus: function(statusData) {
 		this.recordTrend(statusData);
 		var fresh = freshnessOf(statusData);
+		var rLevel = runLevel(fresh);
 		var ws = wanSummary(statusData);
 		var header = document.getElementById('mwan4_header_container');
 		if (header) {
 			var ri = routeInfo(statusData);
 			setText(pick(header, 'run-text'), runText(fresh));
-			setCls(pick(header, 'run-dot'), 'mwan4-dot ' + runLevel(fresh));
+			setCls(pick(header, 'run-dot'), 'mwan4-dot ' + rLevel);
+			setCls(pick(header, 'run-pill'), 'mwan4-pill mwan4-pill-' + rLevel);
+
 			setText(pick(header, 'wan-text'), ws.text);
 			setCls(pick(header, 'wan-dot'), 'mwan4-dot ' + ws.level);
-			setText(pick(header, 'agg-text'),
-				'\u2191 ' + formatRate(ws.tx) + '  \u2193 ' + formatRate(ws.rx));
+			setText(pick(header, 'agg-rx'), '\u2193 ' + formatRate(ws.rx));
+			setText(pick(header, 'agg-tx'), '\u2191 ' + formatRate(ws.tx));
+
 			setText(pick(header, 'route-text'), ri.text);
 			setCls(pick(header, 'route-dot'), 'mwan4-dot ' + ri.level);
+			setTitle(pick(header, 'route-wrap'), ri.title);
+
 			setText(pick(header, 'age-text'), statusAgeText(statusData));
+
 			var pt = policyText(statusData);
 			var policyItem = pick(header, 'policy-item');
 			if (policyItem) policyItem.style.display = pt ? '' : 'none';
 			setText(pick(header, 'policy-text'), pt || '');
+
 			var dt = dnsText(statusData);
 			var dnsItem = pick(header, 'dns-item');
 			if (dnsItem) dnsItem.style.display = dt ? '' : 'none';
 			setText(pick(header, 'dns-text'), dt || '');
+
 			var hi = hashInfo(statusData);
 			setText(pick(header, 'hash-text'), hi.text);
 			setCls(pick(header, 'hash-dot'), 'mwan4-dot ' + hi.level);
+			setCls(pick(header, 'hash-pill'), 'mwan4-pill mwan4-pill-' + hi.level);
+			setTitle(pick(header, 'hash-pill'), hi.title);
 		}
 
 		var container = document.getElementById('mwan4_cards_container');
@@ -639,7 +672,6 @@ return view.extend({
 		var list = (statusData && statusData.interfaces) ? statusData.interfaces : [];
 		var sig = list.map(function(iface) { return iface.name; }).join(',');
 
-		// 介面集合没变就只更新数值，避免轮询时整页闪动
 		if (container.getAttribute('data-sig') !== sig) {
 			container.parentNode.replaceChild(this.cardsContainer(statusData), container);
 			return;
@@ -652,8 +684,6 @@ return view.extend({
 	},
 
 	updateDashboard: function() {
-		// LuCI 的 view 没有卸载回调，让轮询自己退出：view 不在 document 里就不再入列。
-		// 给两次宽限，因为 poll.add() 跑在 form promise 解析之前。
 		if (this.viewRoot && this.viewRoot.isConnected) {
 			this.pollMisses = 0;
 		} else if (++this.pollMisses >= 3) {
@@ -676,33 +706,45 @@ return view.extend({
 
 		var styleNode = E('style', {}, `
 			.mwan4-view {
-				--mw-fg: #2f3337;
-				--mw-muted: #8a8f98;
-				--mw-line: rgba(0, 0, 0, 0.11);
-				--mw-line-strong: rgba(0, 0, 0, 0.20);
-				--mw-surface: rgba(0, 0, 0, 0.018);
-				--mw-surface-2: rgba(0, 0, 0, 0.04);
-				--mw-track: rgba(0, 0, 0, 0.08);
-				--mw-ok: #35a06a;
-				--mw-warn: #c9821f;
-				--mw-bad: #cf4436;
-				--mw-info: #5b7fb9;
-				--mw-radius: 8px;
+				--mw-fg: #1f2937;
+				--mw-muted: #6b7280;
+				--mw-line: rgba(15, 23, 42, 0.09);
+				--mw-line-strong: rgba(15, 23, 42, 0.16);
+				--mw-surface: rgba(255, 255, 255, 0.72);
+				--mw-surface-2: rgba(15, 23, 42, 0.035);
+				--mw-track: rgba(15, 23, 42, 0.08);
+				--mw-ok: #10b981;
+				--mw-ok-bg: rgba(16, 185, 129, 0.12);
+				--mw-warn: #f59e0b;
+				--mw-warn-bg: rgba(245, 158, 11, 0.13);
+				--mw-bad: #ef4444;
+				--mw-bad-bg: rgba(239, 68, 68, 0.12);
+				--mw-info: #3b82f6;
+				--mw-info-bg: rgba(59, 130, 246, 0.12);
+				--mw-radius: 10px;
+				--mw-shadow: 0 1px 3px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.02);
+				--mw-shadow-hover: 0 8px 20px rgba(15, 23, 42, 0.07);
 			}
 
 			@media (prefers-color-scheme: dark) {
 				.mwan4-view {
-					--mw-fg: #d6d6d6;
-					--mw-muted: #8b8f96;
-					--mw-line: rgba(255, 255, 255, 0.13);
-					--mw-line-strong: rgba(255, 255, 255, 0.24);
-					--mw-surface: rgba(255, 255, 255, 0.03);
+					--mw-fg: #e5e7eb;
+					--mw-muted: #9ca3af;
+					--mw-line: rgba(255, 255, 255, 0.10);
+					--mw-line-strong: rgba(255, 255, 255, 0.18);
+					--mw-surface: rgba(255, 255, 255, 0.035);
 					--mw-surface-2: rgba(255, 255, 255, 0.06);
-					--mw-track: rgba(255, 255, 255, 0.12);
-					--mw-ok: #4cb87c;
-					--mw-warn: #d69a3a;
-					--mw-bad: #e0685a;
-					--mw-info: #7d9fd0;
+					--mw-track: rgba(255, 255, 255, 0.11);
+					--mw-ok: #34d399;
+					--mw-ok-bg: rgba(52, 211, 153, 0.15);
+					--mw-warn: #fbbf24;
+					--mw-warn-bg: rgba(251, 191, 36, 0.15);
+					--mw-bad: #f87171;
+					--mw-bad-bg: rgba(248, 113, 113, 0.15);
+					--mw-info: #60a5fa;
+					--mw-info-bg: rgba(96, 165, 250, 0.15);
+					--mw-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+					--mw-shadow-hover: 0 8px 22px rgba(0, 0, 0, 0.35);
 				}
 			}
 
@@ -710,17 +752,23 @@ return view.extend({
 			html[data-theme="dark"] .mwan4-view,
 			body.dark .mwan4-view,
 			.dark .mwan4-view {
-				--mw-fg: #d6d6d6 !important;
-				--mw-muted: #8b8f96 !important;
-				--mw-line: rgba(255, 255, 255, 0.13) !important;
-				--mw-line-strong: rgba(255, 255, 255, 0.24) !important;
-				--mw-surface: rgba(255, 255, 255, 0.03) !important;
+				--mw-fg: #e5e7eb !important;
+				--mw-muted: #9ca3af !important;
+				--mw-line: rgba(255, 255, 255, 0.10) !important;
+				--mw-line-strong: rgba(255, 255, 255, 0.18) !important;
+				--mw-surface: rgba(255, 255, 255, 0.035) !important;
 				--mw-surface-2: rgba(255, 255, 255, 0.06) !important;
-				--mw-track: rgba(255, 255, 255, 0.12) !important;
-				--mw-ok: #4cb87c !important;
-				--mw-warn: #d69a3a !important;
-				--mw-bad: #e0685a !important;
-				--mw-info: #7d9fd0 !important;
+				--mw-track: rgba(255, 255, 255, 0.11) !important;
+				--mw-ok: #34d399 !important;
+				--mw-ok-bg: rgba(52, 211, 153, 0.15) !important;
+				--mw-warn: #fbbf24 !important;
+				--mw-warn-bg: rgba(251, 191, 36, 0.15) !important;
+				--mw-bad: #f87171 !important;
+				--mw-bad-bg: rgba(248, 113, 113, 0.15) !important;
+				--mw-info: #60a5fa !important;
+				--mw-info-bg: rgba(96, 165, 250, 0.15) !important;
+				--mw-shadow: 0 1px 3px rgba(0, 0, 0, 0.25) !important;
+				--mw-shadow-hover: 0 8px 22px rgba(0, 0, 0, 0.35) !important;
 			}
 
 			.mwan4-dot {
@@ -731,51 +779,56 @@ return view.extend({
 				background: var(--mw-muted);
 				flex: 0 0 auto;
 			}
-			.mwan4-dot.ok    { background: var(--mw-ok); }
-			.mwan4-dot.warn  { background: var(--mw-warn); }
-			.mwan4-dot.bad   { background: var(--mw-bad); }
-			.mwan4-dot.info  { background: var(--mw-info); }
+			.mwan4-dot.ok    { background: var(--mw-ok); box-shadow: 0 0 0 2px var(--mw-ok-bg); }
+			.mwan4-dot.warn  { background: var(--mw-warn); box-shadow: 0 0 0 2px var(--mw-warn-bg); }
+			.mwan4-dot.bad   { background: var(--mw-bad); box-shadow: 0 0 0 2px var(--mw-bad-bg); }
+			.mwan4-dot.info  { background: var(--mw-info); box-shadow: 0 0 0 2px var(--mw-info-bg); }
 			.mwan4-dot.muted { background: var(--mw-muted); opacity: .55; }
 
-			.mwan4-badge {
+			.mwan4-pill {
 				display: inline-flex;
 				align-items: center;
 				gap: 6px;
-				font-size: 12.5px;
+				padding: 3px 10px;
+				border-radius: 999px;
+				font-size: 12px;
 				font-weight: 600;
 				color: var(--mw-fg);
+				background: var(--mw-surface-2);
+				border: 1px solid var(--mw-line);
 				white-space: nowrap;
 				line-height: 1.4;
 			}
+			.mwan4-pill-ok   { background: var(--mw-ok-bg); border-color: transparent; color: var(--mw-ok); }
+			.mwan4-pill-warn { background: var(--mw-warn-bg); border-color: transparent; color: var(--mw-warn); }
+			.mwan4-pill-bad  { background: var(--mw-bad-bg); border-color: transparent; color: var(--mw-bad); }
+			.mwan4-pill-key  { color: var(--mw-muted); font-weight: 500; }
 
-			/* ---- 页首 ---- */
+			/* ---- Header ---- */
 			.mwan4-header {
 				display: flex;
 				justify-content: space-between;
 				align-items: center;
 				flex-wrap: wrap;
-				gap: 12px 24px;
-				padding: 14px 16px;
+				gap: 10px 16px;
+				padding: 12px 16px;
 				margin-bottom: 12px;
 				background: var(--mw-surface);
 				border: 1px solid var(--mw-line);
 				border-radius: var(--mw-radius);
+				box-shadow: var(--mw-shadow);
 			}
 			.mwan4-brand {
 				display: flex;
-				flex-direction: column;
-				gap: 2px;
+				align-items: center;
+				gap: 10px;
 				min-width: 0;
 			}
 			.mwan4-title {
 				font-size: 16px;
-				font-weight: 650;
-				letter-spacing: .2px;
+				font-weight: 700;
+				letter-spacing: .1px;
 				color: var(--mw-fg);
-			}
-			.mwan4-sub {
-				font-size: 11.5px;
-				color: var(--mw-muted);
 			}
 			.mwan4-meta {
 				display: flex;
@@ -783,39 +836,34 @@ return view.extend({
 				flex-wrap: wrap;
 				gap: 8px;
 			}
-			.mwan4-meta-item {
-				display: inline-flex;
-				align-items: center;
-				gap: 7px;
-				padding: 4px 10px;
-				font-size: 12px;
-				background: var(--mw-surface-2);
-				border: 1px solid var(--mw-line);
-				border-radius: 999px;
-			}
-			.mwan4-meta-key {
+			.mwan4-age {
+				font-size: 11.5px;
 				color: var(--mw-muted);
+				font-variant-numeric: tabular-nums;
+				padding-left: 2px;
 			}
 
-			/* ---- 概况砖 ---- */
+			/* ---- KPI Tiles ---- */
 			.mwan4-summary {
-				display: flex;
-				flex-wrap: wrap;
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
 				gap: 10px;
 				margin-bottom: 16px;
 			}
 			.mwan4-tile {
-				flex: 1 1 170px;
 				display: flex;
 				flex-direction: column;
-				gap: 3px;
-				padding: 10px 14px;
+				gap: 4px;
+				padding: 12px 14px;
 				background: var(--mw-surface);
 				border: 1px solid var(--mw-line);
 				border-radius: var(--mw-radius);
+				box-shadow: var(--mw-shadow);
+				min-width: 0;
 			}
 			.mwan4-tile-key {
 				font-size: 11.5px;
+				font-weight: 500;
 				color: var(--mw-muted);
 			}
 			.mwan4-tile-val {
@@ -823,35 +871,43 @@ return view.extend({
 				align-items: center;
 				gap: 8px;
 				font-size: 17px;
-				font-weight: 650;
+				font-weight: 700;
 				color: var(--mw-fg);
 				font-variant-numeric: tabular-nums;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.mwan4-tile-val-sm {
+				font-size: 14px;
+				font-weight: 650;
 			}
 
-			/* ---- 卡片 ---- */
+			/* ---- WAN Cards ---- */
 			.mwan4-cards-grid {
 				display: grid;
-				grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+				grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 				gap: 14px;
-				margin-bottom: 24px;
+				margin-bottom: 22px;
 			}
 			.mwan4-card {
 				margin: 0 !important;
-				padding: 16px 18px !important;
+				padding: 15px 17px !important;
 				background: var(--mw-surface) !important;
 				border: 1px solid var(--mw-line) !important;
-				border-left: 3px solid var(--mw-ok) !important;
+				border-top: 3px solid var(--mw-ok) !important;
 				border-radius: var(--mw-radius) !important;
-				box-shadow: none !important;
+				box-shadow: var(--mw-shadow) !important;
 				color: var(--mw-fg) !important;
-				transition: box-shadow .15s ease, border-color .15s ease;
+				transition: box-shadow .18s ease, transform .18s ease, border-color .18s ease;
 			}
 			.mwan4-card:hover {
-				box-shadow: 0 4px 16px rgba(0, 0, 0, 0.09) !important;
+				box-shadow: var(--mw-shadow-hover) !important;
+				transform: translateY(-1px);
 			}
-			.mwan4-card-down     { border-left-color: var(--mw-bad) !important; }
-			.mwan4-card-degraded { border-left-color: var(--mw-warn) !important; }
-			.mwan4-card-local    { border-left-color: var(--mw-warn) !important; }
+			.mwan4-card-down     { border-top-color: var(--mw-bad) !important; }
+			.mwan4-card-degraded { border-top-color: var(--mw-warn) !important; }
+			.mwan4-card-local    { border-top-color: var(--mw-warn) !important; }
 			.mwan4-card-stale {
 				border-style: dashed !important;
 				opacity: .78;
@@ -867,70 +923,64 @@ return view.extend({
 			}
 			.mwan4-card-id {
 				display: flex;
-				align-items: baseline;
+				align-items: center;
 				gap: 8px;
 				min-width: 0;
 				overflow: hidden;
 				white-space: nowrap;
 			}
 			.mwan4-card-title {
-				font-size: 15px;
-				font-weight: 650;
+				font-size: 15.5px;
+				font-weight: 700;
 				color: var(--mw-fg);
 			}
 			.mwan4-card-ip {
 				color: var(--mw-muted);
-				font-size: 12px;
-				font-family: monospace;
+				font-size: 11.5px;
+				font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+				padding: 1px 6px;
+				border-radius: 4px;
+				background: var(--mw-surface-2);
 				overflow: hidden;
 				text-overflow: ellipsis;
 			}
-			.mwan4-badge-state {
-				padding: 3px 9px;
-				border-radius: 999px;
-				background: var(--mw-surface-2);
-				font-size: 11.5px;
-			}
 			.mwan4-card-alert {
-				margin: 0 0 10px 0;
-				padding: 6px 9px;
-				border-radius: 4px;
-				background: var(--mw-surface-2);
-				border-left: 3px solid var(--mw-warn);
-				color: var(--mw-muted);
+				margin: 0 0 11px 0;
+				padding: 6px 10px;
+				border-radius: 6px;
+				background: var(--mw-warn-bg);
+				color: var(--mw-fg);
 				font-size: 11.5px;
 				line-height: 1.45;
 				word-break: break-word;
 			}
-			.mwan4-card-stale .mwan4-card-alert {
-				border-left-color: var(--mw-bad);
+			.mwan4-card-stale .mwan4-card-alert,
+			.mwan4-card-down .mwan4-card-alert {
+				background: var(--mw-bad-bg);
 			}
 
 			.mwan4-stats-grid {
 				display: grid;
-				grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
-				gap: 12px 14px;
-				margin-bottom: 10px;
+				grid-template-columns: repeat(4, minmax(0, 1fr));
+				gap: 10px;
+				margin-bottom: 12px;
 			}
 			.mwan4-stat-item {
 				display: flex;
 				flex-direction: column;
 				min-width: 0;
 			}
-			.mwan4-stat-wide {
-				grid-column: 1 / -1;
-			}
 			.mwan4-stat-label {
 				color: var(--mw-muted);
-				font-size: 11.5px;
-				margin-bottom: 3px;
+				font-size: 11px;
+				margin-bottom: 2px;
 			}
 			.mwan4-stat-val {
 				display: inline-flex;
 				align-items: center;
-				gap: 6px;
-				font-size: 15px;
-				font-weight: 600;
+				gap: 5px;
+				font-size: 13.5px;
+				font-weight: 650;
 				color: var(--mw-fg);
 				font-variant-numeric: tabular-nums;
 				min-width: 0;
@@ -939,68 +989,95 @@ return view.extend({
 				white-space: nowrap;
 			}
 			.mwan4-mono {
-				font-family: monospace;
-				font-size: 13px;
-				font-weight: 500;
+				font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+				font-size: 12.5px;
+				font-weight: 550;
 			}
 			.mwan4-tile-val.mwan4-mono {
-				font-size: 15px;
+				font-size: 15.5px;
+				font-weight: 700;
 			}
 
-			/* ---- RTT 趋势 ---- */
-			.mwan4-trend-wrap {
-				margin: 10px 0 2px 0;
+			/* ---- Throughput & Load ---- */
+			.mwan4-rate-box {
+				padding: 8px 10px;
+				margin-bottom: 10px;
+				border-radius: 7px;
+				background: var(--mw-surface-2);
 			}
-			.mwan4-trend-label {
-				display: block;
-				font-size: 11.5px;
+			.mwan4-rate-row {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				gap: 8px;
+			}
+			.mwan4-rate-pair {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+				color: var(--mw-fg);
+				font-size: 12.5px;
+				font-variant-numeric: tabular-nums;
+			}
+			.mwan4-rate-sep {
 				color: var(--mw-muted);
-				margin-bottom: 4px;
+				opacity: .6;
+			}
+			.mwan4-load-tag {
+				font-size: 11px;
+				font-weight: 600;
+				color: var(--mw-muted);
+				font-variant-numeric: tabular-nums;
+			}
+			.mwan4-load-tag.warn {
+				color: var(--mw-warn);
+			}
+			.mwan4-meter-load {
+				margin-top: 6px;
+			}
+
+			/* ---- RTT Sparkline ---- */
+			.mwan4-trend-wrap {
+				margin: 4px 0 10px 0;
 			}
 			.mwan4-trend {
 				display: flex;
 				align-items: flex-end;
-				gap: 1px;
-				height: 34px;
+				gap: 1.5px;
+				height: 30px;
+				padding-bottom: 1px;
 				border-bottom: 1px solid var(--mw-line);
 			}
 			.mwan4-trend-bar {
 				flex: 1 1 0;
 				min-width: 0;
 				height: 0;
-				border-radius: 1px 1px 0 0;
+				border-radius: 2px 2px 0 0;
 				background: var(--mw-muted);
 				opacity: .35;
-				transition: height .35s ease;
+				transition: height .3s ease;
 			}
-			.mwan4-trend-bar.ok   { background: var(--mw-ok); opacity: .8; }
-			.mwan4-trend-bar.warn { background: var(--mw-warn); opacity: .9; }
-			.mwan4-trend-bar.bad  { background: var(--mw-bad); opacity: .9; }
-			.mwan4-trend-bar.empty { background: var(--mw-line-strong); opacity: .25; }
+			.mwan4-trend-bar.ok    { background: var(--mw-ok); opacity: .82; }
+			.mwan4-trend-bar.warn  { background: var(--mw-warn); opacity: .9; }
+			.mwan4-trend-bar.bad   { background: var(--mw-bad); opacity: .9; }
+			.mwan4-trend-bar.empty { background: var(--mw-line-strong); opacity: .22; }
 
-			/* ---- 丢包条 ---- */
-			.mwan4-loss-section {
-				margin-top: 12px;
-			}
-			.mwan4-loss-header {
-				display: flex;
-				justify-content: space-between;
-				align-items: center;
-				font-size: 11.5px;
-				color: var(--mw-muted);
-				margin-bottom: 6px;
-			}
+			/* ---- Meters & Footer ---- */
 			.mwan4-meter {
 				width: 100%;
-				height: 5px;
+				height: 4px;
 				background: var(--mw-track);
-				border-radius: 3px;
+				border-radius: 999px;
 				overflow: hidden;
+			}
+			.mwan4-meter-sm {
+				width: 56px;
+				flex: 0 0 auto;
 			}
 			.mwan4-meter-fill {
 				display: block;
 				height: 100%;
-				border-radius: 3px;
+				border-radius: 999px;
 				background: var(--mw-muted);
 				transition: width .3s ease;
 			}
@@ -1009,34 +1086,61 @@ return view.extend({
 			.mwan4-meter-fill.bad  { background: var(--mw-bad); }
 
 			.mwan4-card-footer {
-				margin-top: 12px;
-				padding-top: 10px;
-				border-top: 1px solid var(--mw-line);
 				display: flex;
-				flex-wrap: wrap;
-				gap: 8px;
-			}
-			.mwan4-chip {
-				padding: 2px 8px;
-				border-radius: 999px;
-				background: var(--mw-surface-2);
-				border: 1px solid var(--mw-line);
-				font-size: 11px;
+				justify-content: space-between;
+				align-items: center;
+				gap: 10px;
+				font-size: 11.5px;
 				color: var(--mw-muted);
 				font-variant-numeric: tabular-nums;
+			}
+			.mwan4-loss-inline {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+			}
+			.mwan4-loss-label {
+				color: var(--mw-muted);
+			}
+			.mwan4-loss-val {
+				color: var(--mw-fg);
+				font-weight: 600;
+			}
+			.mwan4-counters {
+				display: inline-flex;
+				align-items: center;
+				gap: 5px;
+			}
+			.mwan4-counters-sep {
+				opacity: .5;
 			}
 
 			.mwan4-empty {
 				grid-column: 1 / -1;
-				padding: 18px 16px;
-				border: 1px dashed var(--mw-line);
+				padding: 20px 16px;
+				border: 1px dashed var(--mw-line-strong);
 				border-radius: var(--mw-radius);
 				color: var(--mw-muted);
 				font-size: 13px;
 				text-align: center;
 			}
 
-			/* ---- WAN Interfaces / Policy 表格 ---- */
+			/* ---- LuCI Form Polish ---- */
+			.mwan4-view .cbi-map > h2 {
+				font-size: 16px;
+				font-weight: 700;
+				margin-bottom: 12px;
+			}
+			.mwan4-view .cbi-section {
+				border-radius: var(--mw-radius);
+				border: 1px solid var(--mw-line);
+				box-shadow: var(--mw-shadow);
+				margin-bottom: 16px;
+			}
+			.mwan4-view .cbi-section > h3 {
+				font-size: 14px;
+				font-weight: 650;
+			}
 			.mwan4-view .cbi-section-node {
 				overflow-x: auto;
 			}
@@ -1046,7 +1150,7 @@ return view.extend({
 			}
 			.mwan4-view table.cbi-section-table th,
 			.mwan4-view table.cbi-section-table td {
-				padding: 3px 6px !important;
+				padding: 4px 7px !important;
 				font-size: 12.5px !important;
 				line-height: 1.35 !important;
 				vertical-align: middle !important;
@@ -1074,10 +1178,10 @@ return view.extend({
 				width: 100% !important;
 				min-width: 0 !important;
 				height: auto !important;
-				min-height: 24px !important;
-				padding: 2px 6px !important;
+				min-height: 26px !important;
+				padding: 2px 7px !important;
 				font-size: 12.5px !important;
-				border-radius: 3px !important;
+				border-radius: 5px !important;
 				box-shadow: none !important;
 			}
 			.mwan4-view table.cbi-section-table .cbi-dynlist {
@@ -1091,8 +1195,9 @@ return view.extend({
 			}
 			.mwan4-view table.cbi-section-table .cbi-button {
 				min-height: 0 !important;
-				padding: 2px 8px !important;
+				padding: 2px 9px !important;
 				font-size: 12px !important;
+				border-radius: 5px !important;
 			}
 			.mwan4-view input[id$="-name"],
 			.mwan4-view select[id$="-name"] {
@@ -1105,18 +1210,18 @@ return view.extend({
 			@media (max-width: 768px) {
 				.mwan4-header { align-items: flex-start; }
 				.mwan4-cards-grid { grid-template-columns: 1fr; }
+				.mwan4-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 			}
 
-			/* 滚动条跟随主题，且只作用在本页 */
 			.mwan4-view * {
 				scrollbar-width: thin;
 				scrollbar-color: var(--mw-line-strong) transparent;
 			}
-			.mwan4-view ::-webkit-scrollbar { width: 10px; height: 10px; }
+			.mwan4-view ::-webkit-scrollbar { width: 8px; height: 8px; }
 			.mwan4-view ::-webkit-scrollbar-track { background: transparent; }
 			.mwan4-view ::-webkit-scrollbar-thumb {
 				background: var(--mw-line-strong);
-				border-radius: 5px;
+				border-radius: 4px;
 			}
 		`);
 
@@ -1131,7 +1236,6 @@ return view.extend({
 		this.viewRoot = viewRoot;
 		this.pollMisses = 0;
 		this.pollFn = this.updateDashboard.bind(this);
-		// 与 LuCI 全域预设一致的 5 秒轮询（daemon 每秒写一次状态档）
 		poll.add(this.pollFn, 5);
 
 		m = new form.Map('mwan4', _('MWAN4 Configuration'));
@@ -1141,121 +1245,131 @@ return view.extend({
 		s.tab('dns', _('DNS'));
 		s.tab('advanced', _('Advanced'));
 
-		o = s.taboption('basic', form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
+		o = s.taboption('basic', form.Flag, 'enabled', _('Enable Service'));
 		o.default = o.enabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'));
-		o.value('auto', _('Automatic (resilient when supported)'));
-		o.value('standard', _('Standard ECMP (multipath route)'));
-		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
+		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Routing Mode'));
+		o.value('auto', _('Auto'));
+		o.value('standard', _('Standard ECMP'));
+		o.value('resilient', _('Resilient Nexthop'));
 		o.default = 'auto';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.ListValue, 'weight_mode', _('Weight Mode'));
+		o.value('static', _('Static'));
+		o.value('quality', _('Quality-aware'));
+		o.value('aggregate', _('Smart Aggregate'));
+		o.default = 'static';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'));
 		o.datatype = 'uinteger';
-		o.default = '500';
+		o.default = '1000';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'));
 		o.datatype = 'uinteger';
-		o.default = '400';
+		o.default = '800';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'));
+		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Failure Threshold'));
+		o.datatype = 'uinteger';
+		o.default = '4';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Threshold'));
 		o.datatype = 'uinteger';
 		o.default = '3';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'));
-		o.datatype = 'uinteger';
-		o.default = '5';
-		o.rmempty = false;
-
-		o = s.taboption('dns', form.ListValue, 'probe_mode', _('Health Probe Protocol'));
-		o.value('tcp', _('TCP SYN (default)'));
-		o.value('dns', _('DNS Query (UDP)'));
+		o = s.taboption('dns', form.ListValue, 'probe_mode', _('Probe Protocol'));
+		o.value('tcp', _('TCP SYN'));
+		o.value('dns', _('DNS Query'));
 		o.default = 'tcp';
 		o.rmempty = false;
 
-		o = s.taboption('dns', form.Value, 'dns_probe_domain', _('DNS Probe Domain'));
+		o = s.taboption('dns', form.Value, 'dns_probe_domain', _('Probe Domain'));
 		o.default = 'baidu.com';
 		o.placeholder = 'baidu.com';
 		o.depends('probe_mode', 'dns');
 
-		o = s.taboption('dns', form.Value, 'dns_listen_port', _('DNS Forward Port (0 = Off)'));
+		o = s.taboption('dns', form.Value, 'dns_listen_port', _('Forward Port'));
 		o.datatype = 'range(0,65535)';
 		o.default = '0';
 		o.placeholder = '5354';
 		o.rmempty = false;
 
-		o = s.taboption('dns', form.Value, 'dns_listen_addr', _('DNS Listen Address'));
+		o = s.taboption('dns', form.Value, 'dns_listen_addr', _('Listen Address'));
 		o.datatype = 'ipaddr';
 		o.default = '127.0.0.1';
 		o.placeholder = '127.0.0.1';
 
-		o = s.taboption('dns', form.Value, 'dns_forward_timeout_ms', _('DNS Forward Timeout (ms)'));
+		o = s.taboption('dns', form.Value, 'dns_forward_timeout_ms', _('Forward Timeout (ms)'));
 		o.datatype = 'range(100,15000)';
 		o.default = '2000';
 
-		o = s.taboption('dns', form.Value, 'dns_resolv_file', _('Healthy DNS Export File (Optional)'));
+		o = s.taboption('dns', form.Value, 'dns_resolv_file', _('DNS Export File'));
 		o.placeholder = '/tmp/mwan4_resolv.conf';
 		o.rmempty = true;
 
-		o = s.taboption('advanced', form.Value, 'window_size', _('Sliding Window Size'));
+		o = s.taboption('advanced', form.Value, 'window_size', _('Window Size'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'loss_threshold_down', _('Packet Loss Threshold for DOWN'));
+		o = s.taboption('advanced', form.Value, 'loss_threshold_down', _('DOWN Loss Threshold'));
 		o.default = '0.5';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'max_rtt_ms', _('Maximum Allowed RTT (ms)'));
+		o = s.taboption('advanced', form.Value, 'max_rtt_ms', _('Max RTT (ms)'));
 		o.default = '1500';
 		o.rmempty = false;
 
 		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
-		o.default = '0.2';
+		o.default = '0';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'));
-		o.value('l4', _('L4 (addresses + ports, the default)'));
-		o.value('l3', _('L3 (addresses only)'));
-		o.value('inner', _('L3 + tunnel inner headers'));
+		o = s.taboption('advanced', form.Value, 'resilient_idle_timer_secs', _('Resilient Idle Timer (s)'));
+		o.datatype = 'range(1,3600)';
+		o.default = '30';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.Value, 'resilient_unbalanced_timer_secs', _('Resilient Rebalance Timer (s)'));
+		o.datatype = 'range(0,3600)';
+		o.default = '60';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Hash Policy'));
+		o.value('l4', _('L4 (Per-Connection)'));
+		o.value('l3', _('L3 (Per-IP)'));
+		o.value('inner', _('Inner (Tunnel)'));
 		o.default = 'l4';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.ListValue, 'weight_mode', _('ECMP Weight Mode'));
-		o.value('static', _('Static (configured weights)'));
-		o.value('quality', _('Quality-aware (dynamic)'));
-		o.value('aggregate', _('Aggregate spreading (headroom-aware)'));
-		o.default = 'static';
-		o.rmempty = false;
-
-		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Traffic Shifting'));
+		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Shifting'));
 		o.default = o.disabled;
+		o.depends('weight_mode', 'static');
+		o.depends('weight_mode', 'quality');
 
-		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms',
-			_('Dynamic Weight Update Interval (ms)'));
+		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms', _('Weight Update Interval (ms)'));
 		o.datatype = 'uinteger';
 		o.default = '10000';
 		o.depends('weight_mode', 'quality');
 		o.depends('weight_mode', 'aggregate');
 		o.depends('load_aware', '1');
 
-		o = s.taboption('advanced', form.Flag, 'allow_dynamic_weights_on_standard',
-			_('Allow Dynamic Weights on Standard ECMP'));
+		o = s.taboption('advanced', form.Flag, 'allow_dynamic_weights_on_standard', _('Dynamic Weights on Standard ECMP'));
 		o.default = o.disabled;
 		o.depends('ecmp_mode', 'standard');
 
 		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'));
 		o.default = o.enabled;
 
-		o = s.taboption('advanced', form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Active Set Change'));
+		o = s.taboption('advanced', form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Switch'));
 		o.default = o.enabled;
 
-		o = s.taboption('advanced', form.Flag, 'remove_routes_on_exit', _('Remove Default Route on Exit'));
+		o = s.taboption('advanced', form.Flag, 'remove_routes_on_exit', _('Remove Routes on Exit'));
 		o.default = o.disabled;
 
 		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'));
@@ -1266,7 +1380,7 @@ return view.extend({
 		o.default = o.enabled;
 		o.editable = true;
 
-		o = s.option(form.Value, 'name', _('Interface Name'));
+		o = s.option(form.Value, 'name', _('Interface'));
 		o.rmempty = false;
 		o.editable = true;
 		if (netdevs.length) {
@@ -1280,7 +1394,7 @@ return view.extend({
 			});
 		}
 
-		o = s.option(form.Value, 'gateway', _('Gateway IP'));
+		o = s.option(form.Value, 'gateway', _('Gateway'));
 		o.datatype = 'ip4addr';
 		o.placeholder = '0.0.0.0';
 		o.rmempty = true;
@@ -1291,60 +1405,60 @@ return view.extend({
 		o.rmempty = true;
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'metric', _('Metric (Priority)'));
+		o = s.option(form.Value, 'metric', _('Priority'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.editable = true;
 
-		o = s.option(form.Value, 'weight', _('ECMP Weight'));
+		o = s.option(form.Value, 'weight', _('Weight'));
 		o.datatype = 'uinteger';
 		o.default = '1';
 		o.editable = true;
 
-		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'));
+		o = s.option(form.Value, 'max_mbps', _('Bandwidth (Mbps)'));
 		o.datatype = 'ufloat';
 		o.editable = true;
 
-		o = s.option(form.Value, 'up_mbps', _('Up Capacity (Mbps)'));
+		o = s.option(form.Value, 'up_mbps', _('Uplink (Mbps)'));
 		o.datatype = 'ufloat';
 		o.modalonly = true;
 
-		o = s.option(form.ListValue, 'probe_mode', _('Probe Protocol Override'));
-		o.value('', _('Inherit global setting'));
-		o.value('tcp', _('TCP SYN (default)'));
-		o.value('dns', _('DNS Query (UDP)'));
+		o = s.option(form.ListValue, 'probe_mode', _('Probe Protocol'));
+		o.value('', _('Global Default'));
+		o.value('tcp', _('TCP SYN'));
+		o.value('dns', _('DNS Query'));
 		o.rmempty = true;
 		o.modalonly = true;
 
-		o = s.option(form.DynamicList, 'probe_targets', _('Probe Targets (IP:Port)'));
+		o = s.option(form.DynamicList, 'probe_targets', _('Probe Targets'));
 		o.datatype = 'ipaddrport(1)';
 		o.default = ['223.5.5.5:53', '114.114.114.114:53'];
 
-		o = s.option(form.DynamicList, 'dns_servers', _('Upstream DNS (IP[:Port])'));
+		o = s.option(form.DynamicList, 'dns_servers', _('Upstream DNS'));
 		o.placeholder = '202.96.128.86';
 		o.validate = validateDnsServer;
 		o.rmempty = true;
 
-		o = s.option(form.DynamicList, 'underlay_targets', _('Tunnel Underlay Peers (IPv4)'));
+		o = s.option(form.DynamicList, 'underlay_targets', _('Tunnel Peers'));
 		o.datatype = 'ip4addr';
 		o.rmempty = true;
 		o.modalonly = true;
 
-		s = m.section(form.GridSection, 'policy', _('Policy Routing (Source / Destination)'));
+		s = m.section(form.GridSection, 'policy', _('Policy Routing'));
 		s.addremove = true;
 		s.anonymous = false;
 		s.sortable = true;
 
-		o = s.option(form.Value, 'name', _('Rule Name'));
+		o = s.option(form.Value, 'name', _('Name'));
 		o.rmempty = false;
 		o.editable = true;
 
-		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'));
+		o = s.option(form.DynamicList, 'source', _('Source CIDR'));
 		o.datatype = 'cidr4';
 		o.placeholder = '192.168.3.0/24';
 		o.editable = true;
 
-		o = s.option(form.DynamicList, 'destination', _('Destination Prefixes (CIDR)'));
+		o = s.option(form.DynamicList, 'destination', _('Destination CIDR'));
 		o.datatype = 'cidr4';
 		o.editable = true;
 
@@ -1356,7 +1470,7 @@ return view.extend({
 			if (wanName) o.value(wanName, wanName);
 		});
 
-		o = s.option(form.Value, 'priority', _('Rule Priority'));
+		o = s.option(form.Value, 'priority', _('Priority'));
 		o.datatype = 'uinteger';
 		o.editable = true;
 

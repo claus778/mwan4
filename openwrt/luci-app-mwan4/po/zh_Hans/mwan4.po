@@ -6,343 +6,285 @@ msgstr "Content-Type: text/plain; charset=UTF-8\n"
 "MIME-Version: 1.0\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
+
 msgid "MWAN4 Load Balancing"
 msgstr "MWAN4 多路分流"
+
+msgid "MWAN4 Configuration"
+msgstr "MWAN4 配置"
+
+msgid "Global Settings"
+msgstr "全局设置"
+
 msgid "Basic"
 msgstr "基础"
-msgid "Advanced"
-msgstr "高级"
-msgid "Unknown"
-msgstr "未知"
-msgid "Running"
-msgstr "运行中"
-msgid "Stopped"
-msgstr "已停止"
-msgid "MWAN4 Multi-WAN Failover & Health Monitor"
-msgstr "MWAN4 多路故障转移与健康监控"
-msgid "Daemon:"
-msgstr "守护进程:"
-msgid "Kernel Default Route:"
-msgstr "内核默认路由:"
-msgid "No metrics available. Check that the MWAN4 service is running."
-msgstr "未获取到运行指标，请确认 MWAN4 服务已启动。"
-msgid "Online (UP)"
-msgstr "在线 (UP)"
-msgid "Offline (DOWN)"
-msgstr "离线 (DOWN)"
-msgid "(No IP)"
-msgstr "(无IP)"
-msgid "Realtime RTT"
-msgstr "实时 RTT (延迟)"
-msgid "Jitter"
-msgstr "网络抖动 (Jitter)"
-msgid "Gateway"
-msgstr "网关地址 (Gateway)"
-msgid "ECMP Weight"
-msgstr "ECMP 权重 (Weight)"
-msgid "Sliding Window Packet Loss"
-msgstr "滑动窗口丢包率"
-msgid "Consecutive Successes: "
-msgstr "连续成功: "
-msgid "Consecutive Timeouts: "
-msgstr "连续超时: "
-msgid "MWAN4 Configuration"
-msgstr "MWAN4 参数配置"
-msgid "Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon."
-msgstr "通过 UCI 配置多出口网卡与健康探针，保存并应用后重载守护进程。"
-msgid "Global Settings"
-msgstr "全局运行参数"
-msgid "Enable MWAN4 Daemon"
-msgstr "启用 MWAN4 守护进程"
-msgid "Probe Interval (ms)"
-msgstr "探测间隔 (毫秒)"
-msgid "Probe interval per interface (default: 500 ms)"
-msgstr "每个网卡的探测间隔（默认 500 ms）"
-msgid "Probe Timeout (ms)"
-msgstr "单次探测超时 (毫秒)"
-msgid "Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)"
-msgstr "探测无响应超过此时间判定为丢包（默认 400ms，不应大于探测周期）"
-msgid "Sliding Window Size"
-msgstr "滑动窗口长度"
-msgid "Number of probe samples to calculate loss rate and smoothed RTT (default: 10)"
-msgstr "用于计算丢包率与平滑 RTT 的样本数（默认 10）"
-msgid "Consecutive Failures for DOWN"
-msgstr "断线触发超时次数"
-msgid "Consecutive probe timeouts before interface is marked DOWN (default: 3)"
-msgstr "连续超时达到此数值直接判定线路为 DOWN（默认 3 次）"
-msgid "Recovery Success Count (Hysteresis)"
-msgstr "防震荡恢复次数 (Hysteresis)"
-msgid "Consecutive successful probes with normal RTT required before recovering to UP (default: 5)"
-msgstr "线路断开后需连续成功此数值且 RTT 正常才恢复为 UP（默认 5 次）"
-msgid "Flush Conntrack on DOWN"
-msgstr "掉线自动清理 Conntrack"
-msgid "Flush TCP/UDP connections on an interface when it goes down."
-msgstr "网卡掉线时清理该链路上的 TCP/UDP 连接。"
-msgid "WAN Interfaces"
-msgstr "WAN 网卡接口列表"
-msgid "Gateway, ECMP weight and probe targets for each WAN interface."
-msgstr "每个出口网卡的网关、ECMP 权重与探测目标。"
-msgid "Enable"
-msgstr "启用"
-msgid "Interface Name"
-msgstr "网卡名称"
-msgid "Gateway IP"
-msgstr "网关 IP (Gateway)"
-msgid "Probe Targets (IP:Port)"
-msgstr "探测目标 (IP:Port)"
-msgid "MWAN4 configuration saved and applied."
-msgstr "MWAN4 配置已保存并重新载入。"
-msgid "Priority / Weight"
-msgstr "优先级 / 权重"
-msgid "Metric (Priority)"
-msgstr "跃点优先级 (Metric)"
-msgid "Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover."
-msgstr "数值越小优先级越高；metric 相同走 ECMP 负载均衡（多流分流），不同则走主备故障转移。"
-msgid "ECMP weight for interfaces with the same metric."
-msgstr "同一 metric 网卡之间的流量分配权重。"
-msgid "Multi-WAN Routing Mode"
-msgstr "多线路由模式 (ECMP)"
-msgid "standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+)."
-msgstr "standard 只有一条 multipath 路由，链路变化会重新哈希、可能打断既有连接；resilient 只重映射故障链路（需 Linux 5.14+）。"
-msgid "Standard ECMP (multipath route)"
-msgstr "标准 ECMP（多路径路由）"
-msgid "Automatic (resilient when supported)"
-msgstr "自动（内核支持时使用弹性模式）"
-msgid "Resilient nexthop group (require kernel support)"
-msgstr "弹性 nexthop 组（需内核支持）"
-msgid "Throughput (TX / RX)"
-msgstr "实时吞吐 (发送 / 接收)"
-msgid " (inactive)"
-msgstr "（未生效）"
-msgid "Policy Routing:"
-msgstr "策略分流："
-msgid "Multipath Hash Policy"
-msgstr "多路径哈希策略"
-msgid "Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start."
-msgstr "内核 fib_multipath_hash_policy。l4（多数系统默认）同时哈希端口，分流最均匀；l3 只哈希地址；inner 还会使用隧道内层头。启动时写入。"
-msgid "L3 (addresses only)"
-msgstr "L3（仅地址）"
-msgid "L4 (addresses + ports, the default)"
-msgstr "L4（地址 + 端口，默认）"
-msgid "L3 + tunnel inner headers"
-msgstr "L3 + 隧道内层头"
-msgid "ECMP Weight Mode"
-msgstr "ECMP 权重模式"
-msgid "quality adjusts each active WAN weight from measured loss and RTT (rate-limited, may rehash flows); static keeps the configured weights."
-msgstr "quality 依据实测丢包与 RTT 动态调整各线路权重（有限速，可能触发重哈希）；static 使用配置的固定权重。"
-msgid "Static (configured weights)"
-msgstr "静态（使用配置权重）"
-msgid "Quality-aware (dynamic)"
-msgstr "质量感知（动态）"
-msgid "Dynamic Weight Update Interval (ms)"
-msgstr "动态权重更新间隔（毫秒）"
-msgid "Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route."
-msgstr "两次动态权重更新之间的最小间隔（默认 10000 毫秒）。每次更新都会重新下发 ECMP 路由。"
-msgid "Load-aware Traffic Shifting"
-msgstr "负载感知流量转移"
-msgid "When a WAN utilisation (measured tx/rx against its max_mbps/up_mbps) exceeds the target ratio, lower its ECMP weight so part of the flows move to the idle WANs. Rate-limited by the update interval above; every interface then needs max_mbps."
-msgstr "当某条 WAN 的利用率（按实测 tx/rx 与该接口的 max_mbps/up_mbps 计算）超过目标比例时，下修其 ECMP 权重，把部分 flow 转移到空闲的 WAN。更新节流沿用上面的间隔；启用后每条 interface 都必须填 max_mbps。"
-msgid "Utilisation at or above which a WAN starts shedding weight (default: 0.80 = 80%). Must be greater than the recover ratio."
-msgstr "利用率达到或超过该值时，该 WAN 开始下修权重（默认 0.80 = 80%）。必须大于恢复阈值。"
-msgid "Utilisation at or below which a throttled WAN fully regains its configured weight (default: 0.60). The gap to the offload threshold is hysteresis against weight oscillation."
-msgstr "利用率降到该值及以下时，被下修的 WAN 完全恢复配置权重（默认 0.60）。与触发阈值之间的差值是避免权重来回震荡的迟滞。"
-msgid "Max Bandwidth (Mbps)"
-msgstr "最大带宽（Mbps）"
-msgid "Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled."
-msgstr "线路容量。所有 interface 都填写时，ECMP 权重自动按它成比例（weight × max_mbps）；同时也是负载感知使用的 LAN 下载方向容量。启用负载感知流量转移时每条 interface 必填。"
-msgid "Up Capacity (Mbps)"
-msgstr "上行容量（Mbps）"
-msgid "Upload (LAN upload) capacity for asymmetric lines. Leave empty to reuse the max bandwidth."
-msgstr "非对称线路的上传（LAN 上传）容量。留空则沿用最大带宽。"
-msgid "offloaded"
-msgstr "已转移"
-msgid "Policy Routing (Source / Destination)"
-msgstr "策略分流（来源 / 目的）"
-msgid "Send traffic matching a source (and optionally destination) prefix through a specific WAN using fib rules. Non-matching traffic keeps using ECMP. Rules are removed automatically while the target WAN is down, so traffic falls back to ECMP."
-msgstr "让匹配来源（可选目的）前缀的流量经 fib 规则走指定 WAN，未匹配流量仍走 ECMP。目标 WAN 下线时规则自动移除，流量回退 ECMP。"
-msgid "Rule Name"
-msgstr "规则名称"
-msgid "Unique name used in logs and status."
-msgstr "用于日志与状态显示的唯一名称。"
-msgid "Source Prefixes (CIDR)"
-msgstr "来源前缀 (CIDR)"
-msgid "IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source."
-msgstr "IPv4 来源前缀，例如 192.168.3.0/24。留空 = 匹配任意来源。"
-msgid "Destination Prefixes (CIDR)"
-msgstr "目的前缀 (CIDR)"
-msgid "Optional IPv4 destination prefixes. Leave empty to match any destination."
-msgstr "可选的 IPv4 目的前缀。留空 = 匹配任意目的。"
-msgid "Target WAN"
-msgstr "目标 WAN"
-msgid "Traffic matching this rule is routed through this WAN while it is healthy."
-msgstr "匹配此规则的流量在该 WAN 健康时经它转发。"
-msgid "Rule Priority"
-msgstr "规则优先级"
-msgid "Optional fib-rule priority (9000-9063); lower matches first. Either set it on every rule or on none."
-msgstr "可选的 fib 规则优先级（9000-9063），数值越小越先匹配。要么每条规则都设置，要么都不设置。"
-msgid "Degrade Loss Threshold"
-msgstr "降级丢包阈值"
-msgid "Flush Conntrack on Active Set Change"
-msgstr "成员变化时清理 conntrack"
-msgid "Last probe error: "
-msgstr "最近探测错误："
-msgid "Local problem (packets never left the device): "
-msgstr "本机问题（封包未发出网卡）："
-msgid "No status file"
-msgstr "无状态文件"
-msgid "No status file yet: the daemon has not written one (or it just started)."
-msgstr "尚无状态文件：守护进程尚未写入（或刚启动）。"
-msgid "Not trustworthy (clock skew)"
-msgstr "不可信（时钟偏差）"
-msgid "Online (UP, degraded - not carrying traffic)"
-msgstr "在线（UP，已降级——不承载流量）"
-msgid "Status File:"
-msgstr "状态文件："
-msgid "Status is stale: the daemon may have stopped. This is the last known state."
-msgstr "状态已过期：守护进程可能已停止，这是最后已知状态。"
-msgid "Stopped (status is stale)"
-msgstr "已停止（状态过期）"
-msgid "ago"
-msgstr "前"
-msgid "clock skew"
-msgstr "时钟偏差"
-msgid "missing"
-msgstr "缺失"
-msgid "Hash Granularity:"
-msgstr "哈希粒度："
-msgid "L3 only: one WAN per destination IP"
-msgstr "仅 L3：同一目的 IP 只走一条 WAN"
-msgid "l4: per-connection spreading"
-msgstr "l4：按连线分散"
-
-msgid "WAN Status:"
-msgstr "WAN 状态："
-
-msgid "Allow Dynamic Weights on Standard ECMP"
-msgstr "允许在 Standard ECMP 下使用动态权重"
-
-msgid "Aggregate"
-msgstr "合计速率"
-
-msgid "RTT Trend"
-msgstr "RTT 趋势"
-
-msgid "DNS Pinning:"
-msgstr "DNS 出口绑定："
-
-msgid "Health Probe Protocol"
-msgstr "健康探测协议"
-
-msgid "tcp uses lightweight TCP SYN handshakes; dns sends real UDP DNS queries (ephemeral port, never conflicts with AdGuardHome / SmartDNS / MosDNS / dnsmasq) to detect broken DNS or hijacked links."
-msgstr "tcp 使用轻量 TCP SYN 握手；dns 发送真实 UDP DNS 查询（临时端口，绝不与 AdGuardHome / SmartDNS / MosDNS / dnsmasq 冲突），可识别假通或 DNS 故障。"
-
-msgid "TCP SYN (default)"
-msgstr "TCP SYN（默认）"
-
-msgid "DNS Query (UDP)"
-msgstr "DNS 查询（UDP）"
-
-msgid "DNS Probe Domain"
-msgstr "DNS 探测域名"
-
-msgid "Domain queried when Health Probe Protocol is set to DNS Query (default: baidu.com)."
-msgstr "健康探测协议设为 DNS 查询时请求的测试域名（默认 baidu.com）。"
-
-msgid "Packet Loss Threshold for DOWN"
-msgstr "断线丢包率阈值"
-
-msgid "Sliding-window packet loss ratio (0.0 - 1.0) above which a link is marked DOWN (default: 0.5)."
-msgstr "滑动窗口丢包率（0.0 - 1.0）高于此值直接判定线路 DOWN（默认 0.5）。"
-
-msgid "Maximum Allowed RTT (ms)"
-msgstr "最大容许 RTT（毫秒）"
-
-msgid "Smoothed RTT ceiling before consecutive violations mark the link DOWN (default: 1500 ms)."
-msgstr "平滑 RTT 连续超标判定线路 DOWN 的上限（默认 1500 毫秒）。"
-
-msgid "Degrade Exit Hysteresis"
-msgstr "降级退出迟滞"
-
-msgid "Degrade Enter Samples"
-msgstr "进入降级连续样本数"
-
-msgid "Degrade Exit Samples"
-msgstr "退出降级连续样本数"
-
-msgid "Degrade Minimum Out Samples"
-msgstr "降级最短离开样本数"
-
-msgid "Load Offload Threshold"
-msgstr "负载转移触发阈值"
-
-msgid "Load Recover Threshold"
-msgstr "负载恢复阈值"
-
-msgid "Healthy DNS Export File (Optional)"
-msgstr "健康 DNS 导出文件（可选）"
-
-msgid "Leave empty to disable (recommended when using AdGuardHome / SmartDNS / MosDNS / dnsmasq). If set to an independent path like /tmp/mwan4_resolv.conf, mwan4 writes healthy per-WAN DNS servers there without touching /etc/resolv.conf."
-msgstr "留空即关闭（使用 AdGuardHome / SmartDNS / MosDNS / dnsmasq 时建议留空）。若指定独立路径如 /tmp/mwan4_resolv.conf，mwan4 会将健康 WAN 的 DNS 写入该文件，绝不覆盖 /etc/resolv.conf。"
-
-msgid "Remove Default Route on Exit"
-msgstr "退出时移除默认路由"
-
-msgid "Keep disabled (default) to avoid brief internet loss during service restarts. Probe paths, policies, underlay and DNS host routes are always cleaned up."
-msgstr "建议保持关闭（默认），避免重启服务期间短暂断网。探针路径、策略规则、underlay 与 DNS 主机路由退出时一律自动清理。"
-
-msgid "Gateway, ECMP weight, probe targets and optional per-WAN DNS pinning for each WAN interface."
-msgstr "每个出口网卡的网关、ECMP 权重、探测目标及可选上游 DNS 出口绑定。"
-
-msgid "Leave empty or 0.0.0.0 for point-to-point / PPPoE / WireGuard interfaces."
-msgstr "点对点 / PPPoE / WireGuard 接口可留空或填 0.0.0.0。"
-
-msgid "IPv6 Gateway"
-msgstr "IPv6 网关"
-
-msgid "Probe Protocol Override"
-msgstr "单接口探测协议覆写"
-
-msgid "Inherit global setting"
-msgstr "继承全局设置"
-
-msgid "Pinned Upstream DNS (IPv4)"
-msgstr "绑定的上游 DNS (IPv4)"
-
-msgid "Optional ISP/upstream DNS IPs pinned to this WAN via kernel /32 routes while healthy. Works transparently under AdGuardHome, SmartDNS, MosDNS and dnsmasq without touching port 53."
-msgstr "可选：填写该 WAN 专属运营商/上游 DNS IP，链路健康时通过内核 /32 路由固定从本 WAN 发出。对 AdGuardHome、SmartDNS、MosDNS 和 dnsmasq 完全透明，不占用 53 端口。"
-
-msgid "Tunnel Underlay Peers (IPv4)"
-msgstr "隧道 Underlay 对端 (IPv4)"
-
-msgid "For tunnel WANs (VXLAN/WireGuard): peer IPs pinned to a non-tunnel WAN to avoid ECMP self-loop."
-msgstr "用于隧道型 WAN（VXLAN/WireGuard）：将对端 IP 固定走非隧道 WAN，防止 ECMP 自环。"
-
-msgid "Degraded: sliding-window packet loss reached the degrade threshold, so this WAN is excluded from the default route. It is still probed and rejoins automatically once its loss drops."
-msgstr "已降级：滑动窗口丢包率达到降级阈值，该 WAN 已临时移出默认路由；守护进程仍持续探测，丢包恢复后将自动回归。"
-
-msgid "Router clock differs from this browser, so freshness cannot be judged. These values may be the last known state of a stopped daemon."
-msgstr "路由器系统时间与当前浏览器偏差较大，无法判断状态新鲜度；以下数值可能是守护进程停止前的最后快照。"
 
 msgid "DNS"
 msgstr "DNS"
 
-msgid "DNS:"
-msgstr "DNS："
+msgid "Advanced"
+msgstr "高级"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "No Status"
+msgstr "无状态"
+
+msgid "Clock Skew"
+msgstr "时钟偏差"
+
+msgid "Unknown"
+msgstr "未知"
+
+msgid "Online"
+msgstr "在线"
+
+msgid "Offline"
+msgstr "离线"
+
+msgid "Degraded"
+msgstr "已降级"
+
+msgid "(No IP)"
+msgstr "无 IP"
+
+msgid "ago"
+msgstr "前"
+
+msgid "Policy"
+msgstr "策略"
+
+msgid " (inactive)"
+msgstr "（未生效）"
+
+msgid "L3 Hash"
+msgstr "L3 哈希"
+
+msgid "L4 Hash"
+msgstr "L4 分流"
+
+msgid "Online WANs"
+msgstr "在线线路"
+
+msgid "Downlink"
+msgstr "聚合下行"
+
+msgid "Uplink"
+msgstr "聚合上行"
+
+msgid "Active Route"
+msgstr "当前路由"
+
+msgid "RTT"
+msgstr "延迟"
+
+msgid "Jitter"
+msgstr "抖动"
+
+msgid "Gateway"
+msgstr "网关"
+
+msgid "Weight"
+msgstr "权重"
+
+msgid "Loss"
+msgstr "丢包"
+
+msgid "OK"
+msgstr "成功"
+
+msgid "Timeout"
+msgstr "超时"
+
+msgid "offloaded"
+msgstr "已分流"
+
+msgid "Status expired: daemon may have stopped."
+msgstr "状态已过期，守护进程可能已停止。"
+
+msgid "Clock skew detected: status freshness cannot be verified."
+msgstr "检测到时钟偏差，无法确认状态新鲜度。"
+
+msgid "Waiting for daemon status..."
+msgstr "等待守护进程写入状态..."
+
+msgid "Local error: "
+msgstr "本机异常："
+
+msgid "Probe error: "
+msgstr "探测失败："
+
+msgid "Degraded: excluded from ECMP until packet loss recovers."
+msgstr "已降级：暂不参与分流，丢包恢复后自动回归。"
+
+msgid "No metrics available. Check that the MWAN4 service is running."
+msgstr "暂无监控数据，请确认 MWAN4 服务已运行。"
+
+msgid "Enable Service"
+msgstr "启用服务"
+
+msgid "Routing Mode"
+msgstr "路由模式"
+
+msgid "Auto"
+msgstr "自动"
+
+msgid "Standard ECMP"
+msgstr "标准 ECMP"
+
+msgid "Resilient Nexthop"
+msgstr "弹性 Nexthop"
+
+msgid "Weight Mode"
+msgstr "权重模式"
+
+msgid "Static"
+msgstr "静态权重"
+
+msgid "Quality-aware"
+msgstr "质量感知"
+
+msgid "Smart Aggregate"
+msgstr "智能聚合"
+
+msgid "Probe Interval (ms)"
+msgstr "探测间隔 (ms)"
+
+msgid "Probe Timeout (ms)"
+msgstr "探测超时 (ms)"
+
+msgid "Failure Threshold"
+msgstr "断线阈值"
+
+msgid "Recovery Threshold"
+msgstr "恢复阈值"
+
+msgid "Probe Protocol"
+msgstr "探测协议"
+
+msgid "TCP SYN"
+msgstr "TCP SYN"
+
+msgid "DNS Query"
+msgstr "DNS 查询"
+
+msgid "Probe Domain"
+msgstr "探测域名"
+
+msgid "Forward Port"
+msgstr "转发端口"
+
+msgid "Listen Address"
+msgstr "监听地址"
+
+msgid "Forward Timeout (ms)"
+msgstr "转发超时 (ms)"
+
+msgid "DNS Export File"
+msgstr "DNS 导出文件"
+
+msgid "Window Size"
+msgstr "滑动窗口"
+
+msgid "DOWN Loss Threshold"
+msgstr "断线丢包阈值"
+
+msgid "Max RTT (ms)"
+msgstr "最大延迟 (ms)"
+
+msgid "Degrade Loss Threshold"
+msgstr "降级丢包阈值"
+
+msgid "Resilient Idle Timer (s)"
+msgstr "空闲桶迁移 (s)"
+
+msgid "Resilient Rebalance Timer (s)"
+msgstr "失衡强制平衡 (s)"
+
+msgid "Hash Policy"
+msgstr "哈希策略"
+
+msgid "L4 (Per-Connection)"
+msgstr "L4（按连接）"
+
+msgid "L3 (Per-IP)"
+msgstr "L3（按 IP）"
+
+msgid "Inner (Tunnel)"
+msgstr "Inner（含隧道）"
+
+msgid "Load-aware Shifting"
+msgstr "负载感知分流"
+
+msgid "Weight Update Interval (ms)"
+msgstr "权重更新间隔 (ms)"
+
+msgid "Dynamic Weights on Standard ECMP"
+msgstr "标准模式允许动态权重"
+
+msgid "Flush Conntrack on DOWN"
+msgstr "断线清理连接追踪"
+
+msgid "Flush Conntrack on Switch"
+msgstr "切换清理连接追踪"
+
+msgid "Remove Routes on Exit"
+msgstr "退出时移除路由"
+
+msgid "WAN Interfaces"
+msgstr "WAN 接口"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Interface"
+msgstr "接口"
+
+msgid "IPv6 Gateway"
+msgstr "IPv6 网关"
+
+msgid "Priority"
+msgstr "优先级"
+
+msgid "Bandwidth (Mbps)"
+msgstr "带宽 (Mbps)"
+
+msgid "Uplink (Mbps)"
+msgstr "上行 (Mbps)"
+
+msgid "Global Default"
+msgstr "跟随全局"
+
+msgid "Probe Targets"
+msgstr "探测目标"
+
+msgid "Upstream DNS"
+msgstr "上游 DNS"
+
+msgid "Tunnel Peers"
+msgstr "隧道对端"
+
+msgid "Policy Routing"
+msgstr "策略分流"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Source CIDR"
+msgstr "来源网段"
+
+msgid "Destination CIDR"
+msgstr "目的网段"
+
+msgid "Target WAN"
+msgstr "目标 WAN"
 
 msgid "Expected IPv4 or IPv4:Port"
 msgstr "请输入有效的 IPv4 或 IPv4:端口"
 
-msgid "DNS Forward Port (0 = Off)"
-msgstr "DNS 转发端口（0 = 关闭）"
-
-msgid "DNS Listen Address"
-msgstr "DNS 监听地址"
-
-msgid "DNS Forward Timeout (ms)"
-msgstr "DNS 转发超时（毫秒）"
-
-msgid "Upstream DNS (IP[:Port])"
-msgstr "上游 DNS (IP[:端口])"
-
-msgid "Aggregate spreading (headroom-aware)"
-msgstr "聚合分流（余量感知）"
+msgid "MWAN4 configuration saved and applied."
+msgstr "MWAN4 配置已保存并应用。"

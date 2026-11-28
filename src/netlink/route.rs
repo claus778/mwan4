@@ -12,7 +12,7 @@ pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 
-// nexthop object（Linux 5.3+）；resilient group 需要 5.14+
+// nexthop object + resilient nexthop group（OpenWrt 25+ / Linux 6.12+ 标准特性）
 pub const RTM_NEWNEXTHOP: u16 = 104;
 pub const RTM_DELNEXTHOP: u16 = 105;
 
@@ -69,6 +69,9 @@ pub const NHA_RES_GROUP: u16 = 12;
 pub const NHA_RES_GROUP_BUCKETS: u16 = 1;
 /// 巢状于 NHA_RES_GROUP 的空闲桶迁移时间（u32，单位 1/100 秒 / centiseconds）。
 pub const NHA_RES_GROUP_IDLE_TIMER: u16 = 2;
+/// 巢状于 NHA_RES_GROUP 的失衡强制重平衡时间（u32，单位 1/100 秒 / centiseconds）；
+/// 0 表示只迁移空闲桶，>0 表示经过该时长仍失衡时也会迁走活跃桶以恢复权重比例。
+pub const NHA_RES_GROUP_UNBALANCED_TIMER: u16 = 3;
 
 /// SOL_NETLINK / NETLINK_EXT_ACK：开了核心才会在错误回应附上原因；libc 未必导出故自备。
 const SOL_NETLINK: libc::c_int = 270;
@@ -124,9 +127,15 @@ pub const PROBE_SLOT_MAX: u32 = 64;
 pub const POLICY_RULE_PRIORITY_BASE: u32 = 9_000;
 /// 策略规则数量上限（含来源/目的展开后的总条数）
 pub const POLICY_SLOT_MAX: u32 = 64;
-/// enum fib_rule_attr：来源/目的前缀
+/// 内核调度模块 fwmark 路由规则的优先序起点（位于策略分流之后、探针规则之前）
+pub const FWMARK_RULE_PRIORITY_BASE: u32 = 9_200;
+/// fwmark 路由规则槽位上限（与 PROBE_SLOT_MAX 一致）
+pub const FWMARK_SLOT_MAX: u32 = 64;
+/// enum fib_rule_attr：来源/目的前缀与 fwmark/fwmask
 pub const FRA_DST: u16 = 1;
 pub const FRA_SRC: u16 = 2;
+pub const FRA_FWMARK: u16 = 10;
+pub const FRA_FWMASK: u16 = 16;
 /// 探针目标主表 /32 的 metric；与预设路由 priority 分开才能精准辨识删除。
 pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 
@@ -151,9 +160,10 @@ const _: () = {
     assert!(PROBE_TABLE_BASE > 255);
     assert!(PROBE_RULE_PRIORITY_BASE > 0);
     assert!(PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX < 32_766);
-    // 策略规则的保留区段必须完整落在探针规则之前，两者不会互相覆盖
+    // 策略规则与 fwmark 规则的保留区段必须互不重叠且完整落在探针规则之前
     assert!(POLICY_RULE_PRIORITY_BASE > 0);
-    assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
+    assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= FWMARK_RULE_PRIORITY_BASE);
+    assert!(FWMARK_RULE_PRIORITY_BASE + FWMARK_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
     assert!(PROBE_MAIN_ROUTE_METRIC != 0);
     // 探针 /32 的 metric 不能落在表号／规则优先序的保留区段里，否则清扫会误删
     assert!(PROBE_MAIN_ROUTE_METRIC > PROBE_RULE_PRIORITY_BASE + PROBE_SLOT_MAX);
@@ -402,6 +412,21 @@ pub struct PolicyRule {
     pub destination: Option<(Ipv4Addr, u8)>,
 }
 
+/// 内核态调度模块（`kmod-mwan4-sched`）配套的 `fwmark/fwmask -> table` 规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FwmarkRule {
+    pub ifname: String,
+    pub table: u32,
+    pub priority: u32,
+    pub fwmark: u32,
+    pub fwmask: u32,
+}
+
+struct ProbeRouteKernelState {
+    table_defaults: std::collections::HashMap<u32, (Option<u32>, Option<Ipv4Addr>)>,
+    main_probe_hosts: std::collections::HashMap<Ipv4Addr, (Option<u32>, Option<Ipv4Addr>)>,
+}
+
 /// 一条 fib_rule 的描述（出向用 oif、入向用 iif）
 #[derive(Debug, Clone, Copy)]
 struct RuleSpec<'a> {
@@ -460,6 +485,8 @@ pub struct RouteManager {
     ecmp_mode: EcmpMode,
     /// resilient 空闲桶迁移时间（秒），下发时换算为 centiseconds（×100）写入 NHA_RES_GROUP_IDLE_TIMER。
     resilient_idle_timer_secs: u32,
+    /// resilient 失衡强制迁移时间（秒），下发时换算为 centiseconds（×100）写入 NHA_RES_GROUP_UNBALANCED_TIMER。
+    resilient_unbalanced_timer_secs: u32,
     /// None = 尚未探测；Some(true/false) = 核心是否支援 resilient nexthop group
     resilient_supported: Option<bool>,
     /// (family, ifindex, gateway bytes) -> nexthop object id；ID 必须跨次呼叫稳定，核心才只重映射故障链路的 bucket。
@@ -475,6 +502,8 @@ pub struct RouteManager {
     dns_routes: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
     /// 已下发的策略分流规则（差异比对与清理用）
     policy_rules: Vec<PolicyRule>,
+    /// 已下发的内核调度器 fwmark 规则（差异比对与清理用）
+    fwmark_rules: Vec<FwmarkRule>,
     /// 上一次真正下发到核心的 nexthop 集合（含权重）。用来跳过「内容完全一样」的 FIB 重下：
     /// 探针路径每 48 秒的周期刷新、以及单成员时的权重变更，都会走到同一条下发路径，
     /// 实测让核心每分钟重下 5 次完全相同的预设路由（RIB 上是等价替换，纯粹是噪声）。
@@ -550,6 +579,7 @@ impl RouteManager {
                 priority,
                 ecmp_mode,
                 resilient_idle_timer_secs: 30,
+                resilient_unbalanced_timer_secs: 60,
                 resilient_supported: None,
                 nh_ids: std::collections::HashMap::new(),
                 next_nh_id: 1,
@@ -559,6 +589,7 @@ impl RouteManager {
                 underlay_routes: std::collections::HashMap::new(),
                 dns_routes: std::collections::HashMap::new(),
                 policy_rules: Vec::new(),
+                fwmark_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
                 last_active_v4: Vec::new(),
@@ -573,6 +604,7 @@ impl RouteManager {
                 priority,
                 ecmp_mode,
                 resilient_idle_timer_secs: 30,
+                resilient_unbalanced_timer_secs: 60,
                 resilient_supported: None,
                 nh_ids: std::collections::HashMap::new(),
                 next_nh_id: 1,
@@ -582,6 +614,7 @@ impl RouteManager {
                 underlay_routes: std::collections::HashMap::new(),
                 dns_routes: std::collections::HashMap::new(),
                 policy_rules: Vec::new(),
+                fwmark_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
                 last_active_v4: Vec::new(),
@@ -593,6 +626,12 @@ impl RouteManager {
     /// 设定 resilient 空闲桶迁移时间（秒，默认 30）；数值越小空闲桶越快向空闲 WAN 迁移，活跃流不受影响。
     pub fn with_resilient_idle_timer(mut self, secs: u32) -> Self {
         self.resilient_idle_timer_secs = secs.clamp(1, 3600);
+        self
+    }
+
+    /// 设定 resilient 失衡强制迁移时间（秒，默认 60；0 表示不强制迁移活跃流）。
+    pub fn with_resilient_unbalanced_timer(mut self, secs: u32) -> Self {
+        self.resilient_unbalanced_timer_secs = secs.min(3600);
         self
     }
 
@@ -890,13 +929,14 @@ impl RouteManager {
         buffer
     }
 
-    /// 组出 nexthop group 讯息：buckets = Some(n) 则附 NHA_RES_GROUP(BUCKETS + IDLE_TIMER) + NHA_GROUP_TYPE=RES（resilient）。
+    /// 组出 nexthop group 讯息：buckets = Some(n) 则附 NHA_RES_GROUP(BUCKETS + IDLE_TIMER + UNBALANCED_TIMER) + NHA_GROUP_TYPE=RES（resilient）。
     fn build_nexthop_group_msg(
         seq: u32,
         group_id: u32,
         members: &[(u32, u32)],
         buckets: Option<u16>,
         idle_timer_secs: Option<u32>,
+        unbalanced_timer_secs: Option<u32>,
         msg_type: u16,
         flags: u16,
     ) -> Vec<u8> {
@@ -930,11 +970,15 @@ impl RouteManager {
         Self::append_attr(&mut buffer, NHA_GROUP, &grp);
 
         if let Some(bucket_count) = buckets {
-            let mut res: Vec<u8> = Vec::with_capacity(24);
+            let mut res: Vec<u8> = Vec::with_capacity(32);
             Self::append_attr(&mut res, NHA_RES_GROUP_BUCKETS, &bucket_count.to_ne_bytes());
             if let Some(secs) = idle_timer_secs {
                 let cs = secs.saturating_mul(100);
                 Self::append_attr(&mut res, NHA_RES_GROUP_IDLE_TIMER, &cs.to_ne_bytes());
+            }
+            if let Some(secs) = unbalanced_timer_secs {
+                let cs = secs.saturating_mul(100);
+                Self::append_attr(&mut res, NHA_RES_GROUP_UNBALANCED_TIMER, &cs.to_ne_bytes());
             }
             Self::append_attr(&mut buffer, NHA_RES_GROUP | NLA_F_NESTED, &res);
         }
@@ -1175,7 +1219,139 @@ impl RouteManager {
         }
     }
 
-    /// 差异比对探针路径：删掉多的并重下所有期望的（幂等；重下而非只补缺，因记录也可能被外部改掉）。
+    fn build_fwmark_rule_msg(seq: u32, rule: &FwmarkRule, msg_type: u16, flags: u16) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(128);
+        buffer.extend_from_slice(&[0u8; NlMsgHdr::LEN]);
+
+        let hdr = FibRuleHdr {
+            family: AF_INET,
+            dst_len: 0,
+            src_len: 0,
+            tos: 0,
+            table: 0,
+            action: FR_ACT_TO_TBL,
+            flags: 0,
+        };
+        buffer.extend_from_slice(&hdr.to_bytes());
+
+        Self::append_attr(&mut buffer, FRA_TABLE, &rule.table.to_ne_bytes());
+        Self::append_attr(&mut buffer, FRA_PRIORITY, &rule.priority.to_ne_bytes());
+        Self::append_attr(&mut buffer, FRA_FWMARK, &rule.fwmark.to_ne_bytes());
+        Self::append_attr(&mut buffer, FRA_FWMASK, &rule.fwmask.to_ne_bytes());
+        Self::append_attr(&mut buffer, FRA_PROTOCOL, &[PROBE_RULE_PROTOCOL]);
+
+        Self::finish_msg(&mut buffer, msg_type, flags, seq);
+        buffer
+    }
+
+    /// 同步内核调度器配套的 fwmark 路由规则（差异比对，零闪烁）。
+    pub fn set_fwmark_rules(&mut self, wanted: &[FwmarkRule]) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+
+        let stale: Vec<FwmarkRule> = self
+            .fwmark_rules
+            .iter()
+            .filter(|old| !wanted.contains(old))
+            .cloned()
+            .collect();
+        for rule in stale {
+            if let Err(e) = self.delete_fwmark_rule(&rule) {
+                warn!(
+                    "[RouteManager] Failed to remove fwmark rule for '{}' (priority {}): {e}",
+                    rule.ifname, rule.priority
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            self.fwmark_rules.retain(|r| r != &rule);
+        }
+
+        for rule in wanted {
+            if self.fwmark_rules.contains(rule) {
+                continue;
+            }
+            match self.install_fwmark_rule(rule) {
+                Ok(()) => self.fwmark_rules.push(rule.clone()),
+                Err(e) => {
+                    warn!(
+                        "[RouteManager] Failed to install fwmark rule for '{}' (priority {}): {e}",
+                        rule.ifname, rule.priority
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn install_fwmark_rule(&mut self, rule: &FwmarkRule) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let msg = Self::build_fwmark_rule_msg(
+            seq,
+            rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        );
+        self.commit_rule_msg(
+            &msg,
+            &format!(
+                "fwmark rule '{}' (mark 0x{:08x}/0x{:08x} lookup {})",
+                rule.ifname, rule.fwmark, rule.fwmask, rule.table
+            ),
+        )
+    }
+
+    fn delete_fwmark_rule(&mut self, rule: &FwmarkRule) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let msg = Self::build_fwmark_rule_msg(seq, rule, RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK);
+        self.commit_rule_msg(
+            &msg,
+            &format!(
+                "fwmark rule removal '{}' (priority {})",
+                rule.ifname, rule.priority
+            ),
+        )
+    }
+
+    /// 清扫 fwmark 规则保留区段内本程式留下的所有规则（启动与退出共用）。
+    pub fn sweep_fwmark_rules(&mut self) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+        let mut removed = 0usize;
+        for slot in 0..FWMARK_SLOT_MAX {
+            match self.delete_own_rule_by_priority(FWMARK_RULE_PRIORITY_BASE + slot) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            info!(
+                "[RouteManager] Removed {removed} leftover fwmark rule(s) from the reserved band"
+            );
+        }
+        self.fwmark_rules.clear();
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// 差异比对探针路径：删掉多的、校验未变更的内核状态并仅按需重下，
+    /// 避免每 30s 周期刷新无谓下发 RTM_NEWROUTE(REPLACE) 抬高 rt_genid 冲毁 Flow Offload 缓存。
     pub fn set_probe_paths(&mut self, wanted: &[ProbePath]) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         let wanted_names: std::collections::HashSet<&str> =
@@ -1201,6 +1377,8 @@ impl RouteManager {
             self.probe_paths.remove(&path.ifname);
         }
 
+        let probe_state = self.dump_probe_route_state();
+
         for path in wanted {
             // 内容有变（含主表 /32 子集）必须先完整拆掉再装，否则主表那条 /32 会留在不该留的时候。
             if let Some(prev) = self.probe_paths.get(&path.ifname) {
@@ -1216,6 +1394,10 @@ impl RouteManager {
                         continue;
                     }
                     self.probe_paths.remove(&path.ifname);
+                } else if self.probe_routes_present_in_kernel(path, probe_state.as_ref())
+                    && self.ensure_probe_rule(path).is_ok()
+                {
+                    continue;
                 }
             }
             match self.install_probe_path(path) {
@@ -1238,6 +1420,103 @@ impl RouteManager {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dump_probe_route_state(&mut self) -> Option<ProbeRouteKernelState> {
+        let bodies = self.dump_route_messages(AF_INET).ok()?;
+        let mut table_defaults = std::collections::HashMap::new();
+        let mut main_probe_hosts = std::collections::HashMap::new();
+        for body in bodies {
+            if body.len() < NlMsgHdr::LEN + RtMsg::LEN {
+                continue;
+            }
+            let msg_len = body.len();
+            let dst_len = body[NlMsgHdr::LEN + 1];
+            let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
+            let mut priority = 0u32;
+            let mut oif = None;
+            let mut gateway = None;
+            let mut dst = None;
+            let mut off = NlMsgHdr::LEN + RtMsg::LEN;
+            while off + RtAttr::LEN <= msg_len {
+                let rta_len = read_u16(&body, off).unwrap_or(0) as usize;
+                let rta_type = read_u16(&body, off + 2).unwrap_or(0);
+                if rta_len < RtAttr::LEN || off + rta_len > msg_len {
+                    break;
+                }
+                let data = &body[off + RtAttr::LEN..off + rta_len];
+                match rta_type {
+                    RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
+                    RTA_PRIORITY => priority = read_u32(data, 0).unwrap_or(priority),
+                    RTA_OIF => oif = read_u32(data, 0),
+                    RTA_GATEWAY if data.len() == 4 => {
+                        gateway = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+                    }
+                    RTA_DST if data.len() == 4 => {
+                        dst = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+                    }
+                    _ => {}
+                }
+                off += rta_align(rta_len);
+            }
+            if dst_len == 0 && table >= PROBE_TABLE_BASE {
+                table_defaults.insert(table, (oif, gateway));
+            } else if dst_len == 32
+                && table == u32::from(RT_TABLE_MAIN)
+                && priority == PROBE_MAIN_ROUTE_METRIC
+            {
+                if let Some(addr) = dst {
+                    main_probe_hosts.insert(addr, (oif, gateway));
+                }
+            }
+        }
+        Some(ProbeRouteKernelState {
+            table_defaults,
+            main_probe_hosts,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn dump_probe_route_state(&mut self) -> Option<ProbeRouteKernelState> {
+        None
+    }
+
+    fn probe_routes_present_in_kernel(
+        &self,
+        path: &ProbePath,
+        state: Option<&ProbeRouteKernelState>,
+    ) -> bool {
+        let Some(state) = state else {
+            return false;
+        };
+        if state.table_defaults.get(&path.table) != Some(&(Some(path.ifindex), path.gateway)) {
+            return false;
+        }
+        path.main_route_targets.iter().all(|target| {
+            state.main_probe_hosts.get(target) == Some(&(Some(path.ifindex), path.gateway))
+        })
+    }
+
+    fn ensure_probe_rule(&mut self, path: &ProbePath) -> io::Result<()> {
+        self.seq += 1;
+        let seq = self.seq;
+        let rule = Self::build_rule_msg(
+            seq,
+            RuleSpec {
+                family: AF_INET,
+                table: path.table,
+                ifname: &path.ifname,
+                priority: path.priority,
+                output: true,
+            },
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        );
+        self.commit_rule_msg(
+            &rule,
+            &format!("probe rule (oif {} lookup {})", path.ifname, path.table),
+        )
     }
 
     // 路由查询 / 转储：用来「问内核」而不是靠猜（要不要补主表 /32、分辨线路不通与本机没路）。
@@ -1563,8 +1842,119 @@ impl RouteManager {
         Ok(Vec::new())
     }
 
+    /// 转储主表中「非 mwan4 下发」的 IPv4 默认路由网关（ifindex -> gateway）。
+    /// 用于 gateway 留空的 DHCP/以太网 WAN 自动探测网关，避免退化成无网关直连路由在广播网段断流。
+    #[cfg(target_os = "linux")]
+    pub fn dump_external_gateways(&mut self) -> io::Result<std::collections::HashMap<u32, Ipv4Addr>> {
+        let mut out: std::collections::HashMap<u32, (u32, Ipv4Addr)> =
+            std::collections::HashMap::new();
+        for body in self.dump_route_messages(AF_INET)? {
+            if body.len() < NlMsgHdr::LEN + RtMsg::LEN {
+                continue;
+            }
+            let dst_len = body[NlMsgHdr::LEN + 1];
+            let proto = body[NlMsgHdr::LEN + 5];
+            if dst_len != 0 || proto == RTPROT_MWAN4 {
+                continue;
+            }
+            let msg_len = body.len();
+            let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
+            let mut priority = 0u32;
+            let mut oif: Option<u32> = None;
+            let mut gateway: Option<Ipv4Addr> = None;
+            let mut multipath: Vec<(u32, Ipv4Addr)> = Vec::new();
+            let mut off = NlMsgHdr::LEN + RtMsg::LEN;
+            while off + RtAttr::LEN <= msg_len {
+                let rta_len = read_u16(&body, off).unwrap_or(0) as usize;
+                let rta_type = read_u16(&body, off + 2).unwrap_or(0);
+                if rta_len < RtAttr::LEN || off + rta_len > msg_len {
+                    break;
+                }
+                let data = &body[off + RtAttr::LEN..off + rta_len];
+                match rta_type {
+                    RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
+                    RTA_PRIORITY => priority = read_u32(data, 0).unwrap_or(priority),
+                    RTA_OIF => oif = read_u32(data, 0),
+                    RTA_GATEWAY if data.len() == 4 => {
+                        gateway = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+                    }
+                    RTA_MULTIPATH => {
+                        let mut mp_off = 0;
+                        while mp_off + RtNextHop::LEN <= data.len() {
+                            let rtnh_len = read_u16(data, mp_off).unwrap_or(0) as usize;
+                            let rtnh_ifindex = read_i32(data, mp_off + 4).unwrap_or(0);
+                            if rtnh_len < RtNextHop::LEN || mp_off + rtnh_len > data.len() {
+                                break;
+                            }
+                            let mut a_off = mp_off + RtNextHop::LEN;
+                            while a_off + RtAttr::LEN <= mp_off + rtnh_len {
+                                let alen = read_u16(data, a_off).unwrap_or(0) as usize;
+                                let atype = read_u16(data, a_off + 2).unwrap_or(0);
+                                if alen < RtAttr::LEN || a_off + alen > mp_off + rtnh_len {
+                                    break;
+                                }
+                                let adata = &data[a_off + RtAttr::LEN..a_off + alen];
+                                if atype == RTA_GATEWAY && adata.len() == 4 && rtnh_ifindex > 0 {
+                                    let gw = Ipv4Addr::new(adata[0], adata[1], adata[2], adata[3]);
+                                    if !gw.is_unspecified() {
+                                        multipath.push((rtnh_ifindex as u32, gw));
+                                    }
+                                }
+                                a_off += rta_align(alen);
+                            }
+                            mp_off += rta_align(rtnh_len);
+                        }
+                    }
+                    _ => {}
+                }
+                off += rta_align(rta_len);
+            }
+            if table != u32::from(RT_TABLE_MAIN) {
+                continue;
+            }
+            if let (Some(idx), Some(gw)) = (oif, gateway) {
+                if idx > 0 && !gw.is_unspecified() {
+                    out.entry(idx)
+                        .and_modify(|cur| {
+                            if priority < cur.0 {
+                                *cur = (priority, gw);
+                            }
+                        })
+                        .or_insert((priority, gw));
+                }
+            }
+            for (idx, gw) in multipath {
+                out.entry(idx)
+                    .and_modify(|cur| {
+                        if priority < cur.0 {
+                            *cur = (priority, gw);
+                        }
+                    })
+                    .or_insert((priority, gw));
+            }
+        }
+        Ok(out.into_iter().map(|(k, (_, gw))| (k, gw)).collect())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn dump_external_gateways(&mut self) -> io::Result<std::collections::HashMap<u32, Ipv4Addr>> {
+        Ok(std::collections::HashMap::new())
+    }
+
     #[cfg(target_os = "linux")]
     fn dump_default_routes(&mut self, family: u8) -> io::Result<Vec<(u32, u32)>> {
+        Ok(self
+            .dump_main_default_route_metas(family)?
+            .into_iter()
+            .map(|(table, prio, _, _)| (table, prio))
+            .collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dump_main_default_route_metas(
+        &mut self,
+        family: u8,
+    ) -> io::Result<Vec<(u32, u32, u8, Option<u32>)>> {
         let mut out = Vec::new();
         for body in self.dump_route_messages(family)? {
             if body.len() < NlMsgHdr::LEN + RtMsg::LEN {
@@ -1572,8 +1962,10 @@ impl RouteManager {
             }
             let msg_len = body.len();
             let dst_len = body[NlMsgHdr::LEN + 1];
+            let proto = body[NlMsgHdr::LEN + 5];
             let mut priority = None;
             let mut table = u32::from(body[NlMsgHdr::LEN + 4]);
+            let mut nh_id = None;
             let mut off = NlMsgHdr::LEN + RtMsg::LEN;
             while off + RtAttr::LEN <= msg_len {
                 let rta_len = read_u16(&body, off).unwrap_or(0) as usize;
@@ -1585,6 +1977,7 @@ impl RouteManager {
                 match rta_type {
                     RTA_PRIORITY => priority = read_u32(data, 0),
                     RTA_TABLE => table = read_u32(data, 0).unwrap_or(table),
+                    RTA_NH_ID => nh_id = read_u32(data, 0),
                     _ => {}
                 }
                 off += rta_align(rta_len);
@@ -1592,7 +1985,7 @@ impl RouteManager {
             let prio = priority.unwrap_or(0);
             // 只认主表：探针表里也有 default，不按表号过滤会误判成「主表有预设路由」（实测踩过）。
             if dst_len == 0 && table == u32::from(RT_TABLE_MAIN) {
-                out.push((table, prio));
+                out.push((table, prio, proto, nh_id));
             }
         }
         debug!("[RouteManager] main-table default routes: {out:?}");
@@ -2482,12 +2875,14 @@ impl RouteManager {
             .collect()
     }
 
-    /// 核心里是否确实存在我们那条预设路由（metric == `priority`）。dump 失败时保守回传 true：
-    /// 误判成「已存在」只损失一次自愈机会；误判成「不存在」会让每个 tick 都重下路由。
+    /// 核心里是否确实存在我们那条预设路由（metric == `priority` 且 protocol == `RTPROT_MWAN4`）。
+    /// dump 失败时保守回传 true：误判成「已存在」只损失一次自愈机会；误判成「不存在」会让每个 tick 都重下路由。
     #[cfg(target_os = "linux")]
     fn our_default_route_present(&mut self, family: u8) -> bool {
-        match self.dump_default_routes(family) {
-            Ok(routes) => routes.iter().any(|(_, metric)| *metric == self.priority),
+        match self.dump_main_default_route_metas(family) {
+            Ok(routes) => routes
+                .iter()
+                .any(|(_, metric, proto, _)| *metric == self.priority && *proto == RTPROT_MWAN4),
             Err(e) => {
                 debug!("[RouteManager] default-route dump failed ({e}); assuming ours is present");
                 true
@@ -2497,6 +2892,25 @@ impl RouteManager {
 
     #[cfg(not(target_os = "linux"))]
     fn our_default_route_present(&mut self, _family: u8) -> bool {
+        true
+    }
+
+    /// 核心里是否确实存在引用指定 resilient nexthop group 的预设路由。
+    #[cfg(target_os = "linux")]
+    fn our_resilient_route_present(&mut self, family: u8, group_id: u32) -> bool {
+        match self.dump_main_default_route_metas(family) {
+            Ok(routes) => routes.iter().any(|(_, metric, proto, nh_id)| {
+                *metric == self.priority && *proto == RTPROT_MWAN4 && *nh_id == Some(group_id)
+            }),
+            Err(e) => {
+                debug!("[RouteManager] resilient route dump failed ({e}); assuming ours is present");
+                true
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn our_resilient_route_present(&mut self, _family: u8, _group_id: u32) -> bool {
         true
     }
 
@@ -2861,24 +3275,30 @@ impl RouteManager {
         let buckets = RES_BUCKETS_MAX as u16;
         self.ensure_nexthop_group(group_id, &members, buckets)?;
 
-        self.seq += 1;
-        let seq = self.seq;
-        let buffer = Self::build_route_msg_via_nh(
-            self.priority,
-            family,
-            group_id,
-            RTM_NEWROUTE,
-            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-            seq,
-        );
-        self.commit_msg(
-            &buffer,
-            &format!(
-                "{} default route via resilient nexthop group",
-                Self::family_name(family)
-            ),
-        )?;
-        self.set_installed_variant(family, InstalledVariant::Resilient);
+        // 已用同一 resilient group 安装且内核里 mwan4 的默认路由仍在时，仅更新 group 成员/权重即可；
+        // 避免无谓重下 RTM_NEWROUTE(REPLACE) 抬高 rt_genid 并失效 nf_flow_table / Flow Offload。
+        if !(self.installed_variant(family) == InstalledVariant::Resilient
+            && self.our_resilient_route_present(family, group_id))
+        {
+            self.seq += 1;
+            let seq = self.seq;
+            let buffer = Self::build_route_msg_via_nh(
+                self.priority,
+                family,
+                group_id,
+                RTM_NEWROUTE,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+                seq,
+            );
+            self.commit_msg(
+                &buffer,
+                &format!(
+                    "{} default route via resilient nexthop group",
+                    Self::family_name(family)
+                ),
+            )?;
+            self.set_installed_variant(family, InstalledVariant::Resilient);
+        }
 
         // 4) group 已改指向新成员，这时删旧成员才不会拿到 EBUSY
         self.drop_unused_members(family, hops);
@@ -2920,6 +3340,7 @@ impl RouteManager {
             members,
             Some(buckets),
             Some(self.resilient_idle_timer_secs),
+            Some(self.resilient_unbalanced_timer_secs),
             RTM_NEWNEXTHOP,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         );
@@ -2999,9 +3420,12 @@ impl RouteManager {
 
     /// 优雅退出时清干净所有产物；只有我们真的下发过预设路由时才删它（否则那条其实是 netifd 的）。
     pub fn cleanup_routes(&mut self) -> io::Result<()> {
-        // 策略规则先拆（指向探针表，须在表被清空前移除）。
+        // 策略规则与 fwmark 规则先拆（指向探针表，须在表被清空前移除）。
         if let Err(e) = self.sweep_policy_rules() {
             warn!("[RouteManager] Failed to remove policy rules on shutdown: {e}");
+        }
+        if let Err(e) = self.sweep_fwmark_rules() {
+            warn!("[RouteManager] Failed to remove fwmark rules on shutdown: {e}");
         }
 
         let _ = self.set_probe_paths(&[]);
@@ -3482,6 +3906,7 @@ mod tests {
             &members,
             Some(240),
             Some(30),
+            Some(60),
             RTM_NEWNEXTHOP,
             NLM_F_REQUEST,
         );
@@ -3514,11 +3939,16 @@ mod tests {
         let res = parse_attr_stream(&attrs[3].1, 0);
         assert_eq!(
             attr_types(&res),
-            vec![NHA_RES_GROUP_BUCKETS, NHA_RES_GROUP_IDLE_TIMER]
+            vec![
+                NHA_RES_GROUP_BUCKETS,
+                NHA_RES_GROUP_IDLE_TIMER,
+                NHA_RES_GROUP_UNBALANCED_TIMER
+            ]
         );
         assert_eq!(res[0].1.len(), 2, "bucket 数必须是 u16，不是 u32");
         assert_eq!(read_u16(&res[0].1, 0), Some(240));
         assert_eq!(read_u32(&res[1].1, 0), Some(3000)); // 30s = 3000 centiseconds
+        assert_eq!(read_u32(&res[2].1, 0), Some(6000)); // 60s = 6000 centiseconds
     }
 
     #[test]
@@ -3528,6 +3958,7 @@ mod tests {
             1,
             77,
             &members,
+            None,
             None,
             None,
             RTM_NEWNEXTHOP,

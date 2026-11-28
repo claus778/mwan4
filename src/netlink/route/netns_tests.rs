@@ -364,8 +364,8 @@ fn netns_route_lifecycle() {
         ("mwe1", "10.8.0.2/24"),
         ("mwe2", "10.9.0.2/24"),
     ]);
-    // flow key 要含埠位元；新核心的预设（7）不含埠，要先打开（policy 会被它覆盖）
-    if std::fs::write("/proc/sys/net/ipv4/fib_multipath_hash_fields", "31\n").is_err() {
+    // flow key 要含埠位元（Linux 6.12+ SRC_PORT=16 | DST_PORT=32，L4 合计 55）
+    if std::fs::write("/proc/sys/net/ipv4/fib_multipath_hash_fields", "55\n").is_err() {
         eprintln!("skip flow-stickiness section: cannot set fib_multipath_hash_fields");
         return;
     }
@@ -501,7 +501,7 @@ fn netns_route_lifecycle() {
     let l4 = crate::apply_multipath_hash(Some(MultipathHashPolicy::L4), false);
     assert_eq!(l4[0].1.policy, Some(1), "l4 必须写成 policy=1");
     assert!(!l4[0].1.l3_only(), "policy=1 不该被判成 L3-only");
-    assert_eq!(read_sysctl(fields_path), Some(31), "同时把位元补齐到 L4");
+    assert_eq!(read_sysctl(fields_path), Some(55), "同时把位元补齐到 L4 (55)");
     let l4_map = flow_map_ports(&devs_f, "10.6.9.9", cdn, &ports);
     let on0 = l4_map.iter().filter(|d| d.as_str() == "mwf0").count();
     eprintln!(
@@ -902,7 +902,8 @@ fn netns_odd_even_resilient_buckets() {
     ]);
     let mut rm = RouteManager::new(5300, EcmpMode::Resilient)
         .unwrap()
-        .with_resilient_idle_timer(25);
+        .with_resilient_idle_timer(25)
+        .with_resilient_unbalanced_timer(45);
 
     // 单数 3 WAN -> 每条精确 80 桶
     let odd3 = vec![
@@ -913,8 +914,10 @@ fn netns_odd_even_resilient_buckets() {
     rm.apply_default_routes(&odd3).expect("apply 3-WAN odd");
     let nh = sh_out(&["ip", "nexthop", "show"]);
     assert!(
-        nh.contains("buckets 240") && nh.contains("idle_timer 25"),
-        "应安装 240 桶与 idle_timer 25:\n{nh}"
+        nh.contains("buckets 240")
+            && nh.contains("idle_timer 25")
+            && nh.contains("unbalanced_timer 45"),
+        "应安装 240 桶、idle_timer 25 与 unbalanced_timer 45:\n{nh}"
     );
     let buckets3 = sh_out(&[
         "ip",

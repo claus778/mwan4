@@ -44,6 +44,42 @@ pub struct ProbeSample {
     pub error_kind: Option<ProbeErrorKind>,
 }
 
+/// 为探测 socket 设置高优先级队列标记（SO_PRIORITY=6 + CS6/EF TOS），
+/// 避免测速满载时的排队缓冲膨胀把健康探针堵在队列末尾造成假超时。
+#[cfg(target_os = "linux")]
+fn set_probe_socket_priority(socket: &socket2::Socket, is_ipv4: bool) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let prio: libc::c_int = 6;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &prio as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let tos: libc::c_int = 0xC0; // CS6 (Network Control)
+        if is_ipv4 {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                &tos as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        } else {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_TCLASS,
+                &tos as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 /// 建立绑定到特定网卡的非阻塞 TCP 套接字。
 ///
 /// 依目标地址选 AF_INET/AF_INET6（固定 AF_INET 会让 IPv6 目标 EINVAL）。
@@ -65,6 +101,7 @@ fn create_bound_tcp_socket(iface: &str, target: &SocketAddr) -> io::Result<socke
 
     #[cfg(target_os = "linux")]
     {
+        set_probe_socket_priority(&socket, target.is_ipv4());
         if !iface.is_empty() {
             socket.bind_device(Some(iface.as_bytes()))?;
         }
@@ -90,6 +127,7 @@ fn create_bound_udp_socket(iface: &str, target: &SocketAddr) -> io::Result<socke
 
     #[cfg(target_os = "linux")]
     {
+        set_probe_socket_priority(&socket, target.is_ipv4());
         if !iface.is_empty() {
             socket.bind_device(Some(iface.as_bytes()))?;
         }
@@ -481,8 +519,10 @@ pub async fn probe_interface(
         return sample;
     }
 
-    // 第一阶段：只探主目标（健康时每周期的唯一探针）。
-    let primary = probe_one(iface, targets[primary_idx], timeout, mode, dns_domain).await;
+    // 第一阶段：只探主目标（限制在 60% 预算内，确保主目标超时时仍有余量并发回退其余目标，整拍不超过 1×timeout）。
+    let deadline = Instant::now() + timeout;
+    let primary_budget = timeout.mul_f32(0.6).max(Duration::from_millis(150)).min(timeout);
+    let primary = probe_one(iface, targets[primary_idx], primary_budget, mode, dns_domain).await;
     if primary.success {
         debug!(
             "[{}] Probe success ({}) to {} with RTT {:?}",
@@ -503,12 +543,15 @@ pub async fn probe_interface(
             None
         };
 
-    // 第二阶段：主目标失败才并发探其余目标（future 是 !Unpin，故 Box::pin）。
+    // 第二阶段：主目标失败才并发探其余目标（共享总 deadline，避免 2×timeout 拖长主事件循环）。
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(80));
     let mut futures: Vec<_> = targets
         .iter()
         .enumerate()
         .filter(|(idx, _)| *idx != primary_idx)
-        .map(|(_, &target)| Box::pin(probe_one(iface, target, timeout, mode, dns_domain)))
+        .map(|(_, &target)| Box::pin(probe_one(iface, target, remaining, mode, dns_domain)))
         .collect();
 
     while !futures.is_empty() {

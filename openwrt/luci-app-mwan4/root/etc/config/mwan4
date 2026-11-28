@@ -1,21 +1,21 @@
 config global 'global'
 	option enabled '1'
-	option check_interval_ms '500'
-	option probe_timeout_ms '400'
+	option check_interval_ms '1000'
+	option probe_timeout_ms '800'
 	option window_size '10'
 	option loss_threshold_down '0.5'
-	# 降级门槛/迟滞：窗口填满且丢包 >= 门槛即退出 ECMP（仍探测、恢复自动回归）；须 < loss_threshold_down，退出门槛 = 门槛 - 迟滞（须严格小于门槛，否则反复重下路由）
-	# enter/exit/min_out_samples：进出降级与最短离开所需的连续样本数（预设 20 ≈ 2 窗口 / 6 ≈ 3 秒）；隧道满载探针偶超时故需持续才降级，设 1 = 旧行为
-	option degrade_loss_threshold '0.2'
+	# 降级门槛/迟滞：默认 0 关闭（高速测速/满载波动时避免误把健康 WAN 踢出 ECMP 导致掉速）；需要启用可设为如 0.2，且须 < loss_threshold_down
+	# enter/exit/min_out_samples：进出降级与最短离开所需的连续样本数
+	option degrade_loss_threshold '0'
 	option degrade_hysteresis '0.1'
 	option degrade_exit_samples '6'
 	option degrade_enter_samples '20'
 	option degrade_min_out_samples '20'
-	option consecutive_fail_down '3'
-	option recovery_success_count '5'
+	option consecutive_fail_down '4'
+	option recovery_success_count '3'
 	option max_rtt_ms '1500'
 	option rtt_fail_count '3'
-	# 探测协议：tcp（默认 TCP SYN）/ dns（真实 UDP DNS 查询，可识别假通，绝不占用本地 53 端口）
+	# 探测协议：tcp（默认 TCP SYN，带高优先级与 DSCP）/ dns（真实 UDP DNS 查询，不占本地 53 端口）
 	option probe_mode 'tcp'
 	option dns_probe_domain 'baidu.com'
 	# 内置多线 UDP DNS 转发端口（0 = 关闭，不占本地 53 端口；可设独立端口如 5354 供第三方 DNS 作上游）
@@ -25,24 +25,20 @@ config global 'global'
 	# 可选：将健康 WAN 的 dns_servers 导出到独立文件（留空 = 不写入）
 	# option dns_resolv_file '/tmp/mwan4_resolv.conf'
 	option flush_conntrack '1'
-	# 存活成员进出时是否清 conntrack（仅 standard ECMP 生效，主备模式只清新进成员）
+	# 成员退出 ECMP 时立即清理离开线路的既有 NAT conntrack，避免残留连线触发 uRPF 丢包断流（保留存活线路连接）
 	option flush_conntrack_on_switch '1'
-	# 退出时是否删掉 mwan4 下发的预设路由。预设 0（保留），否则服务重启／升级窗口内整台路由器没有预设路由
+	# 退出时是否删掉 mwan4 下发的预设路由。预设 0（保留），否则服务重启/升级窗口内整台路由器没有预设路由
 	option remove_routes_on_exit '0'
-	# standard: 单一 multipath 路由，成员/权重一变就重算整张 hash，实测连坐搬走 40%~43% 既有连线（换出口=换 NAT=断线），故非预设
-	# resilient: 内核 nexthop group（Linux 5.14+），只重映射故障成员 bucket（默认延后 120 秒）；auto（预设）优先 resilient，否则退回 standard
+	# OpenWrt 25+ (Linux 6.12+) 原生 Resilient Nexthop Group：240 弹性桶均分且保留活跃连接不断线
 	option ecmp_mode 'auto'
 	option resilient_idle_timer_secs '30'
-	# 多路径哈希策略（预设 l4）：l3 只哈希 IP → 同目的 IP 的连线全挤一条 WAN；l4 加端口 → 24 条连线变 12/12；inner 仅对封装流量有用
-	# 实测 fib_multipath_hash_fields 写 1/7/8/9/31/32 都被内核忽略，真正有效的只有此 policy；空值 = 不碰内核设定（沿用系统预设）
+	option resilient_unbalanced_timer_secs '60'
+	# 多路径哈希策略（默认 l4）：l4 按五元组散列避免同目的 IP 连线全挤单线
 	option multipath_hash_policy 'l4'
-	# 负载感知分流：依实测速率 vs 每条 interface 容量下修过载线权重；启用时每条 interface 必须填 max_mbps，否则 check-config 拒绝
-	# load_target_ratio / load_recover_ratio：利用率 >= 前者开始下修、<= 后者才完全恢复，中间为迟滞死区
+	# 负载感知分流：依实测速率 vs 每条 interface 容量下修过载线权重；启用时每条 interface 必须填 max_mbps
 	option load_aware '0'
 	option load_target_ratio '0.80'
 	option load_recover_ratio '0.60'
-	# ECMP 权重模式：static（预设，固定 weight）/ quality（依实测丢包与 RTT 动态调整）
-	# 动态因子（quality/load_aware）仅在 standard ECMP 下被忽略；auto 装 resilient 时直接生效，设 1 才在 standard 强行套用。dynamic_weight_interval_ms/min_ratio = 最小更新间隔与下修下限
 	option allow_dynamic_weights_on_standard '0'
 	option weight_mode 'static'
 	option dynamic_weight_interval_ms '10000'
@@ -54,6 +50,7 @@ config interface 'wan1'
 	option gateway '192.168.1.1'
 	option metric '10'
 	option weight '1'
+	# gateway 留空或删掉时：PPPoE/WireGuard 自动使用无网关路由，DHCP/以太网 WAN 自动从内核主表探测网关
 	# 该线最大频宽（Mbps）：设定后 ECMP 基准权重 ∝ 最大频宽，也作 LAN 下载容量；up_mbps 为 LAN 上传方向（未填沿用 max）
 	# 专属上游 DNS（选填）：健康时自动写主表 /32 固定走该 WAN 出口，防止第三方 DNS 软件走错运营商线路；留空 = 不干预
 	# list dns_servers '202.96.128.86'

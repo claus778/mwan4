@@ -56,18 +56,19 @@ impl MultipathHashPolicy {
     }
 }
 
-/// `net.ipv{4,6}.fib_multipath_hash_fields` 的单个位元（内核 UAPI，Linux 5.12+）：数值取自内核 UAPI，实测写入该档不影响哈希结果，有效开关是 policy。
+/// `net.ipv{4,6}.fib_multipath_hash_fields` 的单个位元（Linux 6.12+ `include/net/ip_fib.h` UAPI）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashField {
     SrcIp,
     DstIp,
     IpProto,
+    FlowLabel,
     SrcPort,
     DstPort,
     InnerSrcIp,
     InnerDstIp,
     InnerIpProto,
-    FlowLabel,
+    InnerFlowLabel,
     InnerSrcPort,
     InnerDstPort,
 }
@@ -78,14 +79,15 @@ impl HashField {
             Self::SrcIp => 1,
             Self::DstIp => 2,
             Self::IpProto => 4,
-            Self::SrcPort => 8,
-            Self::DstPort => 16,
-            Self::InnerSrcIp => 32,
-            Self::InnerDstIp => 64,
-            Self::InnerIpProto => 128,
-            Self::FlowLabel => 256,
-            Self::InnerSrcPort => 512,
-            Self::InnerDstPort => 1024,
+            Self::FlowLabel => 8,
+            Self::SrcPort => 16,
+            Self::DstPort => 32,
+            Self::InnerSrcIp => 64,
+            Self::InnerDstIp => 128,
+            Self::InnerIpProto => 256,
+            Self::InnerFlowLabel => 512,
+            Self::InnerSrcPort => 1024,
+            Self::InnerDstPort => 2048,
         }
     }
 
@@ -94,12 +96,13 @@ impl HashField {
             Self::SrcIp => "src_ip",
             Self::DstIp => "dst_ip",
             Self::IpProto => "ip_proto",
+            Self::FlowLabel => "flow_label",
             Self::SrcPort => "src_port",
             Self::DstPort => "dst_port",
             Self::InnerSrcIp => "inner_src_ip",
             Self::InnerDstIp => "inner_dst_ip",
             Self::InnerIpProto => "inner_ip_proto",
-            Self::FlowLabel => "flow_label",
+            Self::InnerFlowLabel => "inner_flow_label",
             Self::InnerSrcPort => "inner_src_port",
             Self::InnerDstPort => "inner_dst_port",
         }
@@ -367,6 +370,10 @@ pub struct DaemonConfig {
     /// 内核默认 120 秒过慢，导致负载偏移/线路恢复后数分钟内新流仍挤旧线；30 秒既保护活跃长连接不断线，又让空闲桶更快再均衡。
     #[serde(default = "default_resilient_idle_timer_secs")]
     pub resilient_idle_timer_secs: u32,
+    /// resilient nexthop group 的不均衡强制迁移超时（秒，预设 60，范围 0 ~ 3600，0 = 不强制）：
+    /// 仅靠 idle_timer 在持续大流量/测速场景下会导致活跃桶永远不迁移回刚恢复的 WAN；设置上限可确保在限定时间内恢复多线均衡。
+    #[serde(default = "default_resilient_unbalanced_timer_secs")]
+    pub resilient_unbalanced_timer_secs: u32,
     /// 优雅退出时是否移除本程式下发的预设路由（预设 **false**）：删掉唯一出口会在旧实例已退出、新实例未下发的窗口内把路由器打成离线。
     #[serde(default = "default_remove_routes_on_exit")]
     pub remove_routes_on_exit: bool,
@@ -426,11 +433,11 @@ pub struct DaemonConfig {
 }
 
 fn default_check_interval_ms() -> u64 {
-    500
+    1000
 }
-/// 单次探测超时必须小于探测周期，否则实际周期会被超时拖长
+/// 单次探测超时必须小于探测周期，否则实际周期会被超时拖长；800ms 可容忍测速满载时的短时缓冲膨胀。
 fn default_probe_timeout_ms() -> u64 {
-    400
+    800
 }
 fn default_window_size() -> usize {
     10
@@ -441,15 +448,15 @@ fn default_loss_threshold_down() -> f64 {
 fn default_loss_threshold_up() -> f64 {
     0.10
 }
-/// 预设 0.20：介于「可接受」与 `loss_threshold_down`(0.50) 之间的线路不该再吃一半流量；0.0 = 关闭。
+/// 预设 0.0（关闭）：测速满载时探针延迟抖动不应轻易将健康线路移出 ECMP（移出会导致带宽减半并中断既有 NAT 长连接）。
 fn default_degrade_loss_threshold() -> f64 {
-    0.20
+    0.0
 }
-/// 预设 0.10：退出门槛 = 0.20 - 0.10 = 0.10，与进入门槛（0.20）之间形成死区。
+/// 预设 0.10：若用户手动开启降级（如 0.20），退出门槛 = 门槛 - 迟滞。
 fn default_degrade_hysteresis() -> f64 {
     0.10
 }
-/// 预设 6 次连续样本（≈3 秒）才准退出降级，挡掉单次侥幸。
+/// 预设 6 次连续样本才准退出降级，挡掉单次侥幸。
 fn default_degrade_exit_samples() -> usize {
     6
 }
@@ -457,15 +464,15 @@ fn default_degrade_exit_samples() -> usize {
 fn default_degrade_enter_samples() -> usize {
     20
 }
-/// 预设 20 拍（约 10 秒）的最短离开时间，挡掉「移出→几秒后回来」的数秒级循环。
+/// 预设 20 拍的最短离开时间，挡掉「移出→几秒后回来」的数秒级循环。
 fn default_degrade_min_out_samples() -> usize {
     20
 }
 fn default_consecutive_fail_down() -> usize {
-    3
+    4
 }
 fn default_recovery_success_count() -> usize {
-    5
+    3
 }
 fn default_max_rtt_ms() -> f64 {
     1500.0
@@ -520,6 +527,10 @@ fn default_resilient_idle_timer_secs() -> u32 {
     30
 }
 
+fn default_resilient_unbalanced_timer_secs() -> u32 {
+    60
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -543,6 +554,7 @@ impl Default for DaemonConfig {
             route_priority: default_route_priority(),
             ecmp_mode: EcmpMode::default(),
             resilient_idle_timer_secs: default_resilient_idle_timer_secs(),
+            resilient_unbalanced_timer_secs: default_resilient_unbalanced_timer_secs(),
             remove_routes_on_exit: default_remove_routes_on_exit(),
             multipath_hash_policy: default_multipath_hash_policy(),
             weight_mode: WeightMode::default(),
@@ -725,6 +737,12 @@ impl DaemonConfig {
             return Err(format!(
                 "resilient_idle_timer_secs {} out of range (1 ~ 3600)",
                 self.resilient_idle_timer_secs
+            ));
+        }
+        if self.resilient_unbalanced_timer_secs > 3600 {
+            return Err(format!(
+                "resilient_unbalanced_timer_secs {} out of range (0 ~ 3600)",
+                self.resilient_unbalanced_timer_secs
             ));
         }
         crate::dns::validate_dns_domain(&self.dns_probe_domain)?;
@@ -1031,7 +1049,8 @@ mod tests {
         let cfg = DaemonConfig::default();
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let parsed: DaemonConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.check_interval_ms, 500);
+        assert_eq!(parsed.check_interval_ms, 1000);
+        assert_eq!(parsed.probe_timeout_ms, 800);
         assert_eq!(parsed.window_size, 10);
         assert_eq!(parsed.interfaces[0].name, "wan1");
     }
@@ -1157,12 +1176,12 @@ mod tests {
     #[test]
     fn test_degrade_loss_threshold_defaults_and_validation() {
         let cfg = DaemonConfig::default();
-        assert!((cfg.degrade_loss_threshold - 0.20).abs() < f64::EPSILON);
+        assert!((cfg.degrade_loss_threshold - 0.0).abs() < f64::EPSILON);
         assert!(cfg.validate().is_ok());
 
         let old: DaemonConfig =
             serde_json::from_str(r#"{"interfaces":[{"name":"wan1"}]}"#).unwrap();
-        assert!((old.degrade_loss_threshold - 0.20).abs() < f64::EPSILON);
+        assert!((old.degrade_loss_threshold - 0.0).abs() < f64::EPSILON);
 
         let mut too_big = DaemonConfig::default();
         too_big.degrade_loss_threshold = 1.5;
@@ -1172,9 +1191,9 @@ mod tests {
         negative.degrade_loss_threshold = -0.1;
         assert!(negative.validate().is_err());
 
-        let mut disabled = DaemonConfig::default();
-        disabled.degrade_loss_threshold = 0.0;
-        assert!(disabled.validate().is_ok());
+        let mut enabled = DaemonConfig::default();
+        enabled.degrade_loss_threshold = 0.20;
+        assert!(enabled.validate().is_ok());
 
         let mut not_less = DaemonConfig::default();
         not_less.degrade_loss_threshold = 0.5;
@@ -1210,14 +1229,17 @@ mod tests {
         assert!(zero_samples.validate().is_err());
 
         let mut equal = DaemonConfig::default();
+        equal.degrade_loss_threshold = 0.20;
         equal.degrade_hysteresis = 0.20;
         assert!(equal.validate().is_err());
 
         let mut greater = DaemonConfig::default();
+        greater.degrade_loss_threshold = 0.20;
         greater.degrade_hysteresis = 0.30;
         assert!(greater.validate().is_err());
 
         let mut just_below = DaemonConfig::default();
+        just_below.degrade_loss_threshold = 0.20;
         just_below.degrade_hysteresis = 0.19;
         assert!(just_below.validate().is_ok());
 
@@ -1305,20 +1327,21 @@ mod tests {
         );
     }
 
-    /// 位元值取自内核 UAPI（`Documentation/networking/ip-sysctl.rst`），并与 `src/main.rs` 的 L3/L4 遮罩常数一致。
+    /// 位元值取自 Linux 6.12+ `include/net/ip_fib.h` UAPI，并与 `src/main.rs` 的 L3/L4 遮罩常数一致。
     #[test]
     fn test_hash_field_bits_match_kernel_uapi() {
         assert_eq!(HashField::SrcIp.bit(), 1);
         assert_eq!(HashField::DstIp.bit(), 2);
         assert_eq!(HashField::IpProto.bit(), 4);
-        assert_eq!(HashField::SrcPort.bit(), 8);
-        assert_eq!(HashField::DstPort.bit(), 16);
-        assert_eq!(HashField::InnerSrcIp.bit(), 32);
-        assert_eq!(HashField::InnerDstIp.bit(), 64);
-        assert_eq!(HashField::InnerIpProto.bit(), 128);
-        assert_eq!(HashField::FlowLabel.bit(), 256);
-        assert_eq!(HashField::InnerSrcPort.bit(), 512);
-        assert_eq!(HashField::InnerDstPort.bit(), 1024);
+        assert_eq!(HashField::FlowLabel.bit(), 8);
+        assert_eq!(HashField::SrcPort.bit(), 16);
+        assert_eq!(HashField::DstPort.bit(), 32);
+        assert_eq!(HashField::InnerSrcIp.bit(), 64);
+        assert_eq!(HashField::InnerDstIp.bit(), 128);
+        assert_eq!(HashField::InnerIpProto.bit(), 256);
+        assert_eq!(HashField::InnerFlowLabel.bit(), 512);
+        assert_eq!(HashField::InnerSrcPort.bit(), 1024);
+        assert_eq!(HashField::InnerDstPort.bit(), 2048);
         assert_eq!(HashField::SrcPort.as_str(), "src_port");
         assert_eq!(HashField::InnerDstPort.as_str(), "inner_dst_port");
     }

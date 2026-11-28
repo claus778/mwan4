@@ -8,14 +8,21 @@ use crate::netlink::util::{NlMsgHdr, read_u16, read_u32, rta_align};
 
 pub const RTNLGRP_LINK: u32 = 1;
 pub const RTNLGRP_IPV4_IFADDR: u32 = 5;
+pub const RTNLGRP_IPV4_ROUTE: u32 = 7;
 pub const RTNLGRP_IPV6_IFADDR: u32 = 9;
+pub const RTNLGRP_IPV6_ROUTE: u32 = 11;
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 
 const IFLA_IFNAME: u16 = 3;
+const RTA_TABLE: u16 = 15;
+const RT_TABLE_MAIN: u32 = 254;
+const RTPROT_MWAN4: u8 = 0x4D;
 /// netlink 属性类型遮罩（低位 14 bit）
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
@@ -35,6 +42,10 @@ pub enum LinkEvent {
     Address {
         ifindex: u32,
     },
+    /// 外部进程（如 OpenWrt netifd DHCP 续租/重载）修改了主表默认路由。
+    DefaultRouteChanged {
+        family: u8,
+    },
     /// 接收缓冲溢位（ENOBUFS）：部分组播事件已被核心丢弃，呼叫端应做一次全量 resync 并保持订阅。
     Resync,
 }
@@ -43,7 +54,7 @@ impl LinkEvent {
     pub fn ifindex(&self) -> u32 {
         match self {
             LinkEvent::Link { ifindex, .. } | LinkEvent::Address { ifindex } => *ifindex,
-            LinkEvent::Resync => 0,
+            LinkEvent::DefaultRouteChanged { .. } | LinkEvent::Resync => 0,
         }
     }
 }
@@ -77,7 +88,9 @@ impl LinkWatcher {
         // netlink group 是以 0 为起点的 bit number
         sa.nl_groups = (1 << (RTNLGRP_LINK - 1))
             | (1 << (RTNLGRP_IPV4_IFADDR - 1))
-            | (1 << (RTNLGRP_IPV6_IFADDR - 1));
+            | (1 << (RTNLGRP_IPV4_ROUTE - 1))
+            | (1 << (RTNLGRP_IPV6_IFADDR - 1))
+            | (1 << (RTNLGRP_IPV6_ROUTE - 1));
 
         let ret = unsafe {
             libc::bind(
@@ -208,6 +221,27 @@ impl LinkWatcher {
                             events.push(LinkEvent::Address { ifindex });
                         }
                     }
+                    RTM_NEWROUTE | RTM_DELROUTE => {
+                        // struct rtmsg: family(0) dst_len(1) src_len(2) tos(3) table(4) protocol(5)
+                        let base = offset + NlMsgHdr::LEN;
+                        if base + 12 <= offset + msg_len {
+                            let family = buf[base];
+                            let dst_len = buf[base + 1];
+                            let protocol = buf[base + 5];
+                            if dst_len == 0 && protocol != RTPROT_MWAN4 {
+                                let mut table = u32::from(buf[base + 4]);
+                                if let Some(t) = Self::parse_rta_u32(
+                                    &buf[base + 12..offset + msg_len],
+                                    RTA_TABLE,
+                                ) {
+                                    table = t;
+                                }
+                                if table == RT_TABLE_MAIN {
+                                    events.push(LinkEvent::DefaultRouteChanged { family });
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
 
@@ -236,6 +270,22 @@ impl LinkWatcher {
                 let data = &attrs[offset + 4..offset + rta_len];
                 let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 return Some(String::from_utf8_lossy(&data[..end]).into_owned());
+            }
+            offset += rta_align(rta_len);
+        }
+        None
+    }
+
+    fn parse_rta_u32(attrs: &[u8], target_type: u16) -> Option<u32> {
+        let mut offset = 0usize;
+        while offset + 4 <= attrs.len() {
+            let rta_len = read_u16(attrs, offset)? as usize;
+            let rta_type = read_u16(attrs, offset + 2)? & NLA_TYPE_MASK;
+            if rta_len < 4 || offset + rta_len > attrs.len() {
+                break;
+            }
+            if rta_type == target_type && rta_len >= 8 {
+                return read_u32(attrs, offset + 4);
             }
             offset += rta_align(rta_len);
         }
@@ -298,9 +348,11 @@ mod tests {
     #[test]
     fn test_group_bitmask() {
         let mask = (1u32 << (RTNLGRP_LINK - 1))
-            | (1u32 << (RTNLGRP_IPV4_IFADDR - 1))
-            | (1u32 << (RTNLGRP_IPV6_IFADDR - 1));
-        assert_eq!(mask, (1 << 0) | (1 << 4) | (1 << 8));
-        assert_eq!(mask & (1 << 0), 1 << 0);
+            | (1 << (RTNLGRP_IPV4_IFADDR - 1))
+            | (1 << (RTNLGRP_IPV4_ROUTE - 1))
+            | (1 << (RTNLGRP_IPV6_IFADDR - 1))
+            | (1 << (RTNLGRP_IPV6_ROUTE - 1));
+        assert_eq!(mask, (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 10));
+        assert_eq!(mask & (1 << 6), 1 << 6);
     }
 }

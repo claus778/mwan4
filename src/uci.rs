@@ -508,6 +508,11 @@ impl UciDocument {
                     format!("global.resilient_idle_timer_secs: invalid integer '{v}'")
                 })?;
             }
+            if let Some(v) = global.get_option("resilient_unbalanced_timer_secs") {
+                cfg.resilient_unbalanced_timer_secs = v.parse().map_err(|_| {
+                    format!("global.resilient_unbalanced_timer_secs: invalid integer '{v}'")
+                })?;
+            }
             if let Some(v) = global.get_option("multipath_hash_policy") {
                 cfg.multipath_hash_policy = match v {
                     "" | "null" => None,

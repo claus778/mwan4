@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MWAN4 打包脚本（APK + IPK + 离线 bundle）。
+"""MWAN4 打包脚本（OpenWrt 25+ APK + 离线 bundle）。
 
 设计要点
 --------
@@ -7,19 +7,15 @@
    已装机的 mwan4.rsa.pub 才能持续验证后续版本，历史签名也可复现。
    - MWAN4_SIGNING_KEY=<path>     指定/生成金钥档的位置
    - MWAN4_SIGNING_KEY_PEM=<pem>  直接内嵌 PEM（CI / 密钥管理用，完全不落盘）
-2. 按架构出包：不再产出「标 arch = all、内容却是 aarch64 二进位」的假通用包。
-   只对「确实存在已编译二进位」的 target 出包，档名 / .PKGINFO / control
-   全部带上真实架构。跨架构安装会直接被 apk / opkg 拒绝，而不是装完才 SIGSEGV。
-3. 依赖声明（原本完全缺失）：
+2. 按架构出包：只对「确实存在已编译二进位」的 target 出包，档名与 .PKGINFO
+   全部带上真实架构，跨架构安装由 apk 直接拦截。
+3. 依赖声明：
    - APK  : depend = libc
-   - IPK  : Depends: libc
-   OpenWrt/ImmortalWrt 的 libc 包名就是 `libc`（provides `libc-any`）。
+   OpenWrt 25+ 的 libc 包名就是 `libc`（provides `libc-any`）。
    注意：**不要**照 Alpine 写成 `so:libc.musl-<arch>.so.1` —— OpenWrt 没有这种
-   provider，依赖会无法解析、安装直接失败（实机踩过）。错架构的拦阻由
-   .PKGINFO 的 `arch` 栏位负责。
-4. 翻译：LuCI 的 .lmo 一律在打包时由 .po 重新编译，不再依赖入库的 .lmo。
-   旧的 .lmo 会在 .po 变更后悄悄过期，UI 默默退回英文；改成建置时编译后，
-   出厂的翻译必定与原始 .po 一致，并安装到 /usr/lib/lua/luci/i18n/。
+   provider，依赖会无法解析、安装直接失败。
+4. 翻译：LuCI 的 .lmo 一律在打包时由 zh_Hans .po 重新编译并安装到
+   /usr/lib/lua/luci/i18n/mwan4.zh_Hans.lmo。
 """
 
 from __future__ import annotations
@@ -53,8 +49,7 @@ LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r13"
-IPK_RELEASE = "13"
+APK_RELEASE = "r14"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
@@ -87,13 +82,9 @@ class Arch:
     key: str
     #: Rust target triple（用于 target/<triple>/release/mwan4）
     rust_target: str
-    #: apk 的 arch 栏位（OpenWrt 风格）
+    #: apk 的 arch 栏位（OpenWrt 25+ 风格）
     apk_arch: str
-    #: ipk 的 Architecture 栏位
-    ipk_arch: str
-    #: apk 的 libc 依赖。OpenWrt/ImmortalWrt 的 libc 包就叫 `libc`（provides `libc-any`），
-    #: 并没有 Alpine 那种 `so:libc.musl-<arch>.so.1` provider，因此这里用裸包名。
-    #: 错架构的拦阻靠 .PKGINFO 的 `arch` 栏位，而不是这个依赖。
+    #: apk 的 libc 依赖。OpenWrt 25+ 的 libc 包就叫 `libc`。
     libc_dep: str
 
     def binary_path(self) -> str:
@@ -111,21 +102,18 @@ ARCH_TABLE: list[Arch] = [
         key="aarch64_cortex-a53",
         rust_target="aarch64-unknown-linux-musl",
         apk_arch="aarch64_cortex-a53",
-        ipk_arch="aarch64_cortex-a53",
         libc_dep="libc",
     ),
     Arch(
         key="x86_64",
         rust_target="x86_64-unknown-linux-musl",
         apk_arch="x86_64",
-        ipk_arch="x86_64",
         libc_dep="libc",
     ),
     Arch(
         key="arm_cortex-a7",
         rust_target="armv7-unknown-linux-musleabihf",
         apk_arch="arm_cortex-a7",
-        ipk_arch="arm_cortex-a7",
         libc_dep="libc",
     ),
     Arch(
@@ -133,7 +121,6 @@ ARCH_TABLE: list[Arch] = [
         key="mipsel_24kc",
         rust_target="mipsel-unknown-linux-musl",
         apk_arch="mipsel_24kc",
-        ipk_arch="mipsel_24kc",
         libc_dep="libc",
     ),
 ]
@@ -397,88 +384,6 @@ def create_exact_apk_package(
     log(f"[+] Created APK: {output_path} ({os.path.getsize(output_path)} bytes, arch={arch})")
 
 
-def create_ipk_package(
-    output_path: str,
-    pkgname: str,
-    pkgver: str,
-    arch: str,
-    desc: str,
-    data_entries: list[dict],
-    postinst: str | None = None,
-    prerm: str | None = None,
-    depends: list[str] | None = None,
-    conffiles: list[str] | None = None,
-) -> None:
-    """OpenWrt OPKG IPK 格式"""
-    data_tar = bytearray()
-    for entry in data_entries:
-        name = entry["name"]
-        data = entry.get("data", b"")
-        mode = entry.get("mode", 0o644)
-        is_dir = entry.get("is_dir", False)
-        if is_dir:
-            data_tar.extend(make_ustar_header(name.rstrip("/") + "/", 0, 0o755, b"5"))
-        else:
-            data_tar.extend(make_ustar_header(name, len(data), mode, b"0"))
-            data_tar.extend(pad512(data))
-    data_tar.extend(b"\0" * 1024)
-    data_gz_bytes = compress_gz(bytes(data_tar))
-
-    # control 的栏位顺序有讲究：Depends 必须排在 Description 之前
-    control_lines = [
-        f"Package: {pkgname}",
-        f"Version: {pkgver}",
-        f"Architecture: {arch}",
-        f"Maintainer: {PACKAGER}",
-        "Section: net",
-        "Priority: optional",
-        f"License: {LICENSE}",
-    ]
-    if depends:
-        control_lines.append("Depends: " + ", ".join(depends))
-    control_lines.append(f"Description: {desc}")
-    control_content = ("\n".join(control_lines) + "\n").encode("utf-8")
-
-    control_tar = bytearray()
-    control_tar.extend(make_ustar_header("control", len(control_content), 0o644, b"0"))
-    control_tar.extend(pad512(control_content))
-
-    if postinst:
-        pi_bytes = postinst.replace("\r\n", "\n").encode("utf-8")
-        control_tar.extend(make_ustar_header("postinst", len(pi_bytes), 0o755, b"0"))
-        control_tar.extend(pad512(pi_bytes))
-    if prerm:
-        pr_bytes = prerm.replace("\r\n", "\n").encode("utf-8")
-        control_tar.extend(make_ustar_header("prerm", len(pr_bytes), 0o755, b"0"))
-        control_tar.extend(pad512(pr_bytes))
-    if conffiles:
-        # opkg 读 control.tar.gz 里的 conffiles 档（一行一个绝对路径），
-        # 没有它会把 /etc 下的设定当普通档案：升级时用包内容覆盖、移除时直接删掉。
-        cf_bytes = ("\n".join(conffiles) + "\n").encode("utf-8")
-        control_tar.extend(make_ustar_header("conffiles", len(cf_bytes), 0o644, b"0"))
-        control_tar.extend(pad512(cf_bytes))
-    control_tar.extend(b"\0" * 1024)
-    control_gz_bytes = compress_gz(bytes(control_tar))
-
-    deb_bin = b"2.0\n"
-    ipk_tar = bytearray()
-    ipk_tar.extend(make_ustar_header("debian-binary", len(deb_bin), 0o644, b"0"))
-    ipk_tar.extend(pad512(deb_bin))
-
-    ipk_tar.extend(make_ustar_header("control.tar.gz", len(control_gz_bytes), 0o644, b"0"))
-    ipk_tar.extend(pad512(control_gz_bytes))
-
-    ipk_tar.extend(make_ustar_header("data.tar.gz", len(data_gz_bytes), 0o644, b"0"))
-    ipk_tar.extend(pad512(data_gz_bytes))
-
-    ipk_tar.extend(b"\0" * 1024)
-    ipk_gz = compress_gz(bytes(ipk_tar))
-
-    with open(output_path, "wb") as f:
-        f.write(ipk_gz)
-    log(f"[+] Created IPK: {output_path} ({os.path.getsize(output_path)} bytes, arch={arch})")
-
-
 def make_tar(entries: list[dict]) -> bytes:
     tar = bytearray()
     for entry in entries:
@@ -500,11 +405,10 @@ def make_tar(entries: list[dict]) -> bytes:
 # ---------------------------------------------------------------------------
 
 POST_INSTALL_TEMPLATE = """#!/bin/sh
-[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
-# 先验证设定档，设定错误时留下明确日志，而不是等 daemon 退出触发 procd 重启回圈
-if [ -x /usr/bin/mwan4 ] && [ -f /etc/mwan4/mwan4.json ]; then
-    /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \\
-        logger -t mwan4 "warning: /etc/mwan4/mwan4.json failed --check-config"
+# 先验证原生 UCI 设定档，设定错误时留下明确日志，而不是等 daemon 退出触发 procd 重启回圈
+if [ -x /usr/bin/mwan4 ] && [ -f /etc/config/mwan4 ]; then
+    /usr/bin/mwan4 --check-config /etc/config/mwan4 >/dev/null 2>&1 || \\
+        logger -t mwan4 "warning: /etc/config/mwan4 failed --check-config"
 fi
 /etc/init.d/mwan4 enable
 /etc/init.d/mwan4 restart
@@ -512,7 +416,6 @@ exit 0
 """
 
 PRE_DEINSTALL_TEMPLATE = """#!/bin/sh
-[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
 # 卸载前优雅停止并禁用服务，确保守护进程释放探针规则、策略规则、underlay/DNS 主机路由与 PID 锁
 if [ -x /etc/init.d/mwan4 ]; then
     /etc/init.d/mwan4 stop 2>/dev/null || true
@@ -522,7 +425,6 @@ exit 0
 """
 
 LUCI_POST_INSTALL = """#!/bin/sh
-[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart 2>/dev/null || true
 exit 0
@@ -613,11 +515,10 @@ fi
 
 chmod +x /usr/bin/mwan4 /etc/init.d/mwan4
 
-# /etc/init.d/mwan4 实际读取 /etc/config/mwan4 并生成 /var/etc/mwan4.json（启动时会自动 --check-config）；
-# 若存在独立的 /etc/mwan4/mwan4.json，仅做友好提示而不阻断 UCI 模式的安装。
-if [ -f /etc/mwan4/mwan4.json ]; then
-    /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \\
-        echo "Warning: standalone /etc/mwan4/mwan4.json failed validation (UCI /etc/config/mwan4 will still be validated by init.d)" >&2
+# init.d 直接通过原生 UCI 解析器读取 /etc/config/mwan4（启动时自动 --check-config）。
+if [ -f /etc/config/mwan4 ]; then
+    /usr/bin/mwan4 --check-config /etc/config/mwan4 >/dev/null 2>&1 || \\
+        echo "Warning: /etc/config/mwan4 failed --check-config" >&2
 fi
 
 /etc/init.d/mwan4 enable
@@ -703,16 +604,13 @@ def build_luci_data_entries(menu_data: bytes, acl_data: bytes, view_data: bytes,
         {"name": "www/luci-static/resources/view/mwan4/overview.js", "data": view_data, "mode": 0o644},
     ]
     if lmo_data is not None:
-        # 现代 LuCI（21.02+）的简体中文语言码是 zh_Hans；旧版是 zh-cn。
-        # lmo_load_catalog() 以语言码精确匹配档名，只装旧名在中文环境下会完全载不到。
-        # 两个档名装同一份内容，新旧版本都能正确显示中文。
+        # OpenWrt 25+ LuCI 简体中文标准语言码为 zh_Hans
         entries += [
             {"name": "usr/lib", "is_dir": True},
             {"name": "usr/lib/lua", "is_dir": True},
             {"name": "usr/lib/lua/luci", "is_dir": True},
             {"name": "usr/lib/lua/luci/i18n", "is_dir": True},
             {"name": "usr/lib/lua/luci/i18n/mwan4.zh_Hans.lmo", "data": lmo_data, "mode": 0o644},
-            {"name": "usr/lib/lua/luci/i18n/mwan4.zh-cn.lmo", "data": lmo_data, "mode": 0o644},
         ]
     return entries
 
@@ -758,7 +656,7 @@ def resolve_archs(requested: list[str] | None) -> list[Arch]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build MWAN4 APK / IPK / offline bundle packages",
+        description="Build MWAN4 OpenWrt 25+ APK / offline bundle packages",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
@@ -819,11 +717,10 @@ def main() -> int:
     view_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "htdocs", "luci-static", "resources", "view", "mwan4", "overview.js")
 
     # 翻译：由 .po 即时编译（见 build_lmo_bytes 的说明），确保出厂翻译不落后于来源。
-    # 用 zh_Hans（现代 LuCI 语言码）当来源，打包时同时装 zh_Hans 与旧的 zh-cn 档名。
     lmo_data = build_lmo_bytes(
         os.path.join(ROOT_DIR, "openwrt", "luci-app-mwan4", "po", "zh_Hans", "mwan4.po")
     )
-    log(f"[+] Compiled translations: mwan4.zh_Hans.lmo + mwan4.zh-cn.lmo ({len(lmo_data)} bytes)")
+    log(f"[+] Compiled translation: mwan4.zh_Hans.lmo ({len(lmo_data)} bytes)")
 
     luci_data_entries = build_luci_data_entries(menu_data, acl_data, view_data, lmo_data)
 
@@ -842,14 +739,13 @@ def main() -> int:
 
         data_entries = build_mwan4_data_entries(bin_data, init_data, uci_config_data, json_config_data)
         apk_ver = f"{PKG_VERSION}-{APK_RELEASE}"
-        ipk_ver = f"{PKG_VERSION}-{IPK_RELEASE}"
 
         create_exact_apk_package(
             output_path=os.path.join(PKG_DIR, f"{PKG_NAME}_{apk_ver}_{arch.apk_arch}.apk"),
             pkgname=PKG_NAME,
             pkgver=apk_ver,
             arch=arch.apk_arch,
-            desc="Ultra-lightweight Multi-WAN failover & health monitor daemon for OpenWrt",
+            desc="Ultra-lightweight Multi-WAN failover & health monitor daemon for OpenWrt 25+",
             data_entries=data_entries,
             private_key=private_key,
             post_install=POST_INSTALL_TEMPLATE,
@@ -858,27 +754,13 @@ def main() -> int:
             provides=[f"cmd:{PKG_NAME}={apk_ver}"],
         )
 
-        create_ipk_package(
-            output_path=os.path.join(PKG_DIR, f"{PKG_NAME}_{ipk_ver}_{arch.ipk_arch}.ipk"),
-            pkgname=PKG_NAME,
-            pkgver=ipk_ver,
-            arch=arch.ipk_arch,
-            desc="Ultra-lightweight Multi-WAN failover & health monitor daemon for OpenWrt",
-            data_entries=data_entries,
-            postinst=POST_INSTALL_TEMPLATE,
-            prerm=PRE_DEINSTALL_TEMPLATE,
-            depends=["libc"],
-            conffiles=["/etc/config/mwan4", "/etc/mwan4/mwan4.json"],
-        )
-
         bundle_path = os.path.join(OUTPUT_DIR, f"mwan4-{arch.key}-bundle.tar.gz")
         with open(bundle_path, "wb") as f:
             f.write(compress_gz(make_tar(data_entries + luci_data_entries)))
         log(f"[+] Created offline bundle: {bundle_path} ({os.path.getsize(bundle_path)} bytes)")
 
-    # --- 4. luci-app-mwan4（真正的架构无关包，apk 用 noarch / ipk 用 all） ---
+    # --- 4. luci-app-mwan4（架构无关包，apk 使用 noarch） ---
     luci_apk_ver = f"{PKG_VERSION}-{APK_RELEASE}"
-    luci_ipk_ver = f"{PKG_VERSION}-{IPK_RELEASE}"
     create_exact_apk_package(
         output_path=os.path.join(PKG_DIR, f"{LUCI_PKG_NAME}_{luci_apk_ver}_noarch.apk"),
         pkgname=LUCI_PKG_NAME,
@@ -888,17 +770,6 @@ def main() -> int:
         data_entries=luci_data_entries,
         private_key=private_key,
         post_install=LUCI_POST_INSTALL,
-        depends=[PKG_NAME, "luci-base"],
-    )
-
-    create_ipk_package(
-        output_path=os.path.join(PKG_DIR, f"{LUCI_PKG_NAME}_{luci_ipk_ver}_all.ipk"),
-        pkgname=LUCI_PKG_NAME,
-        pkgver=luci_ipk_ver,
-        arch="all",
-        desc="LuCI support for MWAN4 multi-WAN failover & balancing",
-        data_entries=luci_data_entries,
-        postinst=LUCI_POST_INSTALL,
         depends=[PKG_NAME, "luci-base"],
     )
 
